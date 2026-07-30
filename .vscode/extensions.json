@@ -1,0 +1,25 @@
+{
+  // 開啟本資料夾時 VS Code 會提示安裝這些擴充套件
+  "recommendations": [
+    // --- 必要：Python 開發核心 ---
+    "ms-python.python",           // Python 主套件（直譯器切換、測試、REPL）
+    "ms-python.vscode-pylance",   // 型別分析、自動完成、跳轉定義
+    "ms-python.debugpy",          // 除錯器（launch.json 用到）
+
+    // --- 建議：程式碼品質 ---
+    "charliermarsh.ruff",         // Lint + 格式化（取代 flake8/black/isort，速度極快）
+    "njpwerner.autodocstring",    // 打 """ 自動產生 docstring 樣板
+
+    // --- 建議：本專案情境 ---
+    "ms-ceintl.vscode-language-pack-zh-hant", // 繁體中文介面
+    "mechatroner.rainbow-csv",    // data/ 底下實驗數據 CSV 上色檢視
+    "emilast.logfilehighlighter"  // logs/ 的 DS102 log 依 INFO/ERROR 上色
+  ],
+  "unwantedRecommendations": [
+    // 與 Pylance / Ruff 功能重疊，同時裝會有重複警告
+    "ms-python.pylint",
+    "ms-python.flake8",
+    "ms-python.black-formatter",
+    "ms-python.isort"
+  ]
+}

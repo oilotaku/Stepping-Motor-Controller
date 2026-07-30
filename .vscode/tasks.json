@@ -1,0 +1,46 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "執行 DS102 GUI",
+      "type": "shell",
+      "command": "${workspaceFolder}/venv/Scripts/python.exe",
+      "args": ["main_ai.py"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": { "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8" }
+      },
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "列出可用序列埠",
+      "type": "shell",
+      "command": "${workspaceFolder}/venv/Scripts/python.exe",
+      "args": ["-m", "serial.tools.list_ports", "-v"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      "label": "安裝相依套件",
+      "type": "shell",
+      "command": "${workspaceFolder}/venv/Scripts/python.exe",
+      "args": ["-m", "pip", "install", "-r", "requirements.txt"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Ruff 檢查 (需先裝 ruff)",
+      "type": "shell",
+      "command": "${workspaceFolder}/venv/Scripts/python.exe",
+      "args": ["-m", "ruff", "check", "."],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "test",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,97 @@
+{
+  // ===========================================================================
+  // Python 直譯器 / 虛擬環境
+  // ===========================================================================
+  "python.defaultInterpreterPath": "${workspaceFolder}/venv/Scripts/python.exe",
+  "python.terminal.activateEnvironment": true,
+  "python.terminal.activateEnvInCurrentTerminal": true,
+
+  // 中文輸出不再變亂碼（Windows 終端機預設 cp950）
+  "terminal.integrated.env.windows": {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8"
+  },
+
+  // ===========================================================================
+  // Pylance 分析：只分析自己的程式碼，避開 venv 與驅動程式資料夾
+  // ===========================================================================
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.indexing": true,
+  "python.analysis.inlayHints.functionReturnTypes": true,
+  "python.analysis.inlayHints.variableTypes": false,
+  "python.analysis.exclude": [
+    "**/venv/**",
+    "**/__pycache__/**",
+    "DS102-CDMv21228/**",
+    "DS102_USB_Driver_V2.08.28/**"
+  ],
+
+  // ===========================================================================
+  // 搜尋 / 檔案監看排除（大幅加快 Ctrl+Shift+F 與開檔速度）
+  // ===========================================================================
+  "search.exclude": {
+    "**/venv": true,
+    "**/__pycache__": true,
+    "DS102-CDMv21228": true,
+    "DS102_USB_Driver_V2.08.28": true,
+    "logs": true,
+    "recordings": true,
+    "data": true,
+    "**/*.log": true
+  },
+  "files.watcherExclude": {
+    "**/venv/**": true,
+    "**/__pycache__/**": true,
+    "**/logs/**": true,
+    "**/recordings/**": true,
+    "**/data/**": true,
+    "DS102-CDMv21228/**": true,
+    "DS102_USB_Driver_V2.08.28/**": true
+  },
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+
+  // 把散在根目錄的 log 檔收進 Readme_Python.txt 底下，檔案總管清爽一點
+  "explorer.fileNesting.enabled": true,
+  "explorer.fileNesting.patterns": {
+    "Readme_Python.txt": "ds102_log_*.log, DRIVER_ISSUE_REPORT.md",
+    "requirements.txt": "requirements-*.txt"
+  },
+
+  // ===========================================================================
+  // 編輯器行為
+  // ===========================================================================
+  "files.encoding": "utf8",
+  "files.autoGuessEncoding": true,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "editor.bracketPairColorization.enabled": true,
+  "editor.stickyScroll.enabled": true,
+
+  "[python]": {
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    "editor.rulers": [100],
+    "editor.wordBasedSuggestions": "off",
+    // Ruff 裝好後可用 Shift+Alt+F 手動格式化。
+    // 本專案沒有版本控制，先「不」開自動格式化，避免整份 main_ai.py 被大改。
+    "editor.formatOnSave": false,
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "never"
+    }
+  },
+
+  "[json][jsonc]": {
+    "editor.tabSize": 2
+  },
+
+  // log 檔唯讀開啟，避免手滑改到紀錄
+  "files.readonlyInclude": {
+    "logs/**": true,
+    "**/ds102_log_*.log": true
+  }
+}

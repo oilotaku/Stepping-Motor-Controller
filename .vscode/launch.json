@@ -1,0 +1,59 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 主要目標：GUI 版控制器
+      "name": "DS102 GUI (main_ai.py)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main_ai.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true,
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    },
+    {
+      "name": "DS102 舊版 (main.py)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true,
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    },
+    {
+      // 連線診斷腳本，需要指定 COM 埠時用 args
+      "name": "序列埠診斷 (probe_ds102.py)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/probe_ds102.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    },
+    {
+      "name": "Python: 目前檔案",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true,
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  ]
+}
