@@ -27,7 +27,9 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 
 終端機執行時務必帶 `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`（Windows 主控台預設 cp950，否則中文 log 會亂碼）。VS Code 側已涵蓋：`settings.json` 的 `terminal.integrated.env.windows` 對整合終端機全域生效、`launch.json` 四個 configuration 全部自帶 `env`；`tasks.json` 只有「執行 DS102 GUI」自帶 `env`，其餘三個 task 靠 settings 的全域設定拿到（都是 `type: shell`，所以有效）。
 
-**沒有硬體時**：GUI 頂端有「模擬模式」按鈕，`DS102Controller.connect_sim()` 會走 `_sim_parse` / `_sim_query` 假造回應，可完整測試 UI 流程與錄製重播。
+🔴 **沒有模擬模式。** 2026-08-06 依使用者要求整個移除（連同 `connect_sim` / `_sim_parse` / `_sim_query` / `sim_mode` 的全部判斷）。**不要再加回來**——這支程式驅動的是真實滑台，假造的回應會讓使用者以為自己連上了硬體。
+
+沒有硬體時要測 UI／控制邏輯，用**假的 serial 物件**取代 `ctrl.ser`：注意 `query_status()` 是三段式，`SB3?` 必須回 bit0=1（`"1"`）該軸才會被視為可選取，否則 `_wait_axis_stop()` 會立刻回 False。scratchpad 的 `verify_*.py` 都有現成寫法。
 
 ## 檔案定位（哪個才是主程式）
 
@@ -189,7 +191,7 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 - **刪除確認規格統一**：Teaching Point 與 Profile 比照「刪除行程」——列出內容、`icon="warning"`、`default="no"`。
 - **重播加確認視窗**（列出步數／輪數／預估時間／⚠ 不檢查軟體限位），改 `Warn.TButton`，重播中 disable 自己並啟用停止鍵。以前可連按疊出第二條執行緒。
 - **`_rec_tree` 改用 iid（行程名稱）**，不再用 `.index()` 假設顯示順序與記憶體順序一致。
-- **恢復「模擬模式」按鈕**（一度被註解掉，但 CLAUDE.md 與 README 都寫它存在，且沒硬體時整個 UI 無法操作）。
+- ~~恢復「模擬模式」按鈕~~ → **後續依使用者要求整個移除模擬模式**（見上方〈常用指令〉的紅字）。
 - **`Esc` = 停止所有軸**（`bind_all`，任何分頁都有效）。緊急停止**刻意不綁鍵盤**——誤觸後要走解除流程並確認各軸位置。
 - **LOG 加層級篩選**（全部／WARN 以上／只看 ERROR）。
 - **儀表板每軸狀態小字接上資料**（`_dash_status_vars` 以前建立後全檔沒人更新，永遠是「—」）。

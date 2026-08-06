@@ -204,7 +204,6 @@ class DS102Controller:
         self.port = ""
         self.baudrate = 38400
         self.connected = False
-        self.sim_mode = False
         self.ems_active = False
         # 設 True 才會把例行輪詢（POS?/SB?）的 TX/RX 寫進 LOG。
         # 預設關閉：那是每秒十幾筆的量，開著會把 LOG 與 UI 一起拖垮。
@@ -373,11 +372,6 @@ class DS102Controller:
         重送：最多 MAX_RETRY 次，發送前先 flush 輸入緩衝。
         """
         raw = (cmd + "\r").encode("utf-8")
-        if self.sim_mode:
-            self._sim_parse(cmd)
-            self._log("INFO", "發送指令（模擬）", tx=cmd, rx="(sim)")
-            return
-
         for attempt in range(1, MAX_RETRY + 1):
             if not (self.ser and self.ser.is_open):
                 break
@@ -404,12 +398,6 @@ class DS102Controller:
         # 例行輪詢（POS?/SB?）每秒十幾筆，逐筆記 log 會灌爆 LOG 與 UI。
         # 只有成功路徑安靜；WARN / ERROR 一律照記，異常不能被吃掉。
         quiet = self._is_poll_cmd(cmd)
-        if self.sim_mode:
-            resp = self._sim_query(cmd)
-            if not quiet:
-                self._log("DEBUG", "查詢（模擬）", tx=cmd, rx=resp)
-            return resp
-
         for attempt in range(1, MAX_RETRY + 1):
             if not (self.ser and self.ser.is_open):
                 break
@@ -436,50 +424,6 @@ class DS102Controller:
 
         self._log("ERROR", f"查詢失敗（{MAX_RETRY} 次均無回應）", tx=cmd)
         return ""
-
-    # =========================================================================
-    # 模擬模式
-    # =========================================================================
-    def _sim_parse(self, cmd: str) -> None:
-        """解析驅動指令並更新模擬位置"""
-        m = re.search(r":PULS\s+([\d.\-]+):GO\s+ABS", cmd)
-        if m:
-            ax = NO_AXIS.get(self.axis_no)
-            if ax:
-                with self._lock:
-                    self._positions_pulse[ax] = float(m.group(1))
-            return
-        m = re.search(r":PULS\s+([\d.]+):GO\s+(CW|CCW)\b", cmd)
-        if m and "ABS" not in cmd:
-            ax = NO_AXIS.get(self.axis_no)
-            if ax:
-                d = float(m.group(1))
-                with self._lock:
-                    self._positions_pulse[ax] += d if m.group(2) == "CW" else -d
-            return
-        m = re.search(r"AXI(\d):POS\s+([\d.\-]+)", cmd)
-        if m:
-            ax = NO_AXIS.get(m.group(1))
-            if ax:
-                with self._lock:
-                    self._positions_pulse[ax] = float(m.group(2))
-
-    def _sim_query(self, cmd: str) -> str:
-        if "*IDN?" in cmd:
-            return "SURUGA,DS102,1.0"
-        if "DS102VER?" in cmd:
-            return "Ver.1.0.0 (Sim)"
-        if "CONTA?" in cmd:
-            return "6"
-        if ":SB3?" in cmd:
-            return "1"
-        if ":SB1?" in cmd:
-            return "0"
-        if ":POS?" in cmd:
-            ax = NO_AXIS.get(self.axis_no)
-            with self._lock:
-                return str(int(self._positions_pulse.get(ax, 0))) if ax else "0"
-        return "0"
 
     # =========================================================================
     # 連線管理
@@ -524,7 +468,6 @@ class DS102Controller:
         self.port = port
         self.baudrate = baudrate
         self.connected = True
-        self.sim_mode = False
 
         # 連線後立刻讀一次各軸位置，否則畫面會停在 0 直到第一次移動
         self.refresh_positions()
@@ -552,7 +495,7 @@ class DS102Controller:
         而連線點仍是綠的——USB 被拔掉、控制器斷電都看不出來，操作者看到的是
         一組長得完全正常但其實已經跟硬體脫節的座標。
         """
-        if not self.connected or self.sim_mode:
+        if not self.connected:
             return
         got_any = False
         for i in range(self.axis_count):
@@ -587,9 +530,7 @@ class DS102Controller:
     @property
     def comm_stale(self) -> bool:
         """畫面上的座標是否已不可信（連續讀取失敗達門檻）。"""
-        return self.connected and not self.sim_mode and (
-            self.comm_failures >= COMM_FAIL_THRESHOLD
-        )
+        return self.connected and self.comm_failures >= COMM_FAIL_THRESHOLD
 
     def position_age(self) -> float:
         """距離上次成功讀到位置過了幾秒。未曾成功過回傳 inf。"""
@@ -608,8 +549,8 @@ class DS102Controller:
     # =========================================================================
     def capture_controller_config(self) -> dict:
         """讀出控制器目前的設定並存檔，作為日後還原的基準。"""
-        if not self.connected or self.sim_mode:
-            self._log("WARN", "未連線（或模擬模式），無法擷取控制器設定")
+        if not self.connected:
+            self._log("WARN", "未連線，無法擷取控制器設定")
             return {}
 
         axes = {}
@@ -684,7 +625,7 @@ class DS102Controller:
 
         未接滑台的軸一律跳過。
         """
-        if not self.connected or self.sim_mode:
+        if not self.connected:
             return []
         axes_cfg = (self.controller_config or {}).get("axes", {})
         if not axes_cfg:
@@ -754,7 +695,7 @@ class DS102Controller:
         找原點，猜錯會讓它往非預期方向跑完整個行程。這裡只負責讓使用者知道。
         """
         unset: List[str] = []
-        if not self.connected or self.sim_mode:
+        if not self.connected:
             return unset
         for i in range(self.axis_count):
             axis_no = str(i + 1)
@@ -776,18 +717,10 @@ class DS102Controller:
             )
         return unset
 
-    def connect_sim(self) -> None:
-        self.connected = True
-        self.sim_mode = True
-        self.firmware = "Simulator"
-        self.axis_count = 6
-        self._log("INFO", "模擬模式啟動")
-
     def disconnect(self) -> None:
         if self.ser and self.ser.is_open:
             self.ser.close()
         self.connected = False
-        self.sim_mode = False
         self._log("INFO", "已中斷連線")
 
     # =========================================================================
@@ -865,7 +798,7 @@ class DS102Controller:
         self._serial_write(cmd)
         self._log("INFO", f"連續點動 軸{axis_no} {direction}", tx=cmd)
 
-        if lim is not None and not self.sim_mode:
+        if lim is not None:
             threading.Thread(
                 target=self._watch_jog_limit,
                 args=(axis_no, direction, lim, f_speed, rate),
@@ -991,7 +924,7 @@ class DS102Controller:
         self._serial_write(cmd)
         self._log("INFO", f"步進 軸{axis_no} {direction} {amount} pulse", tx=cmd)
 
-        if wait_done and not self.sim_mode:
+        if wait_done:
             return self._wait_axis_stop(axis_no)
         return True
 
@@ -1027,7 +960,7 @@ class DS102Controller:
         cmd = f"AXI{axis_no}:L0 {l_speed}:R0 {rate}" f":S0 {s_rate}:F0 {f_speed}:GO ORG"
         self._serial_write(cmd)
         self._log("INFO", f"原點返回 軸{axis_no} ORG{org_type}", tx=cmd)
-        if not (wait_done and not self.sim_mode):
+        if not wait_done:
             return True
 
         ax = NO_AXIS.get(axis_no, axis_no)
@@ -1169,9 +1102,6 @@ class DS102Controller:
                 self._serial_write(cmd)
                 self._log("INFO", f"原點復歸 軸{ax} Type{org_type}", tx=cmd)
                 time.sleep(0.1)  # 給控制器一點時間啟動復歸
-                if self.sim_mode:
-                    done.append(ax)
-                    continue
 
                 if not self._wait_origin_done(axis_no):
                     failed.append(f"{ax}(復歸逾時)")
@@ -1265,9 +1195,6 @@ class DS102Controller:
         self._jog_stop.set()  # 先讓監看執行緒收工——這一步不需要序列埠
         cmd = "STOP 0"
 
-        if self.sim_mode:
-            self._log("INFO", "停止所有軸（模擬）", tx=cmd)
-            return
         if not (self.ser and self.ser.is_open):
             return
 
@@ -1518,7 +1445,7 @@ class DS102Controller:
             if not axis_no:
                 continue
             # 僅移動有啟用的軸
-            if int(axis_no) > self.axis_count and not self.sim_mode:
+            if int(axis_no) > self.axis_count:
                 continue
 
             with self._lock:
@@ -1540,18 +1467,17 @@ class DS102Controller:
             # 送出前先確認這一軸真的能往那個方向走。
             # 原點復歸後座標 0 就落在限位開關上，(0,0,0) 這種點會把每一軸
             # 都往端點推；再加上未接滑台的軸，結果就是一連串限位警報。
-            if not self.sim_mode:
-                st, _ = self.query_status(axis_no)
-                if st == "Stage not connected":
-                    self._log("WARN", f"軸 {ax} 未接滑台，跳過")
-                    continue
-                if self.limit_direction(st) == direction:
-                    self._log(
-                        "WARN",
-                        f"軸 {ax} 已在 {direction} 限位上（{st}），"
-                        f"無法再往 {direction} 走，跳過",
-                    )
-                    continue
+            st, _ = self.query_status(axis_no)
+            if st == "Stage not connected":
+                self._log("WARN", f"軸 {ax} 未接滑台，跳過")
+                continue
+            if self.limit_direction(st) == direction:
+                self._log(
+                    "WARN",
+                    f"軸 {ax} 已在 {direction} 限位上（{st}），"
+                    f"無法再往 {direction} 走，跳過",
+                )
+                continue
             moved = self.move_step(
                 axis_no,
                 direction,
@@ -1566,7 +1492,7 @@ class DS102Controller:
             # 這一軸若不是正常停下來（撞限位／逾時），後面的軸不要再跑。
             # 目標點超出行程時，逐軸執行會演變成連續撞端點——而且因為
             # 以前這裡沒有檢查、move_step 也沒回傳值，全程不會有任何警告。
-            if wait_done and not self.sim_mode and not moved:
+            if wait_done and not moved:
                 st, _ = self.query_status(axis_no)
                 self._log(
                     "ERROR", f"軸 {ax} 未能正常到位（{st}），中止 Teaching 移動"
@@ -1713,7 +1639,7 @@ class DS102Controller:
                         # ORG 同樣排除：它可能橫跨整個行程且途中壓限位屬正常。
                         if _is_finite_move(tx):
                             ax_m = re.search(r"AXI(\d)", tx)
-                            if ax_m and not self.sim_mode:
+                            if ax_m:
                                 if not self._wait_axis_stop(ax_m.group(1)):
                                     self._log(
                                         "ERROR", "重播中某軸未能正常到位，已中止"
@@ -1940,9 +1866,6 @@ class StatusBar(tk.Frame):
         if not connected:
             self._age_var.set("未連線")
             self._age_lbl.config(fg=CLR_MUTED)
-        elif self.ctrl.sim_mode:
-            self._age_var.set("模擬模式")
-            self._age_lbl.config(fg=CLR_INFO)
         elif stale:
             self._age_var.set("⚠ 已停止更新")
             self._age_lbl.config(fg=CLR_DANGER)
@@ -2303,22 +2226,6 @@ class DS102GUI:
             command=self._toggle_connect,
         )
         self._conn_btn.grid(row=0, column=5, padx=(0, 4))
-        # 這顆按鈕一度被註解掉，但 CLAUDE.md 與 README 都寫「沒有硬體時
-        # GUI 頂端有模擬模式按鈕」，而 _start_sim() 也還在——文件與程式對不上，
-        # 且沒有硬體時整個 UI 無法操作。恢復。
-        self._sim_btn = tk.Button(
-            cr,
-            text="模擬模式",
-            bg=CLR_INFO,
-            fg="white",
-            font=("Segoe UI", 10, "bold"),
-            relief="flat",
-            padx=10,
-            pady=4,
-            cursor="hand2",
-            command=self._start_sim,
-        )
-        self._sim_btn.grid(row=0, column=6)
 
     # =========================================================================
     # Notebook
@@ -4097,25 +4004,6 @@ class DS102GUI:
             self._conn_btn.config(text="連線", bg=CLR_ACCENT)
             messagebox.showerror("連線失敗", msg)
 
-    def _start_sim(self):
-        self.ctrl.connect_sim()
-        self._conn_dot.itemconfig(self._conn_dot_id, fill=CLR_INFO)
-        self._conn_lbl.config(text="模擬模式")
-        self._conn_btn.config(text="中斷", bg=CLR_DANGER)
-        self._fw_var.set("模擬模式 | 6 軸")
-        self._set_drive_buttons_state("normal")
-        self._set_axis_btns_state("normal")
-        self._sim_tick()
-
-    def _sim_tick(self):
-        import random
-
-        if self.ctrl.sim_mode:
-            for ax in AXES:
-                with self.ctrl._lock:
-                    self.ctrl._positions_pulse[ax] += random.uniform(-2, 2)
-            self.root.after(800, self._sim_tick)
-
     def _set_drive_buttons_state(self, state: str):
         """
         切換「會發起移動」的按鈕狀態。
@@ -4173,7 +4061,7 @@ class DS102GUI:
         改成什麼。以前預設是 `ORG 0`（Type0＝不執行），等於一按就把樣式
         毀掉。讀不到就留空，並由 `_on_*_press` 拒絕執行原點動作。
         """
-        if not self.ctrl.connected or self.ctrl.sim_mode:
+        if not self.ctrl.connected:
             self._org_mode_var.set("")
             return
 
@@ -4346,7 +4234,7 @@ class DS102GUI:
         return f"存於 {cfg.get('saved', '?')}｜" + "、".join(parts)
 
     def _save_controller_config(self):
-        if not self.ctrl.connected or self.ctrl.sim_mode:
+        if not self.ctrl.connected:
             messagebox.showwarning("未連線", "請先連線到實體控制器再儲存設定")
             return
 
@@ -4362,7 +4250,7 @@ class DS102GUI:
             self._flash_banner("✔ 控制器設定已存檔，往後連線會自動補回", 6000)
 
     def _restore_controller_config(self):
-        if not self.ctrl.connected or self.ctrl.sim_mode:
+        if not self.ctrl.connected:
             messagebox.showwarning("未連線", "請先連線到實體控制器")
             return
 
@@ -4501,9 +4389,7 @@ class DS102GUI:
         if self.ctrl.connected:
             self._conn_dot.itemconfig(
                 self._conn_dot_id,
-                fill=CLR_DANGER if stale else (
-                    CLR_INFO if self.ctrl.sim_mode else CLR_ACCENT
-                ),
+                fill=CLR_DANGER if stale else CLR_ACCENT,
             )
 
         if "conn" in self._stat_vars:
@@ -4573,8 +4459,6 @@ class DS102GUI:
                     bits.append("● 選取中")
                 if stale:
                     bits.append("⚠ 已停止更新")
-                elif self.ctrl.sim_mode:
-                    bits.append("模擬")
                 else:
                     age = self.ctrl.position_age()
                     bits.append("即時" if age < 1.5 else f"{age:.0f}s 前")

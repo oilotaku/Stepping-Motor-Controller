@@ -22,7 +22,7 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 > Windows 主控台預設 cp950，否則中文 log 會亂碼。VS Code 側已由
 > `settings.json` 的 `terminal.integrated.env.windows` 全域設定。
 
-**沒有硬體時**：`DS102Controller.connect_sim()` 提供模擬模式，會用假造回應走完整個 UI 流程與錄製重播。
+**本程式沒有模擬模式**——它驅動的是真實滑台，假造的回應會讓人誤以為已連上硬體。沒有硬體時要測控制邏輯，請用假的 serial 物件取代 `ctrl.ser`。
 
 ---
 
