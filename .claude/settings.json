@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "venv/Scripts/python.exe .claude/hooks/check_py_syntax.py 2>/dev/null || true",
+            "timeout": 20,
+            "statusMessage": "檢查 Python 語法…"
+          }
+        ]
+      }
+    ]
+  }
+}

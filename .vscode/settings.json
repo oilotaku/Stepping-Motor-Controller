@@ -16,11 +16,42 @@
   // Pylance 分析：只分析自己的程式碼，避開 venv 與驅動程式資料夾
   // ===========================================================================
   "python.analysis.typeCheckingMode": "basic",
+
+  // ---------------------------------------------------------------------------
+  // 降噪：pyserial / PyVISA / tkinter 的型別描述檔與實際行為有落差，
+  // 會冒出一堆「紅色波浪」但程式跑起來完全正常（實測驗證過）。
+  // 把這幾類降成 information（淡色小點，滑鼠移過去仍看得到說明），
+  // 保留 reportCallIssue / reportUndefinedVariable 等真正抓得到 bug 的檢查。
+  // 效果：全專案 54 個紅色錯誤 → 3 個（其中 2 個是 main.py 的真實寫法錯誤）。
+  // ---------------------------------------------------------------------------
+  "python.analysis.diagnosticSeverityOverrides": {
+    // int(序列埠回傳值) — 檢查器看不出你已經做過 None 防呆
+    "reportArgumentType": "information",
+    // ser.isOpen（描述檔漏掉的舊寫法）、PyVISA Resource.query/.write
+    "reportAttributeAccessIssue": "information",
+    // tkinter 元件宣告為 Optional，但 UI 建好後不可能是 None
+    "reportOptionalMemberAccess": "information",
+    "reportOptionalSubscript": "information",
+    "reportOptionalIterable": "information",
+    "reportOptionalCall": "information",
+    "reportOptionalOperand": "information",
+    "reportIndexIssue": "information",
+
+    // --- 以下保持紅色，這些是真的會咬人的 ---
+    "reportCallIssue": "error",          // 參數個數/型別錯、漏帶參數
+    "reportUndefinedVariable": "error",  // 打錯變數名、拼錯字
+    "reportMissingImports": "error",     // 套件沒裝或直譯器選錯
+    "reportSelfClsParameterName": "error"
+  },
+
   "python.analysis.autoImportCompletions": true,
   "python.analysis.indexing": true,
   "python.analysis.inlayHints.functionReturnTypes": true,
   "python.analysis.inlayHints.variableTypes": false,
   "python.analysis.exclude": [
+    // 前兩項是 Pylance 的預設值，自訂 exclude 會覆寫掉預設，要自己補回來
+    "**/node_modules",
+    "**/.*",
     "**/venv/**",
     "**/__pycache__/**",
     "DS102-CDMv21228/**",

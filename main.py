@@ -1,3 +1,5 @@
+from typing import Literal
+
 import serial
 import serial.tools.list_ports
 import time
@@ -26,12 +28,12 @@ logging.basicConfig(
 
 
 # processing : when press the connect button
-def connect_button_click(event):
+def connect_button_click(event) -> None:
     root.after(10, comm_port_open)
 
 
 # processing : set COM port
-def comm_port_open():
+def comm_port_open() -> None:
     global ser
 
     if ser.is_open:
@@ -130,7 +132,7 @@ def comm_port_open():
 
 
 # processing : when press the disconnect button
-def disconnect_button_click(event):
+def disconnect_button_click(event) -> None:
     # Init Serial Port Setting
     global ser
     if ser.is_open:
@@ -147,7 +149,7 @@ def disconnect_button_click(event):
 
 
 # processing : when select the X button
-def axis_x_button_click():
+def axis_x_button_click() -> None:
     global axisNo
     axisNo = "1"
     btnAxisX.config(bg="LightBlue")
@@ -161,7 +163,7 @@ def axis_x_button_click():
 
 
 # processing : when select the Y button
-def axis_y_button_click():
+def axis_y_button_click() -> None:
     global axisNo
     axisNo = "2"
     btnAxisX.config(bg="SystemButtonFace")
@@ -175,7 +177,7 @@ def axis_y_button_click():
 
 
 # processing : when select the Z button
-def axis_z_button_click():
+def axis_z_button_click() -> None:
     global axisNo
     axisNo = "3"
     btnAxisX.config(bg="SystemButtonFace")
@@ -189,7 +191,7 @@ def axis_z_button_click():
 
 
 # processing : when select the U button
-def axis_u_button_click():
+def axis_u_button_click() -> None:
     global axisNo
     axisNo = "4"
     btnAxisX.config(bg="SystemButtonFace")
@@ -203,7 +205,7 @@ def axis_u_button_click():
 
 
 # processing : when select the V button
-def axis_v_button_click():
+def axis_v_button_click() -> None:
     global axisNo
     axisNo = "5"
     btnAxisX.config(bg="SystemButtonFace")
@@ -217,7 +219,7 @@ def axis_v_button_click():
 
 
 # processing : when select the W button
-def axis_w_button_click():
+def axis_w_button_click() -> None:
     global axisNo
     axisNo = "6"
     btnAxisX.config(bg="SystemButtonFace")
@@ -231,7 +233,7 @@ def axis_w_button_click():
 
 
 # processing : when select the continue button
-def continue_mode():
+def continue_mode() -> None:
     global mode
     btnCCW["text"] = "- (CCW)"
     btnCW["text"] = "+ (CW)"
@@ -239,7 +241,7 @@ def continue_mode():
 
 
 # processing : when select the step button
-def step_mode():
+def step_mode() -> None:
     global mode
     btnCCW["text"] = "- (CCW)"
     btnCW["text"] = "+ (CW)"
@@ -247,7 +249,7 @@ def step_mode():
 
 
 # processing : when select the origin button
-def org_mode():
+def org_mode() -> None:
     global mode
     btnCCW["text"] = "Origin"
     btnCW["text"] = "Origin"
@@ -255,7 +257,7 @@ def org_mode():
 
 
 # processing : when press the stop button
-def stop_button_click(event):
+def stop_button_click(event) -> None:
     # ---------------------------------------------------------
     # Stop
     # ---------------------------------------------------------
@@ -263,14 +265,14 @@ def stop_button_click(event):
 
 
 # processing : when press the CCW button
-def ccw_button_press(event):
+def ccw_button_press(event) -> None:
     global direction
     direction = "CCW"
     move_stage()
 
 
 # processing : when release the CCW button
-def ccw_button_release(event):
+def ccw_button_release(event) -> None:
     global mode
     if mode == 0:
         # ---------------------------------------------------------
@@ -280,14 +282,14 @@ def ccw_button_release(event):
 
 
 # processing : when press the CW button
-def cw_button_press(event):
+def cw_button_press(event) -> None:
     global direction
     direction = "CW"
     move_stage()
 
 
 # processing : when release the CW button
-def cw_button_release(event):
+def cw_button_release(event) -> None:
     global mode
     if mode == 0:
         # ---------------------------------------------------------
@@ -297,7 +299,7 @@ def cw_button_release(event):
 
 
 # Drive the stage
-def move_stage():
+def move_stage() -> None:
     global axisNo
     global direction
     global mode
@@ -405,14 +407,14 @@ def move_stage():
 
 
 # processing : Screen update
-def get_status():
+def get_status() -> None:
     if update_status() == "run":
         timer = threading.Timer(0.1, get_status)
         timer.start()
 
 
 # processing : Status update
-def update_status():
+def update_status() -> Literal['Stop'] | Literal['run']:
     # ---------------------------------------------------------
     # Request status binary 3
     # ---------------------------------------------------------
@@ -479,7 +481,7 @@ def update_status():
 
 
 # Send
-def serial_write(write_data):
+def serial_write(write_data) -> None:
     if ser.isOpen():
         try:
             ser.write(write_data)
@@ -489,7 +491,7 @@ def serial_write(write_data):
 
 
 # Send and receive
-def serial_write_read(write_data):
+def serial_write_read(write_data) -> bytes | Literal['']:
     if ser.isOpen():
         try:
             ser.write(write_data)
@@ -505,7 +507,7 @@ def serial_write_read(write_data):
 
 
 # processing : when press the position set button
-def position_button_click(event):
+def position_button_click(event) -> None:
     # ---------------------------------------------------------
     # Set the current position
     # ---------------------------------------------------------
@@ -513,7 +515,7 @@ def position_button_click(event):
 
 
 # processing : when press the close button
-def close_button_click(event):
+def close_button_click(event) -> None:
     global ser
     if ser.isOpen():
         ser.close()
@@ -521,7 +523,7 @@ def close_button_click(event):
     root.destroy()
 
 
-def showerror(msg):
+def showerror(msg) -> None:
     messagebox.showerror("Error", msg)
 
 

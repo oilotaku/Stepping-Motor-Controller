@@ -1,0 +1,24 @@
+以下為您詳細整理截至目前為止的技術討論脈絡、系統三層軟體架構，以及硬體控制與避坑細節。這份文件可直接作為您專案開發的系統設計藍圖（Architecture Design）。1. 系統硬體與環境配置本自動化系統的核心目的是在 Windows 環境下，透過 Python 聯動控制滑台與光學儀器，進行光纖對準（Fiber Alignment）或光學自動化檢測（AOI）。主控端電腦：Windows 10 / 11 系統。多軸馬達控制器：駿河精機（SURUGA SEIKI）DS112（雙軸步進馬達控制箱）。連線方式：透過 USB Mini-B 傳輸線連接電腦，並於 Windows 裝置管理員中手動載入原廠驅動程式，虛擬為序列埠（Virtual COM Port，如 COM3）。光學量測主機：HP 8153A 光波萬用表（Lightwave Multimeter）。內插模組：HP 81536A InGaAs 高性能光功率感測模組（通常插在 Slot 1 或 Slot 2）。連線方式：透過 GPIB 轉 USB 傳輸線（如 NI 或 Keysight 傳輸線）連接電腦，需安裝對應的 VISA 核心驅動（NI-VISA / Keysight IO Libraries）。2. 系統軟體三層架構（Three-Tier Architecture）為了維持程式的擴充性與穩定度，我們採用 PyMeasure 框架 的核心思想，將整個自動化專案切分為三個獨立層級：+-------------------------------------------------------------+
+
+| 3. 應用/流程層 (Application/Procedure Layer)                 |
+|    - 繼承 pymeasure.experiment.Procedure                    |
+|    - 定義十字掃描 (Cross Scan) / 自動對準演算法               |
+|    - 自動生成 CSV 報表與串接 PyMeasure ManagedWindow GUI    |
++-------------------------------------------------------------+
+                              | (呼叫屬性與方法)
+                              v
++-------------------------------------------------------------+
+
+| 2. 驅動封裝層 (Hardware Driver Layer)                       |
+|    - 類別一：HP8153A(Instrument) -> 封裝 SCPI 指令           |
+|    - 類別二：SurugaDS112(Instrument) -> 封裝 ASCII 序列指令   |
++-------------------------------------------------------------+
+                              | (底層 I/O 通訊)
+                              v
++-------------------------------------------------------------+
+
+| 1. 通訊基礎層 (Low-level Communication Layer)               |
+|    - pyvisa 模組 (負責 GPIB 巴士通訊，控制 HP 8153A)         |
+|    - pyserial 模組 (負責 COM Port 序列通訊，控制 DS112)       |
++-------------------------------------------------------------+
+3. 底層通訊與硬體避坑細節（開發核心）這兩台儀器都屬於經典但年代較久的硬體，在 Python 聯動時必須嚴格遵守以下物理與通訊限制，否則極易造成硬體當機或量測數據失真：A. 駿河精機 DS112 控制細節指令與結束符：採用 ASCII 碼控制。每條指令發送時，尾端必須強制加上 \r\n (CR+LF)，控制器才會辨識。通訊參數：鮑率預設通常為 9600，8 位資料位，1 位停止位，無校驗。運動同步機制：發送移動指令（如 1M+1000 再發 1G）後，Python 不可立即讀取光功率。必須透過 !: 指令進行輪詢（Polling），確認狀態從 B (Busy) 變為 R (Ready) 後，代表滑台已完全停穩。B. HP 8153A 控制細節指令與結束符：採用標準 SCPI 指令（指令結構包含 Slot，如 :SENS1:POW...）。寫入與讀取時，尾端必須強制加上 \n (LF)。內建處理器延遲：HP 8153A 內部微處理器較慢。在 Python 迴圈中連續寫入指令或查詢功率時，每次通訊之間強烈建議加上 time.sleep(0.03) ~ 0.05 秒的延遲，以防 GPIB 緩衝區溢位導致「Query INTERRUPTED」錯誤。取樣時間（Averaging Time）：進行快速滑台掃描時，建議將硬體取樣時間調短（如 :SENS1:POW:ATIM 100MS），以加速整體自動化流程。C. 機構震動與線路干擾馬達動，則不讀光：步進馬達移動時會產生微小物理震動，會即時影響光纎的耦合效率（Coupling Efficiency）。標準流程為：馬達移動 → 輪詢確認停止 → 額外延遲 30ms 等待震動衰減 → 讀取 HP 8153A 功率值。單執行緒（Single-Thread）限制：避免使用 Python 多執行緒同時對 GPIB 與串口發送通訊，全程應使用單一量測主執行緒（如 PyMeasure 的 Procedure.execute）依序執行。4. PyMeasure 實作程式碼架構回顧目前我們已在 Python 程式中完成了以下模組的撰寫：HP8153A 類別：將複雜的 SCPI 指令映射為 Python 屬性。例如，直接設定 meter.wavelength = 1550 或讀取 meter.power。SurugaDS112 類別：提供 get_position(axis)、move_relative(axis, pulses) 以及 wait_until_ready() 等高階物件導向方法。AlignmentProcedure 類別：繼承自 PyMeasure 的 Procedure。定義了自動化掃描的參數（如步數、步距），並在 execute() 核心迴圈中完美實現了「走一步、停穩、讀光、紀錄數據（self.emit）」的自動化工作流。目前基礎架構與驅動已經非常完整。接下來，您希望我們朝向哪一個方向繼續深入細化呢？方向 A：【演算法優化】 撰寫更高級的自動尋光演算法（例如從十字掃描升級為「二維螺旋掃描 Spiral Scan」或「高斯擬合自動尋峰」）。方向 B：【圖形介面實作】 使用 PyMeasure 內建的 ManagedWindow，將這個架構封裝成一個擁有「即時光強曲線圖」與「控制按鈕」的 Windows 視窗程式。
