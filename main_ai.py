@@ -1609,28 +1609,45 @@ class DS102Controller:
         repeat: int = 1,
         stop_event: Optional[threading.Event] = None,
         progress_cb=None,
-        delay_override_ms: Optional[int] = None,
+        cycle_delay_ms: int = 3000,
     ):
         """
         重播行程。
         - 重播前設定 playback_running=True，鎖定其他移動操作。
         - 每步先等待前一步到位，再發送下一步，確保精度。
-        - 發送完畢才等待 delay_ms（不含到位等待時間）。
+        - 發送完畢才等待該步自己的 delay_ms（不含到位等待時間）。
 
-        delay_override_ms 不為 None 時，**忽略每一步各自的 delay_ms**，
-        全部改用這個值。用途是「這次重播想跑快一點／慢一點」而不必去改
-        （並存檔）每個步驟的延遲。
+        `cycle_delay_ms` 是**跑完一輪完整行程之後、下一輪開始之前**的間隔，
+        不是步與步之間的延遲（那是各步驟自己的 `delay_ms`）。
+        只在輪與輪之間等待，第一輪不等——以前這裡是寫死的 `time.sleep(3)`，
+        而且連第一輪之前都會等，畫面上完全沒有提示，看起來像沒反應。
         """
         self.playback_running = True
         steps = rec.get("steps", [])
         total = len(steps) * repeat
         done = 0
         completed = False  # 只有正常跑完才會被設 True，見 finally
-        self._log("INFO", f"開始重播 [{rec['name']}] × {repeat}，共 {total} 步")
+        self._log(
+            "INFO",
+            f"開始重播 [{rec['name']}] × {repeat}，共 {total} 步"
+            + (f"，每輪間隔 {cycle_delay_ms}ms" if repeat > 1 else ""),
+        )
 
         try:
-            for _ in range(repeat):
-                time.sleep(3)
+            for cycle in range(repeat):
+                # 輪與輪之間的間隔（第一輪不等）。分段睡以便中途可中止。
+                if cycle > 0 and cycle_delay_ms > 0:
+                    if progress_cb:
+                        progress_cb(done, total, f"等待 {cycle_delay_ms}ms")
+                    waited = 0.0
+                    while waited < cycle_delay_ms / 1000.0:
+                        if (stop_event and stop_event.is_set()) or self.ems_active:
+                            self._log("WARN", "重播已中止（輪間等待中）")
+                            return
+                        time.sleep(min(0.1, cycle_delay_ms / 1000.0 - waited))
+                        waited += 0.1
+                if progress_cb and repeat > 1:
+                    progress_cb(done, total, f"第 {cycle + 1}/{repeat} 輪")
                 for step in steps:
                     if stop_event and stop_event.is_set():
                         self._log("WARN", "重播已中止")
@@ -1656,11 +1673,8 @@ class DS102Controller:
                                         "ERROR", "重播中某軸未能正常到位，已中止"
                                     )
                                     return
-                    delay_ms = (
-                        delay_override_ms
-                        if delay_override_ms is not None
-                        else step.get("delay_ms", 200)
-                    )
+                    # 步與步之間用該步自己的 delay_ms（可在 GUI 雙擊修改並存檔）
+                    delay_ms = step.get("delay_ms", 200)
                     time.sleep(max(0, delay_ms) / 1000.0)
                     done += 1
                     if progress_cb:
@@ -3141,23 +3155,27 @@ class DS102GUI:
             font=("Segoe UI", 9),
         ).grid(row=0, column=2, padx=16)
 
-        # ── 重播固定延遲：只影響「這次重播」，不會改到行程檔裡的每步 delay ──
-        self._fixed_delay_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        # ── 每輪之間的間隔（不是步與步之間；那是各步驟自己的 delay）──
+        tk.Label(
             pf,
-            text="重播使用固定延遲:",
-            variable=self._fixed_delay_on,
+            text="每輪之間間隔:",
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 9),
         ).grid(row=1, column=0, sticky="w", pady=3)
-        self._fixed_delay_var = tk.StringVar(value="200")
-        ttk.Entry(pf, textvariable=self._fixed_delay_var, width=8).grid(
+        self._cycle_delay_var = tk.StringVar(value="3000")
+        ttk.Entry(pf, textvariable=self._cycle_delay_var, width=8).grid(
             row=1, column=1, sticky="w", padx=8
         )
         tk.Label(
             pf,
-            text="ms（勾選後忽略各步驟自己的延遲，不會改到行程檔）",
+            text="ms（跑完一次完整行程後、下一輪開始前的等待；"
+                 "步與步之間的延遲請在上方「已錄製步驟」設定）",
             bg=CLR_CARD,
             fg=CLR_MUTED,
             font=("Segoe UI", 8),
+            justify="left",
+            wraplength=420,
         ).grid(row=1, column=2, sticky="w", padx=8)
 
         plbtn = tk.Frame(play_card, bg=CLR_CARD)
@@ -3303,20 +3321,20 @@ class DS102GUI:
         idx = self._rec_tree.index(sel[0])
         if idx >= len(self.ctrl.recordings):
             return
-        # 重播固定延遲（勾選才生效；不會改到行程檔裡的每步 delay）
-        override = None
-        if self._fixed_delay_on.get():
-            try:
-                override = int(self._fixed_delay_var.get())
-                assert override >= 0
-            except (ValueError, AssertionError):
-                messagebox.showerror("錯誤", "固定延遲請輸入 0 或正整數毫秒")
-                return
+        # 每輪之間的間隔（跑完一次完整行程後、下一輪開始前）
+        try:
+            cycle_delay = int(self._cycle_delay_var.get())
+            assert cycle_delay >= 0
+        except (ValueError, AssertionError):
+            messagebox.showerror("錯誤", "每輪之間間隔請輸入 0 或正整數毫秒")
+            return
 
         self._stop_playback.clear()
 
-        def _progress(done, total):
-            self.root.after(0, lambda: self._play_progress_var.set(f"{done}/{total}"))
+        def _progress(done, total, note=""):
+            # note 是輪次資訊或「等待中」，讓輪與輪之間的空檔不再看起來像沒反應
+            txt = f"{done}/{total}" + (f"  {note}" if note else "")
+            self.root.after(0, lambda: self._play_progress_var.set(txt))
             self.root.after(0, self._update_stat_ui)
 
         threading.Thread(
@@ -3326,7 +3344,7 @@ class DS102GUI:
                 "repeat": self._repeat_var.get(),
                 "stop_event": self._stop_playback,
                 "progress_cb": _progress,
-                "delay_override_ms": override,
+                "cycle_delay_ms": cycle_delay,
             },
             daemon=True,
         ).start()
