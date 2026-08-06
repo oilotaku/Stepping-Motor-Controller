@@ -168,6 +168,13 @@ LOG_TEXT_MAX_LINES = 2000
 # UI 座標重繪間隔（毫秒）。純重繪、不碰序列埠，所以只需要跟得上
 # POSITION_POLL_INTERVAL(0.5s) 的資料更新即可，設 10ms 純屬浪費。
 UI_REDRAW_INTERVAL = 100
+# 連續幾輪讀不到任何軸的位置，就判定「畫面上的座標已不可信」。
+# 3 輪 × POSITION_POLL_INTERVAL(0.5s) ≈ 1.5 秒，足以濾掉偶發的單次逾時。
+COMM_FAIL_THRESHOLD = 3
+# 橫幅「合併視窗」：這段時間內連續來的訊息會排隊依序顯示（避免互相覆蓋），
+# 超過就直接換掉目前這則——超過表示新訊息多半是使用者剛按下按鈕的回饋，
+# 那不該排隊等好幾秒才出現。
+BANNER_COALESCE_SEC = 1.0
 
 # 顏色主題
 CLR_BG = "#F4F3F0"
@@ -225,6 +232,11 @@ class DS102Controller:
 
         self.firmware = ""
         self.axis_count = 0
+        # 通訊健康度：連續讀不到位置的次數，與上次成功的時間戳。
+        # 用來讓畫面能區分「這是即時值」與「這是停住的舊值」。
+        self.comm_failures = 0
+        self.last_position_ok = 0.0
+
         # 連線時偵測到「復歸樣式未設定」的軸（MEMSW0=0）。
         # MEMSW 是 RAM-only，控制器斷電後會全部歸零。
         self.homing_unconfigured: List[str] = []
@@ -534,9 +546,15 @@ class DS102Controller:
         只送 POS?（每軸一筆交易），比 query_status() 的三段式查詢輕得多，
         適合當成背景定時刷新。query_status() 一次只更新它被傳入的那一軸，
         不足以讓畫面上其餘各軸保持同步。
+
+        同時維護通訊健康度（`comm_failures` / `last_position_ok`）：
+        以前讀不到就 `continue`，畫面上的座標會**停在最後一次成功的數值不動**，
+        而連線點仍是綠的——USB 被拔掉、控制器斷電都看不出來，操作者看到的是
+        一組長得完全正常但其實已經跟硬體脫節的座標。
         """
         if not self.connected or self.sim_mode:
             return
+        got_any = False
         for i in range(self.axis_count):
             axis_no = str(i + 1)
             ax = NO_AXIS.get(axis_no)
@@ -548,8 +566,36 @@ class DS102Controller:
             try:
                 with self._lock:
                     self._positions_pulse[ax] = float(pos)
+                got_any = True
             except ValueError:
                 continue
+
+        if got_any:
+            if self.comm_failures >= COMM_FAIL_THRESHOLD:
+                self._log("INFO", "位置刷新已恢復正常")
+            self.comm_failures = 0
+            self.last_position_ok = time.time()
+        else:
+            self.comm_failures += 1
+            if self.comm_failures == COMM_FAIL_THRESHOLD:
+                self._log(
+                    "ERROR",
+                    f"連續 {self.comm_failures} 次讀不到任何軸的位置——"
+                    f"畫面上的座標已不可信，請檢查連線",
+                )
+
+    @property
+    def comm_stale(self) -> bool:
+        """畫面上的座標是否已不可信（連續讀取失敗達門檻）。"""
+        return self.connected and not self.sim_mode and (
+            self.comm_failures >= COMM_FAIL_THRESHOLD
+        )
+
+    def position_age(self) -> float:
+        """距離上次成功讀到位置過了幾秒。未曾成功過回傳 inf。"""
+        if not self.last_position_ok:
+            return float("inf")
+        return time.time() - self.last_position_ok
 
     # =========================================================================
     # 控制器設定持久化（MEMSW0 復歸樣式 + 韌體軟體限位）
@@ -1802,35 +1848,45 @@ class StatusBar(tk.Frame):
         coord_frame.pack(fill="x", padx=1, pady=(1, 0))
 
         self._coord_labels: Dict[str, tk.Label] = {}
+        self._axis_cells: Dict[str, tk.Frame] = {}
+        self._axis_names: Dict[str, tk.Label] = {}
         for ax in AXES:
             cell = tk.Frame(coord_frame, bg=CLR_CARD)
             cell.pack(side="left", padx=6, pady=2)
-            tk.Label(
+            name = tk.Label(
                 cell,
                 text=f"{ax}:",
                 bg=CLR_CARD,
                 fg=CLR_MUTED,
                 font=("Segoe UI", 8, "bold"),
-            ).pack(side="left")
+            )
+            name.pack(side="left")
             lbl = tk.Label(
                 cell,
-                text="0.000",
+                # 初值不可是 0——三軸的 0 幾乎就落在限位開關上，顯示一組
+                # 「所有軸都壓在端點」的假座標，而且完全看不出它是假的。
+                text="—",
                 bg=CLR_CARD,
-                fg=CLR_TEXT,
+                fg=CLR_MUTED,
                 font=("Consolas", 10, "bold"),
                 width=10,
                 anchor="e",
             )
             lbl.pack(side="left")
             self._coord_labels[ax] = lbl
+            self._axis_cells[ax] = cell
+            self._axis_names[ax] = name
 
-        tk.Label(
+        # 資料新鮮度：讓「停住的舊值」看得出來，不要偽裝成即時值
+        self._age_var = tk.StringVar(value="未連線")
+        self._age_lbl = tk.Label(
             coord_frame,
-            text="pulse",
+            textvariable=self._age_var,
             bg=CLR_CARD,
             fg=CLR_MUTED,
             font=("Segoe UI", 8),
-        ).pack(side="right", padx=6)
+        )
+        self._age_lbl.pack(side="right", padx=6)
 
         log_frame = tk.Frame(self, bg="#E8E7E2")
         log_frame.pack(fill="x", padx=1, pady=(0, 1))
@@ -1845,10 +1901,57 @@ class StatusBar(tk.Frame):
         ).pack(fill="x", padx=6, pady=1)
 
     def update_coords(self):
-        """刷新各軸工作座標（機械位置扣除 offset，單位 pulse）"""
+        """
+        刷新各軸工作座標（機械位置扣除 offset，單位 pulse）。
+
+        三種狀態要能一眼分辨，這是控制台的基本要求：
+          未連線   → 全部「—」，絕不顯示 0（0 幾乎就在限位開關上）
+          失聯     → 座標轉為警告色並標示「已停止更新」
+          正常     → 顯示數值，右側標註資料年齡
+        另外把**當前選取軸**highlight 出來——選錯軸就是驅動錯的滑台，
+        而軸選擇器只存在於兩個分頁，其餘分頁完全看不出選的是哪一軸。
+        """
+        connected = self.ctrl.connected
+        stale = self.ctrl.comm_stale
+        cur_ax = NO_AXIS.get(self.ctrl.axis_no)
+        n_axes = self.ctrl.axis_count if connected else 0
         pos_work = self.ctrl.positions
+
         for ax, lbl in self._coord_labels.items():
-            lbl.config(text=f"{pos_work.get(ax, 0.0):,.0f}")
+            enabled = connected and int(AXIS_NO[ax]) <= n_axes
+            is_cur = enabled and ax == cur_ax
+
+            if not enabled:
+                text, fg = "—", CLR_MUTED
+            elif stale:
+                text, fg = f"{pos_work.get(ax, 0.0):,.0f}", CLR_DANGER
+            else:
+                text, fg = f"{pos_work.get(ax, 0.0):,.0f}", CLR_TEXT
+            lbl.config(text=text, fg=fg)
+
+            # 當前軸用底色標示（比改字色顯眼，且不與失聯的警告色打架）
+            bg = CLR_ACCENT if is_cur else CLR_CARD
+            self._axis_cells[ax].config(bg=bg)
+            self._axis_names[ax].config(
+                bg=bg, fg="white" if is_cur else CLR_MUTED
+            )
+            lbl.config(bg=bg, fg="white" if (is_cur and not stale) else fg)
+
+        if not connected:
+            self._age_var.set("未連線")
+            self._age_lbl.config(fg=CLR_MUTED)
+        elif self.ctrl.sim_mode:
+            self._age_var.set("模擬模式")
+            self._age_lbl.config(fg=CLR_INFO)
+        elif stale:
+            self._age_var.set("⚠ 已停止更新")
+            self._age_lbl.config(fg=CLR_DANGER)
+        else:
+            age = self.ctrl.position_age()
+            self._age_var.set(
+                "pulse · 剛更新" if age < 1.5 else f"pulse · {age:.0f}s 前"
+            )
+            self._age_lbl.config(fg=CLR_MUTED if age < 2 else CLR_WARN)
 
     def update_log(self, msg: str):
         self._log_var.set(msg[:100])
@@ -1867,6 +1970,8 @@ class DS102GUI:
 
         # 全域 StringVar
         self._axis_no_var = tk.StringVar(value="1")
+        # 軸名（X/Y/Z…）——畫面上一律用軸名，軸號只在組指令時用
+        self._axis_name_var = tk.StringVar(value="X")
 
         # 事件
         self._stop_playback = threading.Event()
@@ -1887,6 +1992,8 @@ class DS102GUI:
         # LOG 文字框
         self._log_text: Optional[tk.Text] = None
         self._log_auto_scroll = tk.BooleanVar(value=True)
+        self._log_filter_var = tk.StringVar(value="全部")
+        self._log_count_var = tk.StringVar(value="")
 
         # 移動控制 UI 參考
         self._ctrl_status_var = tk.StringVar(value="Stop")
@@ -1898,6 +2005,10 @@ class DS102GUI:
 
         # 非強制的提醒橫幅（取代會卡住 UI 的 messagebox）
         self._banner_after_id: Optional[str] = None
+        # 失聯橫幅只提醒一次，恢復後才重置——否則每 100ms 就會重跳一次
+        self._comm_warned = False
+        # 目前這則橫幅是何時開始顯示的（決定新訊息要排隊還是直接換掉）
+        self._banner_shown_at = 0.0
 
         self._build_window()
         self._build_top_bar()
@@ -1929,47 +2040,90 @@ class DS102GUI:
         messagebox，使用者必須按確認、期間整個 UI 停擺。改用這條橫幅：
         看得到、不擋操作、幾秒後自己收起來。
         """
-        self._banner = tk.Frame(self.root, bg=CLR_WARN)
+        # ⚠ 橫幅**常駐 pack**、高度固定，閒置時只是變成背景色。
+        # 以前是有訊息才 pack、逾時 pack_forget，結果整個 notebook 會上下
+        # 跳動約 30px——而觸發橫幅最頻繁的情境正是「長按點動撞到限位」，
+        # 按鈕就在手指下方位移。Tk 的隱式指標抓取保證這次的 release 仍送到
+        # 原 widget（放開即停不受影響），但**下一次點擊**很可能落在錯位的
+        # 目標上，而點動按鈕旁邊就是停止鍵。
+        self._banner = tk.Frame(self.root, bg=CLR_BG, height=30)
+        self._banner.pack(fill="x", side="top")
+        self._banner.pack_propagate(False)
         self._banner_var = tk.StringVar(value="")
-        tk.Label(
+        self._banner_lbl = tk.Label(
             self._banner,
             textvariable=self._banner_var,
-            bg=CLR_WARN,
-            fg="white",
+            bg=CLR_BG,
+            fg=CLR_BG,
             font=("Segoe UI", 10, "bold"),
             anchor="w",
             justify="left",
-        ).pack(side="left", padx=(12, 6), pady=6, fill="x", expand=True)
-        tk.Button(
+        )
+        self._banner_lbl.pack(side="left", padx=(12, 6), fill="both", expand=True)
+        self._banner_close = tk.Button(
             self._banner,
             text="✕",
-            bg=CLR_WARN,
-            fg="white",
+            bg=CLR_BG,
+            fg=CLR_BG,
             relief="flat",
             cursor="hand2",
             font=("Segoe UI", 10, "bold"),
             command=self._hide_banner,
-        ).pack(side="right", padx=(0, 10))
-        # 先不 pack——有訊息時才顯示
+        )
+        self._banner_close.pack(side="right", padx=(0, 10))
+        # 待顯示的訊息佇列（見 _flash_banner）
+        self._banner_queue: List[Tuple[str, int]] = []
 
     def _flash_banner(self, msg: str, ms: int = 8000):
-        """顯示提醒並在 ms 毫秒後自動收起。重複呼叫會重設倒數。"""
+        """
+        顯示提醒，ms 毫秒後自動收起。
+
+        短時間內來第二則訊息時**排隊依序顯示**，不會互相覆蓋。
+        以前是直接覆寫同一個變數並重設倒數——連線成功時若同時有
+        「已從設定檔還原」與「復歸樣式未設定」兩則，第一則會在顯示 0ms
+        後被蓋掉，實質上永遠看不到。
+        """
         try:
-            self._banner_var.set(msg)
-            if not self._banner.winfo_ismapped():
-                self._banner.pack(fill="x", side="top", before=self._nb)
             if self._banner_after_id:
+                # 只有「幾乎同時」湧入的訊息才排隊。這正是佇列要解決的情境：
+                # 連線成功時「已從設定檔還原」與「復歸樣式未設定」在同一個
+                # 事件裡連續觸發，舊寫法會讓第一則顯示 0ms 就被蓋掉。
+                #
+                # 但若目前這則已經顯示一段時間，新訊息多半是使用者剛按下
+                # 某個按鈕的回饋——那不該排隊等好幾秒才出現，直接換掉。
+                if time.time() - self._banner_shown_at < BANNER_COALESCE_SEC:
+                    if (msg, ms) not in self._banner_queue:
+                        self._banner_queue.append((msg, ms))
+                    return
                 self.root.after_cancel(self._banner_after_id)
-            self._banner_after_id = self.root.after(ms, self._hide_banner)
+                self._banner_after_id = None
+            self._show_banner_now(msg, ms)
         except tk.TclError:
             pass  # 關閉流程中 widget 可能已銷毀
 
+    def _show_banner_now(self, msg: str, ms: int):
+        self._banner_shown_at = time.time()
+        self._banner_var.set(msg)
+        self._banner.config(bg=CLR_WARN)
+        self._banner_lbl.config(bg=CLR_WARN, fg="white")
+        self._banner_close.config(bg=CLR_WARN, fg="white")
+        self._banner_after_id = self.root.after(ms, self._hide_banner)
+
     def _hide_banner(self):
+        """收起目前訊息；佇列裡還有就接著顯示下一則。"""
         try:
             if self._banner_after_id:
                 self.root.after_cancel(self._banner_after_id)
                 self._banner_after_id = None
-            self._banner.pack_forget()
+            if self._banner_queue:
+                nxt_msg, nxt_ms = self._banner_queue.pop(0)
+                self._show_banner_now(nxt_msg, nxt_ms)
+                return
+            # 不 pack_forget，只是變回背景色——版面高度永遠不變
+            self._banner_var.set("")
+            self._banner.config(bg=CLR_BG)
+            self._banner_lbl.config(bg=CLR_BG, fg=CLR_BG)
+            self._banner_close.config(bg=CLR_BG, fg=CLR_BG)
         except tk.TclError:
             pass
 
@@ -1981,6 +2135,12 @@ class DS102GUI:
         self.root.configure(bg=CLR_BG)
         self.root.minsize(1020, 720)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Escape = 停止所有軸。機台旁操作時滑鼠不一定在手上，而停止鍵
+        # 只存在於「移動控制」分頁。bind_all 讓它在任何分頁、任何焦點下都有效。
+        # ⚠ 緊急停止**刻意不綁鍵盤**：誤觸後還要走解除流程並確認各軸位置，
+        #   代價比多按一次滑鼠高。
+        self.root.bind_all("<Escape>", self._on_escape)
 
         s = ttk.Style()
         s.theme_use("clam")
@@ -2143,18 +2303,22 @@ class DS102GUI:
             command=self._toggle_connect,
         )
         self._conn_btn.grid(row=0, column=5, padx=(0, 4))
-        # tk.Button(
-        #     cr,
-        #     text="模擬模式",
-        #     bg=CLR_INFO,
-        #     fg="white",
-        #     font=("Segoe UI", 10, "bold"),
-        #     relief="flat",
-        #     padx=10,
-        #     pady=4,
-        #     cursor="hand2",
-        #     command=self._start_sim,
-        # ).grid(row=0, column=6)
+        # 這顆按鈕一度被註解掉，但 CLAUDE.md 與 README 都寫「沒有硬體時
+        # GUI 頂端有模擬模式按鈕」，而 _start_sim() 也還在——文件與程式對不上，
+        # 且沒有硬體時整個 UI 無法操作。恢復。
+        self._sim_btn = tk.Button(
+            cr,
+            text="模擬模式",
+            bg=CLR_INFO,
+            fg="white",
+            font=("Segoe UI", 10, "bold"),
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            command=self._start_sim,
+        )
+        self._sim_btn.grid(row=0, column=6)
 
     # =========================================================================
     # Notebook
@@ -2254,6 +2418,7 @@ class DS102GUI:
     def _select_axis(self, ax_name: str, ax_no: str):
         self.ctrl.axis_no = ax_no
         self._axis_no_var.set(ax_no)
+        self._axis_name_var.set(ax_name)
         for grp in self._all_axis_btn_groups:
             for a, b in grp.items():
                 b.config(
@@ -2309,6 +2474,7 @@ class DS102GUI:
         pos_grid.pack(fill="x", padx=12, pady=8)
         self._dash_pos_vars: Dict[str, tk.StringVar] = {}
         self._dash_status_vars: Dict[str, tk.StringVar] = {}
+        self._dash_pos_labels: Dict[str, tk.Label] = {}
         for i, ax in enumerate(AXES):
             col = i % 3
             row = i // 3
@@ -2322,16 +2488,20 @@ class DS102GUI:
                 fg=CLR_MUTED,
                 font=("Segoe UI", 9, "bold"),
             ).pack(anchor="w", padx=8, pady=(6, 0))
-            pv = tk.StringVar(value="0")
+            # 初值「—」而非 0：0 幾乎就落在限位開關上，未連線就顯示 0
+            # 等於畫一組「所有軸都壓在端點」的假座標
+            pv = tk.StringVar(value="—")
             self._dash_pos_vars[ax] = pv
-            tk.Label(
+            pl = tk.Label(
                 cell,
                 textvariable=pv,
                 bg="#F0EEE8",
-                fg=CLR_TEXT,
+                fg=CLR_MUTED,
                 font=("Consolas", 18, "bold"),
-            ).pack(anchor="w", padx=8)
-            sv = tk.StringVar(value="—")
+            )
+            pl.pack(anchor="w", padx=8)
+            self._dash_pos_labels[ax] = pl
+            sv = tk.StringVar(value="未連線")
             self._dash_status_vars[ax] = sv
             tk.Label(
                 cell, textvariable=sv, bg="#F0EEE8", fg=CLR_MUTED, font=("Segoe UI", 8)
@@ -2360,7 +2530,20 @@ class DS102GUI:
                 command=lambda a=AXIS_NO[ax]: self.ctrl.clear_offset(a),
             ).pack(side="left")
 
-        # ── 速度設定 ──
+        # ── 實驗數據記錄（屬於「觀測」，留在儀表板）──
+        self._build_card_datalog(scr)
+
+    # =========================================================================
+    # 可搬移的卡片（抽成獨立方法，讓分頁配置能單獨調整）
+    # =========================================================================
+    def _build_card_speed(self, scr):
+        """
+        速度設定 + Profile。
+
+        放在**移動控制**分頁、緊接驅動按鈕下方：調速是靠感覺反覆試出來的，
+        以前這張卡在儀表板，等於「改速度 → 切分頁 → 點動 → 再切回去改」，
+        每次調整都要來回切兩次分頁。
+        """
         spd_card = self._card(scr, "速度設定")
         spd_f = tk.Frame(spd_card, bg=CLR_CARD)
         spd_f.pack(fill="x", padx=12, pady=8)
@@ -2411,14 +2594,18 @@ class DS102GUI:
             prof_row, text="刪除", style="Danger.TButton", command=self._delete_profile
         ).pack(side="left", padx=2)
 
-        # ── 軟體行程限制 ──
-        lim_card = self._card(scr, "軟體行程限制（Software Limit）")
+    def _build_card_sw_limits(self, scr):
+        """程式端軟體行程限制。屬於「連線後設定一次」，放分頁底部。"""
+        lim_card = self._card(scr, "軟體行程限制（程式端，非控制器韌體）")
         lim_note = tk.Label(
             lim_card,
-            text="單位：pulse。留空表示不限制。設定後馬上生效，超限指令將被攔截。",
+            text="單位：pulse。留空＝不限制。這是**程式端**的攔截，"
+                 "與下方「控制器設定」裡的韌體軟體限位（CWSLE）是兩套、互不同步。\n"
+                 "程式端只在送出指令前用快取座標算一次；韌體端才是實時的。",
             bg=CLR_CARD,
             fg=CLR_MUTED,
             font=("Segoe UI", 8),
+            justify="left",
         )
         lim_note.pack(anchor="w", padx=12, pady=(2, 4))
         lim_grid = tk.Frame(lim_card, bg=CLR_CARD)
@@ -2448,6 +2635,17 @@ class DS102GUI:
             font=("Segoe UI", 9),
             width=14,
         ).grid(row=0, column=2)
+        # 「目前生效」欄：輸入框留白有兩種無法分辨的含意——「這一軸沒設限制」
+        # 與「有設，只是沒顯示」。把 ctrl.sw_limits 的實際內容攤出來。
+        tk.Label(
+            lim_grid,
+            text="目前生效",
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 9),
+            width=22,
+        ).grid(row=0, column=3)
+        self._lim_cur_vars: Dict[str, tk.StringVar] = {}
         for r, ax in enumerate(AXES, start=1):
             tk.Label(
                 lim_grid,
@@ -2466,6 +2664,17 @@ class DS102GUI:
             ttk.Entry(lim_grid, textvariable=cw_v, width=14).grid(
                 row=r, column=2, padx=4, pady=2
             )
+            cur_v = tk.StringVar(value="無限制")
+            self._lim_cur_vars[ax] = cur_v
+            tk.Label(
+                lim_grid,
+                textvariable=cur_v,
+                bg=CLR_CARD,
+                fg=CLR_MUTED,
+                font=("Consolas", 8),
+                width=22,
+                anchor="w",
+            ).grid(row=r, column=3, padx=4, pady=2)
         ttk.Button(
             lim_card,
             text="套用限制設定",
@@ -2473,7 +2682,8 @@ class DS102GUI:
             command=self._apply_sw_limits,
         ).pack(padx=12, pady=(0, 8))
 
-        # ── 控制器設定的存檔／還原 ──
+    def _build_card_controller_cfg(self, scr):
+        """控制器設定的存檔／還原。同樣是「連線後設定一次」的東西。"""
         cfg_card = self._card(scr, "控制器設定（MEMSW0 復歸樣式 + 韌體軟體限位）")
         tk.Label(
             cfg_card,
@@ -2509,7 +2719,8 @@ class DS102GUI:
             command=self._restore_controller_config,
         ).pack(side="left")
 
-        # ── 實驗數據記錄 ──
+    def _build_card_datalog(self, scr):
+        """實驗數據記錄（CSV）。屬於「觀測」，留在儀表板。"""
         data_card = self._card(scr, "實驗數據記錄（CSV）")
         data_row = tk.Frame(data_card, bg=CLR_CARD)
         data_row.pack(fill="x", padx=12, pady=8)
@@ -2600,9 +2811,11 @@ class DS102GUI:
         tk.Label(
             info_row, text="軸:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
         ).pack(side="left")
+        # 顯示軸名（X/Y/Z…）而非軸號（1/2/3）——軸選擇器上按的是 X，
+        # 這裡卻寫 1，同一個畫面兩套命名，而「選錯軸就是驅動錯的滑台」
         tk.Label(
             info_row,
-            textvariable=self._axis_no_var,
+            textvariable=self._axis_name_var,
             bg=CLR_CARD,
             fg=CLR_ACCENT,
             font=("Segoe UI", 14, "bold"),
@@ -2624,12 +2837,35 @@ class DS102GUI:
         tk.Label(
             pos_row, text="Position:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
         ).pack(side="left")
-        ttk.Entry(pos_row, textvariable=self._ctrl_pos_var, width=14).pack(
+        # ⚠ 唯讀顯示，與下方的輸入框分開。
+        # 以前兩者共用 _ctrl_pos_var：輪詢每 100ms 覆寫它，使用者打到一半的
+        # 數字會被清掉；反過來看，欄位裡的數字像是「即將設定的值」，實際是
+        # 「剛讀回來的值」，兩種語意疊在同一個 widget 上。
+        tk.Label(
+            pos_row,
+            textvariable=self._ctrl_pos_var,
+            bg=CLR_CARD,
+            fg=CLR_TEXT,
+            font=("Consolas", 11, "bold"),
+            width=12,
+            anchor="e",
+        ).pack(side="left", padx=6)
+        tk.Label(
+            pos_row, text="pulse", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        ).pack(side="left", padx=(0, 16))
+
+        # 改寫座標暫存器（不產生任何移動）——預設留空，不可預填 0
+        tk.Label(
+            pos_row, text="改寫為:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+        ).pack(side="left")
+        self._setpos_var = tk.StringVar(value="")
+        ttk.Entry(pos_row, textvariable=self._setpos_var, width=10).pack(
             side="left", padx=6
         )
-        ttk.Button(pos_row, text="Set Position", command=self._do_set_position).pack(
-            side="left", padx=4
-        )
+        ttk.Button(
+            pos_row, text="設為此值", style="Flat.TButton",
+            command=self._do_set_position,
+        ).pack(side="left", padx=4)
 
         # CCW / Stop / CW
         btn_row = tk.Frame(drv_f, bg=CLR_CARD)
@@ -2690,11 +2926,29 @@ class DS102GUI:
         self._drive_buttons.extend([self._ccw_btn, self._cw_btn])
         tk.Label(
             drv_card,
-            text="連線後方可使用；EMS 或重播中驅動按鈕自動鎖定（停止鍵不受此限）",
+            text="連線後方可使用；EMS 或重播中驅動按鈕自動鎖定（停止鍵不受此限）"
+                 "　·　Esc = 停止所有軸",
             bg=CLR_CARD,
             fg=CLR_MUTED,
             font=("Segoe UI", 8),
         ).pack(pady=(0, 8))
+
+        # ── 速度設定緊接在驅動按鈕下方 ──
+        # 調速是靠感覺反覆試出來的，兩者必須在同一個視野內。
+        # 以前速度設定在儀表板，每次調整都要來回切兩次分頁。
+        self._build_card_speed(scr)
+
+        # ── 以下是「連線後設定一次」的東西，用分隔線與日常操作區隔 ──
+        ttk.Separator(scr, orient="horizontal").pack(fill="x", padx=12, pady=(14, 6))
+        tk.Label(
+            scr,
+            text="以下為連線後設定一次即可的項目",
+            bg=CLR_BG,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", padx=14)
+        self._build_card_sw_limits(scr)
+        self._build_card_controller_cfg(scr)
 
     # ── 模式與驅動事件 ────────────────────────────────────────
     def _on_mode_change(self):
@@ -2771,10 +3025,50 @@ class DS102GUI:
     def _do_stop(self):
         self.ctrl.stop()
 
+    def _on_escape(self, event=None):
+        """Escape：停止所有軸，並中止進行中的重播。"""
+        if not self.ctrl.connected:
+            return
+        self.ctrl.stop()
+        if self.ctrl.playback_running:
+            self._stop_playback.set()
+        self._flash_banner("■ 已送出停止指令（Esc）", 4000)
+
     def _do_set_position(self):
-        val = self._ctrl_pos_var.get().strip()
-        if val:
-            self.ctrl.set_position(self.ctrl.axis_no, val)
+        """
+        改寫座標暫存器（`AXI{n}:POS {val}`）——不會產生任何移動。
+
+        值得一次確認：這會讓後續所有軟體限位比對與 teaching point 的基準
+        全部跟著偏移，而且沒有任何實體動作可以提示使用者「剛剛發生了什麼」。
+        """
+        if not self.ctrl.connected:
+            self._flash_banner("尚未連線，無法設定座標", 4000)
+            return
+        raw = self._setpos_var.get().strip()
+        if not raw:
+            self._flash_banner("請先在「改寫為」欄位輸入數值", 4000)
+            return
+        try:
+            val = float(raw)
+        except ValueError:
+            messagebox.showerror("錯誤", f"「{raw}」不是有效數值（只填數字，不要單位）")
+            return
+
+        ax = NO_AXIS.get(self.ctrl.axis_no, self.ctrl.axis_no)
+        cur = self._ctrl_pos_var.get()
+        if not messagebox.askyesno(
+            "確認改寫座標",
+            f"將軸 {ax} 的座標暫存器\n\n"
+            f"　　由 {cur} 改寫為 {val:.0f}\n\n"
+            f"這**不會產生任何移動**，但之後的軟體限位比對與\n"
+            f"Teaching Point 都會以新座標為基準。確定？",
+            icon="warning",
+            default="no",
+        ):
+            return
+        self.ctrl.set_position(self.ctrl.axis_no, f"{val:.0f}")
+        self._setpos_var.set("")
+        self._flash_banner(f"軸 {ax} 座標已改寫為 {val:.0f}", 5000)
 
     def _poll_status(self):
         """
@@ -2981,13 +3275,35 @@ class DS102GUI:
         self._poll_status()
 
     def _do_delete_point(self):
+        """
+        刪除 Teaching Point。
+
+        確認視窗比照「刪除行程」的規格：列出內容、`icon="warning"`、
+        `default="no"`。以前只有一句「確定刪除 [name]？」且沒有 default，
+        Tk 的預設焦點在「是」——而教點是操作者一個一個教出來的座標，
+        誤刪只有整檔 .bak 可救。
+        """
         sel = self._pts_tree.selection()
         if not sel:
+            self._flash_banner("請先選取要刪除的 Teaching Point", 4000)
             return
-        name = sel[0]
-        if messagebox.askyesno("確認", f"確定刪除 [{name}]？"):
-            self.ctrl.delete_point(name)
-            self._refresh_points()
+        name = sel[0]  # iid 即點名稱
+        pt = self.ctrl.saved_points.get(name, {})
+        pos = pt.get("positions_pulse", {})
+        detail = "、".join(f"{a}={v:,.0f}" for a, v in pos.items()) or "（無座標）"
+        if not messagebox.askyesno(
+            "確認刪除",
+            f"確定刪除 Teaching Point [{name}]？\n\n"
+            f"座標：{detail}\n"
+            f"建立：{pt.get('ts', '?')}\n\n"
+            f"刪除後只能從 teaching_points.json.bak 手動救回。",
+            icon="warning",
+            default="no",
+        ):
+            return
+        self.ctrl.delete_point(name)
+        self._refresh_points()
+        self._flash_banner(f"🗑 Teaching Point [{name}] 已刪除", 5000)
 
     def _refresh_points(self):
         self._pts_tree.delete(*self._pts_tree.get_children())
@@ -3019,9 +3335,29 @@ class DS102GUI:
     # TAB：行程錄製
     # =========================================================================
     def _build_tab_recording(self, parent):
+        """
+        行程錄製分頁。
+
+        卡片順序刻意依「實際操作動線」排，而不是依功能分類：
+
+            行程錄製      ← 錄一段新的
+            已儲存行程    ← 選一個既有的（這是下面兩張卡的資料來源）
+            步驟明細      ← 顯示上面選取那一筆的內容，可改延遲
+            重播設定      ← 跑它
+
+        以前「步驟明細」排在「已儲存行程」**上面**，但它的內容是由下方
+        清單的選取事件填進去的——資料來源在消費者下方。要編輯既有行程的
+        延遲得先往下捲選行程、再往上捲看步驟、再往下捲按重播。
+        """
         self._add_status_bar(parent)
         scr = self._scrollable(parent)
 
+        self._build_card_record(scr)
+        self._build_card_rec_list(scr)
+        self._build_card_steps(scr)
+        self._build_card_playback(scr)
+
+    def _build_card_record(self, scr):
         rec_card = self._card(scr, "行程錄製")
         rf = tk.Frame(rec_card, bg=CLR_CARD)
         rf.pack(fill="x", padx=12, pady=8)
@@ -3060,7 +3396,10 @@ class DS102GUI:
         )
         self._rec_stop_btn.pack(side="left", padx=4)
 
-        steps_card = self._card(scr, "已錄製步驟（僅含驅動指令，雙擊延遲欄可修改）")
+    def _build_card_steps(self, scr):
+        steps_card = self._card(
+            scr, "步驟明細（顯示上方選取的行程；雙擊延遲欄可修改並存檔）"
+        )
         tf = tk.Frame(steps_card, bg=CLR_CARD)
         tf.pack(fill="x", padx=12, pady=6)
         self._steps_tree = ttk.Treeview(
@@ -3099,8 +3438,18 @@ class DS102GUI:
         ttk.Button(
             gd, text="套用", style="Flat.TButton", command=self._apply_global_delay
         ).pack(side="left", padx=6)
+        # 與下方「每輪之間間隔」外觀太像、預設值也相近，必須靠文案與顏色
+        # 區分「會寫檔」與「只影響這次」
+        tk.Label(
+            gd,
+            text="⚠ 會覆蓋並存檔",
+            bg=CLR_CARD,
+            fg=CLR_WARN,
+            font=("Segoe UI", 8, "bold"),
+        ).pack(side="left", padx=4)
 
-        list_card = self._card(scr, "已儲存行程")
+    def _build_card_rec_list(self, scr):
+        list_card = self._card(scr, "已儲存行程（選一個，下方會顯示它的步驟）")
         self._rec_tree = ttk.Treeview(
             list_card,
             columns=("name", "count", "created"),
@@ -3136,6 +3485,7 @@ class DS102GUI:
             font=("Segoe UI", 8),
         ).pack(side="left", padx=8)
 
+    def _build_card_playback(self, scr):
         play_card = self._card(scr, "重播設定")
         pf = tk.Frame(play_card, bg=CLR_CARD)
         pf.pack(fill="x", padx=12, pady=8)
@@ -3178,17 +3528,34 @@ class DS102GUI:
             wraplength=420,
         ).grid(row=1, column=2, sticky="w", padx=8)
 
+        tk.Label(
+            play_card,
+            text="⚠ 重播會直接重送錄下來的原始指令，"
+                 "不經過軟體限位檢查、也不做 PULS 取整正規化。"
+                 "執行前請先確認各軸位置。",
+            bg=CLR_CARD,
+            fg=CLR_WARN,
+            font=("Segoe UI", 8),
+            justify="left",
+            wraplength=560,
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
         plbtn = tk.Frame(play_card, bg=CLR_CARD)
         plbtn.pack(padx=12, pady=(0, 8))
-        ttk.Button(
-            plbtn, text="▶ 重播行程", style="Accent.TButton", command=self._do_play_rec
-        ).pack(side="left", padx=4)
-        ttk.Button(
+        # Warn 而非 Accent：它會用未經限位檢查的指令驅動真實滑台，
+        # 不該跟「儲存 Teaching Point」長得一樣安全
+        self._play_btn = ttk.Button(
+            plbtn, text="▶ 重播行程", style="Warn.TButton", command=self._do_play_rec
+        )
+        self._play_btn.pack(side="left", padx=4)
+        self._stop_play_btn = ttk.Button(
             plbtn,
             text="■ 停止重播",
             style="Danger.TButton",
             command=self._do_stop_playback,
-        ).pack(side="left", padx=4)
+            state="disabled",
+        )
+        self._stop_play_btn.pack(side="left", padx=4)
 
     def _do_start_rec(self):
         self.ctrl.start_recording(self._rec_name_var.get().strip())
@@ -3212,12 +3579,9 @@ class DS102GUI:
         self._load_steps_to_tree(rec)
 
     def _on_rec_select(self, event):
-        sel = self._rec_tree.selection()
-        if not sel:
-            return
-        idx = self._rec_tree.index(sel[0])
-        if 0 <= idx < len(self.ctrl.recordings):
-            self._load_steps_to_tree(self.ctrl.recordings[idx])
+        rec = self._selected_recording()
+        if rec is not None:
+            self._load_steps_to_tree(rec)
 
     def _load_steps_to_tree(self, rec: dict):
         self._steps_tree.delete(*self._steps_tree.get_children())
@@ -3264,62 +3628,67 @@ class DS102GUI:
             except Exception:
                 messagebox.showerror("錯誤", "請輸入有效正整數", parent=win)
                 return
+            # 同樣是「先確認能寫成功，再動畫面」
+            rec = self._selected_recording()
+            if rec is None:
+                messagebox.showerror("錯誤", "找不到對應的行程", parent=win)
+                return
+            steps = rec.get("steps", [])
+            if not (0 <= step_idx < len(steps)):
+                messagebox.showerror("錯誤", "步驟索引超出範圍", parent=win)
+                return
+            steps[step_idx]["delay_ms"] = ms
+            if not self.ctrl.save_recording(rec):
+                messagebox.showerror(
+                    "錯誤", "寫入行程檔失敗（詳見 LOG），畫面未更新", parent=win
+                )
+                return
             self._steps_tree.item(item, values=(vals[0], vals[1], vals[2], ms))
-            rec_sel = self._rec_tree.selection()
-            if rec_sel:
-                ridx = self._rec_tree.index(rec_sel[0])
-                if 0 <= ridx < len(self.ctrl.recordings):
-                    rec = self.ctrl.recordings[ridx]
-                    steps = rec.get("steps", [])
-                    if 0 <= step_idx < len(steps):
-                        steps[step_idx]["delay_ms"] = ms
-                        # 寫回磁碟：以前只改記憶體，重開就變回原值
-                        if self.ctrl.save_recording(rec):
-                            self._flash_banner(
-                                f"步驟 #{vals[0]} 延遲已改為 {ms}ms 並存檔", 4000
-                            )
-                        else:
-                            messagebox.showerror(
-                                "錯誤", "延遲已修改，但寫入檔案失敗（詳見 LOG）",
-                                parent=win,
-                            )
+            self._flash_banner(f"步驟 #{vals[0]} 延遲已改為 {ms}ms 並存檔", 4000)
             win.destroy()
 
         ttk.Button(win, text="確認", style="Accent.TButton", command=_apply).pack()
 
     def _apply_global_delay(self):
+        """
+        批次把所有步驟的延遲設成同一個值，並寫回行程檔。
+
+        ⚠ **所有檢查都要在動畫面之前完成。** 舊寫法先把 tree 上每一列的
+        延遲欄改掉，才發現沒選行程 → 跳警告 return，結果是「檔案沒寫、
+        記憶體沒改，但螢幕上滿屏都是新值」。使用者按完確認會合理認為
+        已生效——這正是「其實沒生效卻顯示成功」。
+        """
+        rec = self._selected_recording()
+        if rec is None:
+            self._flash_banner("請先選擇要套用的行程", 4000)
+            return
         try:
             ms = int(self._global_delay_var.get())
             assert ms >= 0
-        except Exception:
-            messagebox.showerror("錯誤", "請輸入有效毫秒數")
+        except (ValueError, AssertionError):
+            messagebox.showerror("錯誤", "請輸入 0 或正整數毫秒")
+            return
+
+        # 檢查全過了才動資料與畫面
+        for step in rec.get("steps", []):
+            step["delay_ms"] = ms
+        if not self.ctrl.save_recording(rec):
+            messagebox.showerror("錯誤", "寫入行程檔失敗（詳見 LOG），畫面未更新")
             return
         for item in self._steps_tree.get_children():
             vals = self._steps_tree.item(item)["values"]
             self._steps_tree.item(item, values=(vals[0], vals[1], vals[2], ms))
-        rec_sel = self._rec_tree.selection()
-        if not rec_sel:
-            messagebox.showwarning("警告", "請先選擇行程")
-            return
-        ridx = self._rec_tree.index(rec_sel[0])
-        if not (0 <= ridx < len(self.ctrl.recordings)):
-            return
-        rec = self.ctrl.recordings[ridx]
-        for step in rec.get("steps", []):
-            step["delay_ms"] = ms
-        # 寫回磁碟：以前只改記憶體，重開程式就變回原值
-        if self.ctrl.save_recording(rec):
-            self._flash_banner(f"行程 [{rec.get('name')}] 全部步驟延遲已設為 {ms}ms 並存檔", 4000)
-        else:
-            messagebox.showerror("錯誤", "延遲已修改，但寫入檔案失敗（詳見 LOG）")
+        self._flash_banner(
+            f"行程 [{rec.get('name')}] 全部步驟延遲已設為 {ms}ms 並存檔", 4000
+        )
 
     def _do_play_rec(self):
-        sel = self._rec_tree.selection()
-        if not sel:
-            messagebox.showwarning("警告", "請先選擇行程")
+        if self.ctrl.playback_running:
+            self._flash_banner("已有重播進行中", 4000)
             return
-        idx = self._rec_tree.index(sel[0])
-        if idx >= len(self.ctrl.recordings):
+        rec = self._selected_recording()
+        if rec is None:
+            self._flash_banner("請先選擇要重播的行程", 4000)
             return
         # 每輪之間的間隔（跑完一次完整行程後、下一輪開始前）
         try:
@@ -3327,6 +3696,29 @@ class DS102GUI:
             assert cycle_delay >= 0
         except (ValueError, AssertionError):
             messagebox.showerror("錯誤", "每輪之間間隔請輸入 0 或正整數毫秒")
+            return
+
+        repeat = self._repeat_var.get()
+        n_steps = len(rec.get("steps", []))
+        # 粗估：各步驟延遲 + 輪間間隔（不含到位等待，所以是下限）
+        est_s = (
+            sum(s.get("delay_ms", 200) for s in rec.get("steps", [])) * repeat
+            + cycle_delay * max(0, repeat - 1)
+        ) / 1000.0
+
+        # 這是「必須做決定才能繼續」的情境——它會用未經限位檢查的原始指令
+        # 驅動真實滑台，值得一次確認。預設焦點放在「否」。
+        if not messagebox.askyesno(
+            "確認重播",
+            f"即將重播行程 [{rec.get('name')}]\n\n"
+            f"步數：{n_steps}　重複：{repeat} 輪\n"
+            f"每輪間隔：{cycle_delay} ms\n"
+            f"預估最短時間：{est_s:.1f} 秒（不含到位等待）\n\n"
+            f"⚠ 重播不檢查軟體限位，也不做 PULS 取整正規化。\n"
+            f"請先確認各軸目前位置足以完整跑完這段行程。",
+            icon="warning",
+            default="no",
+        ):
             return
 
         self._stop_playback.clear()
@@ -3337,17 +3729,31 @@ class DS102GUI:
             self.root.after(0, lambda: self._play_progress_var.set(txt))
             self.root.after(0, self._update_stat_ui)
 
-        threading.Thread(
-            target=self.ctrl.play_recording,
-            kwargs={
-                "rec": self.ctrl.recordings[idx],
-                "repeat": self._repeat_var.get(),
-                "stop_event": self._stop_playback,
-                "progress_cb": _progress,
-                "cycle_delay_ms": cycle_delay,
-            },
-            daemon=True,
-        ).start()
+        # 重播中不可再按（以前不在 _drive_buttons 裡，連按會疊出第二條
+        # 執行緒，兩條同時寫序列埠）；停止鍵反過來要啟用
+        self._play_btn.config(state="disabled")
+        self._stop_play_btn.config(state="normal")
+
+        def _run():
+            try:
+                self.ctrl.play_recording(
+                    rec=rec,
+                    repeat=repeat,
+                    stop_event=self._stop_playback,
+                    progress_cb=_progress,
+                    cycle_delay_ms=cycle_delay,
+                )
+            finally:
+                self.root.after(0, self._on_playback_end)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_playback_end(self):
+        try:
+            self._play_btn.config(state="normal")
+            self._stop_play_btn.config(state="disabled")
+        except tk.TclError:
+            pass
 
 
     def _do_stop_playback(self):
@@ -3368,14 +3774,10 @@ class DS102GUI:
         self._flash_banner("■ 已中止重播並送出停止指令", 5000)
 
     def _do_delete_rec(self):
-        sel = self._rec_tree.selection()
-        if not sel:
-            messagebox.showwarning("警告", "請先選擇要刪除的行程")
+        rec = self._selected_recording()
+        if rec is None:
+            self._flash_banner("請先選擇要刪除的行程", 4000)
             return
-        idx = self._rec_tree.index(sel[0])
-        if not (0 <= idx < len(self.ctrl.recordings)):
-            return
-        rec = self.ctrl.recordings[idx]
         name = rec.get("name", "")
         n_steps = len(rec.get("steps", []))
 
@@ -3401,17 +3803,33 @@ class DS102GUI:
         self._flash_banner(f"🗑 {msg}", 6000)
 
     def _refresh_recordings(self):
+        """
+        重繪行程清單。**iid 用行程名稱**，不要靠位置索引。
+
+        以前四處都用 `_rec_tree.index(sel[0])` 去索引 `ctrl.recordings`，
+        等於假設「顯示順序」與「記憶體順序」永遠一致——排序、篩選、
+        或刪除後重繪都可能讓這個假設破功，而破功的後果是對錯誤的行程
+        套用延遲、甚至刪錯檔案。Teaching Point 已經因為同類問題改用 iid。
+        """
         self._rec_tree.delete(*self._rec_tree.get_children())
         for rec in self.ctrl.recordings:
+            name = rec.get("name", "")
             self._rec_tree.insert(
                 "",
                 "end",
-                values=(
-                    rec.get("name", ""),
-                    rec.get("count", 0),
-                    rec.get("created", "")[:19],
-                ),
+                iid=name,
+                values=(name, rec.get("count", 0), rec.get("created", "")[:19]),
             )
+
+    def _selected_recording(self) -> Optional[dict]:
+        """回傳目前選取的行程 dict；沒選或找不到時回 None。"""
+        sel = self._rec_tree.selection()
+        if not sel:
+            return None
+        name = sel[0]  # iid 即行程名稱，不經 Treeview 的型別轉換
+        return next(
+            (r for r in self.ctrl.recordings if r.get("name") == name), None
+        )
 
     # =========================================================================
     # TAB：LOG
@@ -3438,6 +3856,28 @@ class DS102GUI:
         ttk.Checkbutton(toolbar, text="自動捲動", variable=self._log_auto_scroll).pack(
             side="left", padx=8
         )
+        # 層級篩選：出事後要找警告，不該被大量 INFO 淹掉
+        ttk.Separator(toolbar, orient="vertical").pack(
+            side="left", fill="y", padx=8, pady=4
+        )
+        tk.Label(
+            toolbar, text="只顯示:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+        ).pack(side="left")
+        ttk.Combobox(
+            toolbar,
+            textvariable=self._log_filter_var,
+            values=["全部", "WARN 以上", "只看 ERROR"],
+            width=10,
+            state="readonly",
+        ).pack(side="left", padx=6)
+        self._log_filter_var.trace_add("write", lambda *a: self._rerender_log())
+        tk.Label(
+            toolbar,
+            textvariable=self._log_count_var,
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 8),
+        ).pack(side="right", padx=12)
 
         log_frame = tk.Frame(parent, bg=CLR_LOG_BG)
         log_frame.pack(fill="both", expand=True)
@@ -3494,12 +3934,54 @@ class DS102GUI:
     def _on_log_entry(self, entry: dict):
         self.root.after(0, self._append_log_ui, entry)
 
-    def _append_log_ui(self, entry: dict):
+    def _log_visible(self, level: str) -> bool:
+        """依目前的層級篩選判斷這筆要不要顯示。"""
+        mode = self._log_filter_var.get()
+        if mode == "只看 ERROR":
+            return level == "ERROR"
+        if mode == "WARN 以上":
+            return level in ("WARN", "ERROR")
+        return True
+
+    def _rerender_log(self):
+        """切換篩選後，用 action_history 重繪整個 LOG 視窗。"""
+        if not self._log_text:
+            return
+        with self.ctrl._history_lock:
+            history = list(self.ctrl.action_history)
+        shown = [h for h in history if self._log_visible(h.get("level", "INFO"))]
+        # 只保留尾端 LOG_TEXT_MAX_LINES 筆，避免一次塞爆 Text widget
+        shown = shown[-LOG_TEXT_MAX_LINES:]
+        try:
+            self._log_text.config(state="normal")
+            self._log_text.delete("1.0", "end")
+            for h in shown:
+                self._log_text.insert("end", self._fmt_log_line(h),
+                                      h.get("level", "INFO"))
+            if self._log_auto_scroll.get():
+                self._log_text.see("end")
+            self._log_text.config(state="disabled")
+        except tk.TclError:
+            return
+        self._log_count_var.set(
+            f"顯示 {len(shown)} / 共 {len(history)} 筆"
+            if self._log_filter_var.get() != "全部"
+            else f"共 {len(history)} 筆"
+        )
+
+    @staticmethod
+    def _fmt_log_line(entry: dict) -> str:
         level = entry.get("level", "INFO")
         ts = entry.get("ts", "")
         tx = f"[{entry['tx']}] " if entry.get("tx") else ""
         rx = f"→[{entry['rx']}] " if entry.get("rx") else ""
-        line = f"{ts} [{level:<5}] {tx}{rx}{entry.get('msg','')}\n"
+        return f"{ts} [{level:<5}] {tx}{rx}{entry.get('msg','')}\n"
+
+    def _append_log_ui(self, entry: dict):
+        level = entry.get("level", "INFO")
+        if not self._log_visible(level):
+            return  # 被篩選掉，但仍留在 action_history，切回「全部」就看得到
+        line = self._fmt_log_line(entry)
         if self._log_text:
             self._log_text.config(state="normal")
             self._log_text.insert("end", line, level)
@@ -3513,7 +3995,9 @@ class DS102GUI:
             self._log_text.config(state="disabled")
         for sb in self._status_bars:
             sb.update_log(f"[{level}] {entry.get('msg','')}")
-        self._update_stat_ui()
+        # 這裡刻意不呼叫 _update_stat_ui()——_start_poller 每
+        # UI_REDRAW_INTERVAL 已經會跑一次。每筆 log 都重跑一遍是純粹的
+        # 重複工，而 log 的頻率遠高於 UI 需要更新的頻率。
 
     # =========================================================================
     # 警報回調
@@ -3817,12 +4301,27 @@ class DS102GUI:
         self.ctrl._log("INFO", f"載入速度 Profile [{name}]")
 
     def _delete_profile(self):
+        """刪除速度 Profile。確認視窗比照「刪除行程」的規格。"""
         name = self._profile_var.get()
         if not name:
+            self._flash_banner("請先選取要刪除的 Profile", 4000)
             return
-        if messagebox.askyesno("確認", f"刪除 Profile [{name}]？"):
-            self.ctrl.delete_speed_profile(name)
-            self._refresh_profiles()
+        p = self.ctrl.speed_profiles.get(name, {})
+        detail = "　".join(
+            f"{k}={p.get(k, '?')}" for k in ("l_speed", "f_speed", "rate", "s_rate")
+        )
+        if not messagebox.askyesno(
+            "確認刪除",
+            f"確定刪除速度 Profile [{name}]？\n\n{detail}\n\n"
+            f"刪除後只能從 speed_profiles.json.bak 手動救回。",
+            icon="warning",
+            default="no",
+        ):
+            return
+        self.ctrl.delete_speed_profile(name)
+        self._profile_var.set("")
+        self._refresh_profiles()
+        self._flash_banner(f"🗑 Profile [{name}] 已刪除", 5000)
 
     def _refresh_profiles(self):
         names = list(self.ctrl.speed_profiles.keys())
@@ -3895,6 +4394,7 @@ class DS102GUI:
         兩者都是「以為有保護、其實沒有」，比沒設還危險。
         """
         bad: List[str] = []
+        pending: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
         cleared: List[str] = []
 
         def _parse(raw: str, ax: str, side: str) -> Optional[float]:
@@ -3907,33 +4407,58 @@ class DS102GUI:
                 bad.append(f"軸 {ax} {side}「{raw}」")
                 return None
 
+        # ── 先算出「將要變成什麼」，一個字都還沒寫進 ctrl.sw_limits ──
         for ax, (ccw_v, cw_v) in self._lim_vars.items():
             prev = self.ctrl.sw_limits.get(ax, (None, None))
             ccw = _parse(ccw_v.get(), ax, "CCW")
             cw = _parse(cw_v.get(), ax, "CW")
+            pending[ax] = (ccw, cw)
             if any(p is not None for p in prev) and ccw is None and cw is None:
-                cleared.append(ax)
-            self.ctrl.sw_limits[ax] = (ccw, cw)
-            self.ctrl._log("INFO", f"軸 {ax} 軟體限制: CCW={ccw}, CW={cw}")
+                cleared.append(f"{ax}（原 CCW={prev[0]}, CW={prev[1]}）")
 
         if bad:
-            self.ctrl._log("ERROR", f"軟體限制格式錯誤（已視為無限制）: {'、'.join(bad)}")
+            self.ctrl._log("ERROR", f"軟體限制格式錯誤，未套用: {'、'.join(bad)}")
             messagebox.showerror(
                 "格式錯誤",
-                "以下欄位無法解析，已視為「無限制」：\n\n"
+                "以下欄位無法解析：\n\n"
                 + "\n".join(bad)
-                + "\n\n請只填數字（不要有逗號或單位）後重新套用。",
+                + "\n\n**這次完全沒有套用**，既有限制維持不變。\n"
+                  "請只填數字（不要有逗號或單位）後重新套用。",
             )
             return
+
+        # ── 會清空既有保護時，事前徵求確認（以前是寫完才警告）──
+        if cleared and not messagebox.askyesno(
+            "確認清除限制",
+            "以下軸的欄位是空的，套用後其限制會被清除（＝無限制）：\n\n"
+            + "\n".join(f"　{c}" for c in cleared)
+            + "\n\n這些軸將失去程式端的行程保護。確定要套用嗎？",
+            icon="warning",
+            default="no",
+        ):
+            return
+
+        for ax, (ccw, cw) in pending.items():
+            self.ctrl.sw_limits[ax] = (ccw, cw)
+            self.ctrl._log("INFO", f"軸 {ax} 軟體限制: CCW={ccw}, CW={cw}")
+        self._refresh_sw_limit_display()
         if cleared:
-            self.ctrl._log("WARN", f"以下軸的軟體限制被清空: {'、'.join(cleared)}")
-            messagebox.showwarning(
-                "限制已清空",
-                f"軸 {'、'.join(cleared)} 的欄位是空的，其原有限制已被清除"
-                f"（＝無限制）。\n\n若非本意，請重新填入數值再套用。",
+            self._flash_banner(
+                f"⚠ 已清除 {len(cleared)} 個軸的程式端行程限制", 8000
             )
-            return
-        messagebox.showinfo("完成", "軟體行程限制已套用")
+        else:
+            self._flash_banner("✔ 軟體行程限制已套用", 5000)
+
+    def _refresh_sw_limit_display(self):
+        """把 ctrl.sw_limits 的實際內容顯示在「目前生效」欄。"""
+        for ax, var in self._lim_cur_vars.items():
+            ccw, cw = self.ctrl.sw_limits.get(ax, (None, None))
+            if ccw is None and cw is None:
+                var.set("無限制")
+            else:
+                lo = f"{ccw:,.0f}" if ccw is not None else "−∞"
+                hi = f"{cw:,.0f}" if cw is not None else "+∞"
+                var.set(f"{lo} … {hi}")
 
     # =========================================================================
     # 實驗數據記錄
@@ -3959,8 +4484,33 @@ class DS102GUI:
     # 儀表板狀態更新
     # =========================================================================
     def _update_stat_ui(self):
+        # 失聯要看得出來：以前 USB 被拔掉、控制器斷電時 connected 仍是 True，
+        # 指示燈維持綠色、座標停在最後一次成功的值，畫面看起來完全正常。
+        stale = self.ctrl.comm_stale
+        if stale and not self._comm_warned:
+            self._comm_warned = True
+            self._flash_banner(
+                "⚠ 讀不到控制器回應，畫面上的座標已停止更新、不可信。"
+                "請檢查 USB／電源，或重新連線。",
+                15000,
+            )
+        elif not stale and self._comm_warned:
+            self._comm_warned = False
+            self._flash_banner("✔ 與控制器的通訊已恢復", 5000)
+
+        if self.ctrl.connected:
+            self._conn_dot.itemconfig(
+                self._conn_dot_id,
+                fill=CLR_DANGER if stale else (
+                    CLR_INFO if self.ctrl.sim_mode else CLR_ACCENT
+                ),
+            )
+
         if "conn" in self._stat_vars:
-            self._stat_vars["conn"].set("已連線" if self.ctrl.connected else "未連線")
+            self._stat_vars["conn"].set(
+                "⚠ 失聯" if stale
+                else ("已連線" if self.ctrl.connected else "未連線")
+            )
         if "axes" in self._stat_vars:
             self._stat_vars["axes"].set(
                 str(self.ctrl.axis_count) if self.ctrl.connected else "—"
@@ -3986,6 +4536,52 @@ class DS102GUI:
     # =========================================================================
     # 座標定時輪詢
     # =========================================================================
+    def _redraw_positions(self):
+        """
+        重繪儀表板的各軸座標與狀態。純顯示，不做任何 I/O。
+
+        三種狀態必須看得出差別：未連線→「—」（不可顯示 0，0 幾乎就在
+        限位開關上）、失聯→數值轉警告色並註明已停止更新、正常→顯示數值。
+        每軸下方的狀態小字以前是死的（`_dash_status_vars` 建立後全檔沒有
+        任何地方更新它，永遠顯示「—」），這裡一併接上。
+        """
+        connected = self.ctrl.connected
+        stale = self.ctrl.comm_stale
+        n_axes = self.ctrl.axis_count if connected else 0
+        cur_ax = NO_AXIS.get(self.ctrl.axis_no)
+        pos_work = self.ctrl.positions
+
+        for ax, var in self._dash_pos_vars.items():
+            enabled = connected and int(AXIS_NO[ax]) <= n_axes
+            lbl = self._dash_pos_labels.get(ax)
+            sv = self._dash_status_vars.get(ax)
+
+            if not enabled:
+                var.set("—")
+                if lbl:
+                    lbl.config(fg=CLR_MUTED)
+                if sv:
+                    sv.set("未連線" if not connected else "未啟用")
+                continue
+
+            var.set(f"{pos_work.get(ax, 0.0):,.0f}")
+            if lbl:
+                lbl.config(fg=CLR_DANGER if stale else CLR_TEXT)
+            if sv:
+                bits = []
+                if ax == cur_ax:
+                    bits.append("● 選取中")
+                if stale:
+                    bits.append("⚠ 已停止更新")
+                elif self.ctrl.sim_mode:
+                    bits.append("模擬")
+                else:
+                    age = self.ctrl.position_age()
+                    bits.append("即時" if age < 1.5 else f"{age:.0f}s 前")
+                if self.ctrl.playback_running:
+                    bits.append("重播中")
+                sv.set("　".join(bits))
+
     def _start_poller(self):
         """
         把快取的座標重繪到畫面上。不做任何 I/O。
@@ -4000,9 +4596,7 @@ class DS102GUI:
             if self._shutting_down.is_set():
                 return  # 關閉後不要再排下一輪，否則會對已銷毀的 widget 動作
             try:
-                pos_work = self.ctrl.positions
-                for ax, lbl in self._dash_pos_vars.items():
-                    lbl.set(f"{pos_work.get(ax, 0.0):,.0f}")
+                self._redraw_positions()
                 for sb in self._status_bars:
                     sb.update_coords()
                 self._update_stat_ui()
