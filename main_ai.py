@@ -10,12 +10,12 @@
 #   2. 通訊可靠性：指令逾時保護、ACK 確認、重送機制（最多 3 次）
 #   3. 行程錄製僅錄驅動指令（排除查詢類 SB?/POS?）
 #   4. 到位確認：步進/原點後輪詢 SB1? 確認 Driving 旗標清除再繼續
-#   5. 單位一致性：內部永遠以 pulse 儲存，顯示時依選擇換算
+#   5. 單位一律 pulse（不提供 um / mm 切換）
 #   6. 軟體行程限制（Software Limit）：超限自動攔截並警告
 #   7. Limit / 異常狀態自動彈窗警告並停止
 #   8. 連線未建立時鎖定驅動按鈕
 #   9. 速度 Profile 命名儲存與快速切換
-#  10. Teaching Point 加入「移動至此點」功能，並記錄儲存當時單位
+#  10. Teaching Point 加入「移動至此點」功能
 #  11. 實驗數據 CSV 匯出（時間戳 + 各軸位置）
 #  12. 座標偏置（Offset）：定義工作原點與機械原點分離
 #  13. EMS 解除後要求位置確認才能繼續操作
@@ -58,6 +58,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger("DS102")
 
+
+def _write_json_with_backup(path: Path, data: dict, log=None) -> None:
+    """
+    覆寫 JSON 設定檔前先留一份 .bak，並以「先寫暫存再置換」避免寫到一半壞檔。
+
+    這些檔（teaching_points / speed_profiles）是把整個記憶體字典整份寫回，
+    所以任何沒先 load 就儲存的程式碼路徑都會把既有內容清空——實際發生過兩次，
+    都是測試腳本建了新的 DS102Controller 就呼叫 save/delete。
+    .bak 讓這種意外可以直接復原。
+    """
+    if path.exists():
+        try:
+            prev = path.read_text(encoding="utf-8")
+            # 別用「空的」蓋掉「有內容的」備份，否則備份本身就沒意義了
+            if prev.strip() not in ("", "{}"):
+                path.with_suffix(path.suffix + ".bak").write_text(
+                    prev, encoding="utf-8"
+                )
+        except OSError as e:
+            if log:
+                log("WARN", f"備份 {path.name} 失敗: {e}")
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    tmp.replace(path)
+
+
 # =============================================================================
 # 常數定義
 # =============================================================================
@@ -70,18 +99,75 @@ MODE_CONTINUE = 0
 MODE_STEP = 1
 MODE_ORIGIN = 2
 
-# 單位代碼（DS102 UNIT 指令）
-UNIT_CODE = {"pulse": "0", "um": "1", "mm": "2"}
+# 單位固定為 pulse（DS102 UNIT 指令代碼 0）。
+# 本程式不再提供 um / mm 切換：控制器裡的 SD（每 pulse 距離）並未配置實際尺度，
+# 換算成 um/mm 只是拿未經驗證的假設去乘除，徒增出錯機會。
+UNIT_PULSE = "0"
 
-# 原點模式清單
-ORG_MODES = [f"ORG {i}" for i in range(13)]
+# 原點模式清單。
+#
+# 🔴 **刻意從 1 開始，不提供 ORG 0。** move_origin() 第一件事就是送
+# `AXI{n}:MEMSW0 {type}`，所以選 ORG 0 等於把該軸的復歸樣式寫成
+# Type0＝不執行。後果三重：GO ORG 什麼都不做而空等 180 秒逾時、該軸的
+# 復歸樣式被永久覆蓋（實機值 X=2/Y=1/Z=2）、以及把 controller_config.json
+# 剛還原回去的設定當場毀掉。這個下拉的預設值以前就是 ORG 0。
+ORG_MODES = [f"ORG {i}" for i in range(1, 13)]
+
+# 「有終點」的驅動指令——送出後可以等它自己停下來。
+#
+# 刻意排除兩類：
+#   GO CWJ / CCWJ  連續點動，沒有終點，要等下一個 STOP 0 才停
+#   GO ORG         原點復歸，可能橫跨整個行程且途中壓限位屬正常流程
+#
+# `\b` 是關鍵：CW 後面接的 J 也是文字字元，所以 `GO CW\b` 不會誤中 `GO CWJ`。
+# 少了它，重播點動時會誤以為該等到位而阻塞到逾時。
+_FINITE_MOVE_RE = re.compile(r":GO\s+(?:CW|CCW|ABS|HOME)\b|:GO(?:ABS|TCH)\b")
+
+
+def _is_finite_move(tx: str) -> bool:
+    """這條指令是否會自己停在某個終點（＝值得呼叫 _wait_axis_stop）。"""
+    return bool(_FINITE_MOVE_RE.search(tx))
 
 # 通訊重送次數上限
 MAX_RETRY = 3
 # 到位輪詢逾時（秒）
 WAIT_TIMEOUT = 30.0
 # 到位輪詢間隔（秒）
-WAIT_INTERVAL = 0.1
+WAIT_INTERVAL = 0.5
+# 背景位置刷新間隔（秒）。每輪對每個已啟用軸送一筆 POS?（實測約 56ms／筆），
+# 四軸約 0.22s，設 0.5s 讓序列埠仍有餘裕給移動中的到位輪詢。
+POSITION_POLL_INTERVAL = 0.5
+# 連續點動時的軟體限位監看間隔（秒）。單軸只送一筆 POS?，實測約 56ms。
+JOG_WATCH_INTERVAL = 0.06
+
+# 例行輪詢用的查詢指令：這些每秒會送出十幾筆，逐筆記 DEBUG TX/RX 會把
+# LOG 檔、GUI 的 Text widget 與 action_history 全部灌爆，連帶把 Tk 的
+# after() 佇列塞滿（每筆 log 都要回主執行緒重繪五個 StatusBar）。
+# 預設不記錄它們；真要追通訊細節時把 DS102Controller.verbose_poll_log 設 True。
+_POLL_QUERIES = ("POS?", "SB1?", "SB2?", "SB3?")
+
+# action_history 的上限。以前是無上限 list，長時間執行會一路吃記憶體，
+# 也是「偶發當機」的來源之一。
+HISTORY_MAX = 5000
+# stop() 願意花多久等 _serial_lock。等不到就插隊直接寫入——
+# 停止指令遲到的代價是滑台繼續前進，比打斷別人一次查詢嚴重得多。
+STOP_LOCK_TIMEOUT = 0.15
+
+# 控制器設定檔（放在 RECORDING_DIR，與 teaching_points / speed_profiles 同區）。
+# 存的是 MEMSW0 復歸樣式與韌體軟體限位——這些都是 RAM-only，
+# 控制器一斷電就整組回到出廠值。
+CONFIG_FILE = "controller_config.json"
+
+# RECORDING_DIR 底下「不是行程檔」的 json——載入錄製清單時要跳過它們。
+# 新增任何設定檔都要記得加進來。
+NON_RECORDING_JSON = frozenset(
+    {"teaching_points.json", "speed_profiles.json", CONFIG_FILE}
+)
+# GUI LOG 文字框保留的最大行數，超過就從頭截掉。
+LOG_TEXT_MAX_LINES = 2000
+# UI 座標重繪間隔（毫秒）。純重繪、不碰序列埠，所以只需要跟得上
+# POSITION_POLL_INTERVAL(0.5s) 的資料更新即可，設 10ms 純屬浪費。
+UI_REDRAW_INTERVAL = 100
 
 # 顏色主題
 CLR_BG = "#F4F3F0"
@@ -106,13 +192,16 @@ class DS102Controller:
     指令格式完全依照 main.py 範本。
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.ser: Optional[serial.Serial] = None
         self.port = ""
         self.baudrate = 38400
         self.connected = False
         self.sim_mode = False
         self.ems_active = False
+        # 設 True 才會把例行輪詢（POS?/SB?）的 TX/RX 寫進 LOG。
+        # 預設關閉：那是每秒十幾筆的量，開著會把 LOG 與 UI 一起拖垮。
+        self.verbose_poll_log = False
 
         # 當前選取軸號（字串"1"~"6"）
         self.axis_no = "1"
@@ -120,6 +209,10 @@ class DS102Controller:
 
         # ── 執行緒鎖（保護共享資料，避免競爭條件）──
         self._lock = threading.Lock()
+        # 序列埠交易鎖：一次 TX→RX 必須是不可分割的整體。
+        # 移動執行緒的 _wait_axis_stop 與 UI 的狀態輪詢會同時查詢，
+        # 沒有這把鎖時兩邊的問答會交錯，回應被對方讀走（位置錯亂、假的 limit 警報）。
+        self._serial_lock = threading.RLock()
 
         # 各軸位置（內部永遠以 pulse 為單位儲存）
         self._positions_pulse: Dict[str, float] = {ax: 0.0 for ax in AXES}
@@ -132,10 +225,21 @@ class DS102Controller:
 
         self.firmware = ""
         self.axis_count = 0
-        self._unit = "um"  # 當前單位（供換算顯示用）
+        # 連線時偵測到「復歸樣式未設定」的軸（MEMSW0=0）。
+        # MEMSW 是 RAM-only，控制器斷電後會全部歸零。
+        self.homing_unconfigured: List[str] = []
+        # 控制器設定（MEMSW0 / 韌體軟體限位）的存檔內容
+        self.controller_config: dict = {}
+        # 同 _points_loaded：沒載入就存檔會把既有設定整份蓋掉
+        self._config_loaded = False
+        # 連線時實際還原了哪些項目（供 GUI 顯示）
+        self.config_restored: List[str] = []
+        # 座標一律為 pulse——不提供單位切換，內部與顯示同一個數值
 
         # Teaching Points
         self.saved_points: Dict[str, dict] = {}
+        # 是否已從磁碟載入過——沒載入就儲存會把既有點位整份蓋掉
+        self._points_loaded = False
 
         # 動作歷史（含執行緒鎖保護）
         self._history_lock = threading.Lock()
@@ -153,12 +257,18 @@ class DS102Controller:
 
         # 速度 Profile
         self.speed_profiles: Dict[str, dict] = {}
+        # 同 _points_loaded：沒載入就儲存會把既有 Profile 整份蓋掉
+        self._profiles_loaded = False
 
         # GUI LOG 回調
         self._log_cb = None
 
         # 重播鎖定旗標（重播中禁止其他移動操作）
         self.playback_running = False
+
+        # 點動結束訊號：放開按鈕（stop）時設起，讓限位監看執行緒收工
+        self._jog_stop = threading.Event()
+        self._jog_stop.set()
 
         # 狀態異常回調（用於 GUI 彈窗）
         self._alarm_cb = None
@@ -175,7 +285,7 @@ class DS102Controller:
         with self._lock:
             return {ax: self._positions_pulse[ax] - self._offsets[ax] for ax in AXES}
 
-    def set_offset_here(self, axis_no: str):
+    def set_offset_here(self, axis_no: str) -> None:
         """將當前位置設為工作原點（offset = 目前機械位置）"""
         ax = NO_AXIS.get(axis_no)
         if ax:
@@ -183,7 +293,7 @@ class DS102Controller:
                 self._offsets[ax] = self._positions_pulse[ax]
             self._log("INFO", f"軸 {ax} 工作原點已設為當前位置")
 
-    def clear_offset(self, axis_no: str):
+    def clear_offset(self, axis_no: str) -> None:
         """清除工作原點偏置，回復機械座標"""
         ax = NO_AXIS.get(axis_no)
         if ax:
@@ -194,12 +304,18 @@ class DS102Controller:
     # =========================================================================
     # LOG 系統
     # =========================================================================
-    def set_log_callback(self, cb):
+    def set_log_callback(self, cb) -> None:
         self._log_cb = cb
 
     def set_alarm_callback(self, cb):
         """設定狀態異常回調（供 GUI 顯示彈窗警告）"""
         self._alarm_cb = cb
+
+    def _is_poll_cmd(self, cmd: str) -> bool:
+        """這條指令是否為每秒重複數次的例行輪詢（預設不寫進 LOG）。"""
+        if self.verbose_poll_log:
+            return False
+        return any(q in cmd for q in _POLL_QUERIES)
 
     def _log(self, level: str, msg: str, tx: str = "", rx: str = ""):
         """
@@ -213,6 +329,10 @@ class DS102Controller:
 
         with self._history_lock:
             self.action_history.append(entry)
+            # 上限保護：無上限的 list 在長時間執行下會一路吃記憶體。
+            # 一次砍一批而不是每筆都 pop(0)，避免 O(n) 搬移成為新的負擔。
+            if len(self.action_history) > HISTORY_MAX:
+                del self.action_history[: len(self.action_history) - HISTORY_MAX]
 
         # ── 行程錄製：只記錄驅動指令（GO / STOP / MEMSW），排除查詢 ──
         # 查詢指令特徵：以 ? 結尾，或包含 SB1/SB2/SB3/POS?/CONTA/IDN/VER
@@ -220,7 +340,7 @@ class DS102Controller:
             k in tx for k in ["SB1?", "SB2?", "SB3?", "POS?", "CONTA?", "IDN?", "VER?"]
         )
         if self.recording and tx and not _is_query:
-            self.recorded_steps.append({**entry, "delay_ms": 200})
+            self.recorded_steps.append({**entry, "delay_ms": 800})
 
         if self._log_cb:
             self._log_cb(entry)
@@ -234,7 +354,7 @@ class DS102Controller:
     # =========================================================================
     # 串列通訊底層（含重送機制與逾時保護）
     # =========================================================================
-    def _serial_write(self, cmd: str):
+    def _serial_write(self, cmd: str) -> None:
         """
         發送指令，不等待回應。
         對應 main.py serial_write()。
@@ -250,9 +370,10 @@ class DS102Controller:
             if not (self.ser and self.ser.is_open):
                 break
             try:
-                self.ser.reset_input_buffer()  # 清除殘留回應
-                self.ser.write(raw)
-                self._log("INFO", f"發送指令 (嘗試{attempt})", tx=cmd)
+                with self._serial_lock:
+                    self.ser.reset_input_buffer()  # 清除殘留回應
+                    self.ser.write(raw)
+                # self._log("INFO", f"發送指令 (嘗試{attempt})", tx=cmd)
                 return
             except serial.SerialException as e:
                 self._log("WARN", f"寫入失敗 (嘗試{attempt}/{MAX_RETRY}): {e}", tx=cmd)
@@ -268,25 +389,33 @@ class DS102Controller:
         重送機制：最多 MAX_RETRY 次。
         """
         raw = (cmd + "\r").encode("utf-8")
+        # 例行輪詢（POS?/SB?）每秒十幾筆，逐筆記 log 會灌爆 LOG 與 UI。
+        # 只有成功路徑安靜；WARN / ERROR 一律照記，異常不能被吃掉。
+        quiet = self._is_poll_cmd(cmd)
         if self.sim_mode:
             resp = self._sim_query(cmd)
-            self._log("DEBUG", f"查詢（模擬）", tx=cmd, rx=resp)
+            if not quiet:
+                self._log("DEBUG", "查詢（模擬）", tx=cmd, rx=resp)
             return resp
 
         for attempt in range(1, MAX_RETRY + 1):
             if not (self.ser and self.ser.is_open):
                 break
             try:
-                self.ser.reset_input_buffer()
-                self.ser.write(raw)
-                self._log("DEBUG", f"TX: {cmd} (嘗試{attempt})", tx=cmd)
-                # 使用獨立 timeout 讀取回應
-                self.ser.timeout = timeout
-                data = self.ser.read_until(b"\r")
-                self.ser.timeout = 2.0  # 還原預設
+                # 整段 TX→RX 在鎖內完成，避免與其他執行緒的查詢交錯
+                with self._serial_lock:
+                    self.ser.reset_input_buffer()
+                    self.ser.write(raw)
+                    if not quiet:
+                        self._log("DEBUG", f"TX: {cmd} (嘗試{attempt})", tx=cmd)
+                    # 使用獨立 timeout 讀取回應
+                    self.ser.timeout = timeout
+                    data = self.ser.read_until(b"\r")
+                    self.ser.timeout = 2.0  # 還原預設
                 resp = data.decode("utf-8", errors="ignore").strip()
                 if resp:
-                    self._log("DEBUG", f"RX: {resp}", rx=resp)
+                    if not quiet:
+                        self._log("DEBUG", f"RX: {resp}", rx=resp)
                     return resp
                 self._log("WARN", f"空回應 (嘗試{attempt}/{MAX_RETRY})", tx=cmd)
             except serial.SerialException as e:
@@ -299,7 +428,7 @@ class DS102Controller:
     # =========================================================================
     # 模擬模式
     # =========================================================================
-    def _sim_parse(self, cmd: str):
+    def _sim_parse(self, cmd: str) -> None:
         """解析驅動指令並更新模擬位置"""
         m = re.search(r":PULS\s+([\d.\-]+):GO\s+ABS", cmd)
         if m:
@@ -375,62 +504,245 @@ class DS102Controller:
             self.axis_count = 2
             self._log("WARN", f"CONTA? 異常({conta!r})，預設 2 軸")
 
-        # 初始化各軸 UNIT=pulse, SELSP=0
+        # 初始化各軸 UNIT=pulse, SELSP=0（依照 main.py：UNIT 0 = pulse）
         for i in range(self.axis_count):
-            self._serial_write(f"AXI{i+1}:UNIT {UNIT_CODE['um']}:SELSP 0")
+            self._serial_write(f"AXI{i+1}:UNIT {UNIT_PULSE}:SELSP 0")
             time.sleep(0.1)
 
         self.port = port
         self.baudrate = baudrate
         self.connected = True
         self.sim_mode = False
+
+        # 連線後立刻讀一次各軸位置，否則畫面會停在 0 直到第一次移動
+        self.refresh_positions()
+
+        # 控制器設定是 RAM-only，斷電後會被清空。先把存檔的值補回去，
+        # 再檢查還有沒有補不齊的（例如設定檔裡本來就沒有那一軸）。
+        self.load_controller_config()
+        self.config_restored = self.restore_controller_config()
+        self.check_homing_config()
+
         msg = f"已連線至 {port}（{self.axis_count} 軸，韌體 {self.firmware}）"
         self._log("INFO", msg)
         return True, msg
 
-    def connect_sim(self):
+    def refresh_positions(self) -> None:
+        """
+        查詢所有已啟用軸的目前位置，更新 _positions_pulse。
+
+        只送 POS?（每軸一筆交易），比 query_status() 的三段式查詢輕得多，
+        適合當成背景定時刷新。query_status() 一次只更新它被傳入的那一軸，
+        不足以讓畫面上其餘各軸保持同步。
+        """
+        if not self.connected or self.sim_mode:
+            return
+        for i in range(self.axis_count):
+            axis_no = str(i + 1)
+            ax = NO_AXIS.get(axis_no)
+            if not ax:
+                continue
+            pos = self._serial_write_read(f"AXI{axis_no}:POS?")
+            if not pos:
+                continue
+            try:
+                with self._lock:
+                    self._positions_pulse[ax] = float(pos)
+            except ValueError:
+                continue
+
+    # =========================================================================
+    # 控制器設定持久化（MEMSW0 復歸樣式 + 韌體軟體限位）
+    #
+    # 為什麼需要：這些設定**全部是 RAM-only**，控制器斷電後整組回到出廠值
+    # （2026-08-05 實機踩到：MEMSW0～7 全軸歸零、軟限位回到停用 ±99999999）。
+    # MEMSW0=0 的語意是「復歸樣式 Type0＝不執行」，所以斷電後按「全軸原點
+    # 復歸」會把每一軸都合法略過。把設定存檔並在連線時補回去，就不必每次
+    # 手動重設。
+    # =========================================================================
+    def capture_controller_config(self) -> dict:
+        """讀出控制器目前的設定並存檔，作為日後還原的基準。"""
+        if not self.connected or self.sim_mode:
+            self._log("WARN", "未連線（或模擬模式），無法擷取控制器設定")
+            return {}
+
+        axes = {}
+        for i in range(self.axis_count):
+            n = str(i + 1)
+            ax = NO_AXIS.get(n, n)
+            axes[ax] = {
+                "memsw0": self._serial_write_read(f"AXI{n}:MEMSW0?").strip(),
+                "cwslp": self._serial_write_read(f"AXI{n}:CWSLP?").strip(),
+                "ccwslp": self._serial_write_read(f"AXI{n}:CCWSLP?").strip(),
+                "cwsle": self._serial_write_read(f"AXI{n}:CWSLE?").strip(),
+                "ccwsle": self._serial_write_read(f"AXI{n}:CCWSLE?").strip(),
+            }
+
+        # 與磁碟上既有的設定合併，而不是整份覆蓋。
+        # 若這次連線只認到部分軸（通訊異常、或接了不同台控制器），
+        # 直接覆蓋會把其餘軸的設定清掉——與 teaching points 踩過的坑同一類。
+        if not self._config_loaded:
+            self.load_controller_config()
+        merged = dict((self.controller_config or {}).get("axes", {}))
+        dropped = set(merged) - set(axes)
+        merged.update(axes)
+        if dropped:
+            self._log(
+                "WARN",
+                f"本次只讀到 {'、'.join(axes)} 的設定，"
+                f"保留設定檔中既有的 {'、'.join(sorted(dropped))} 不動",
+            )
+
+        cfg = {
+            "saved": datetime.now().isoformat(timespec="seconds"),
+            "port": self.port,
+            "firmware": self.firmware,
+            "axes": merged,
+        }
+        self.controller_config = cfg
+        self._config_loaded = True
+        _write_json_with_backup(RECORDING_DIR / CONFIG_FILE, cfg, self._log)
+        self._log(
+            "INFO",
+            f"控制器設定已存檔（{len(axes)} 軸）："
+            + "、".join(f"{a}:MEMSW0={v['memsw0']}" for a, v in axes.items()),
+        )
+        return cfg
+
+    def load_controller_config(self) -> dict:
+        """載入設定檔。找不到就回空 dict（首次使用的正常情況）。"""
+        p = RECORDING_DIR / CONFIG_FILE
+        if not p.exists():
+            self._config_loaded = True  # 沒有檔案也算「已知狀態」
+            return {}
+        try:
+            self.controller_config = json.loads(p.read_text(encoding="utf-8"))
+            self._config_loaded = True
+            n = len(self.controller_config.get("axes", {}))
+            self._log(
+                "INFO",
+                f"載入控制器設定檔（{n} 軸，存於 "
+                f"{self.controller_config.get('saved', '?')}）",
+            )
+        except (OSError, json.JSONDecodeError) as e:
+            self._log("ERROR", f"控制器設定檔讀取失敗: {e}")
+        return self.controller_config
+
+    def restore_controller_config(self) -> List[str]:
+        """
+        把設定檔裡的值補回控制器，回傳實際還原了哪些項目的說明。
+
+        只在「控制器看起來被清空」時才寫入，不會蓋掉使用者刻意改過的值：
+          - MEMSW0：設定檔有非 0 值、而控制器現在是 0 → 寫回
+          - 軟體限位：設定檔記錄為啟用(1)、而控制器現在是停用(0) → 寫回座標再啟用
+
+        未接滑台的軸一律跳過。
+        """
+        if not self.connected or self.sim_mode:
+            return []
+        axes_cfg = (self.controller_config or {}).get("axes", {})
+        if not axes_cfg:
+            return []
+
+        restored: List[str] = []
+        for i in range(self.axis_count):
+            n = str(i + 1)
+            ax = NO_AXIS.get(n, n)
+            saved = axes_cfg.get(ax)
+            if not saved:
+                continue
+            st, _ = self.query_status(n)
+            if st == "Stage not connected":
+                continue
+
+            # ── 復歸樣式 ──
+            want = str(saved.get("memsw0", "0")).strip()
+            if want and want != "0":
+                cur = self._serial_write_read(f"AXI{n}:MEMSW0?").strip()
+                if cur == "0":
+                    self._serial_write(f"AXI{n}:MEMSW0 {want}")
+                    time.sleep(0.1)
+                    back = self._serial_write_read(f"AXI{n}:MEMSW0?").strip()
+                    if back == want:
+                        restored.append(f"{ax} 復歸樣式={want}")
+                    else:
+                        self._log(
+                            "ERROR",
+                            f"軸 {ax} MEMSW0 寫回失敗（想寫 {want}，讀回 {back!r}）",
+                        )
+
+            # ── 韌體軟體限位：只在設定檔記錄為啟用時才補 ──
+            for side, lp_key, le_key in (
+                ("CW", "cwslp", "cwsle"),
+                ("CCW", "ccwslp", "ccwsle"),
+            ):
+                if str(saved.get(le_key, "0")).strip() != "1":
+                    continue
+                if self._serial_write_read(f"AXI{n}:{side}SLE?").strip() == "1":
+                    continue  # 已經啟用，不動它
+                lp = str(saved.get(lp_key, "")).strip()
+                if not lp:
+                    continue
+                self._serial_write(f"AXI{n}:{side}SLP {lp}")
+                self._serial_write(f"AXI{n}:{side}SLE 1")
+                time.sleep(0.1)
+                restored.append(f"{ax} {side} 軟限位={lp}")
+
+        if restored:
+            self._log(
+                "INFO",
+                "控制器設定已從設定檔還原（斷電後會被清空）：" + "、".join(restored),
+            )
+        return restored
+
+    def check_homing_config(self) -> List[str]:
+        """
+        檢查各軸的復歸樣式（MEMSW0）是否還在，回傳「未設定」的軸名清單。
+
+        為什麼需要這個：**MEMSW 與韌體軟體限位一樣是 RAM-only**，控制器
+        斷電後整組回到 0（2026-08-05 實測踩到）。而 MEMSW0=0 的語意是
+        「復歸樣式 Type0＝不執行」，於是「全軸原點復歸」會把每一軸都合法
+        略過、幾秒就跑完、看起來像成功——實際上滑台完全沒動。
+
+        刻意**不自動寫回**任何值：復歸樣式決定滑台往哪個方向、用哪顆感測器
+        找原點，猜錯會讓它往非預期方向跑完整個行程。這裡只負責讓使用者知道。
+        """
+        unset: List[str] = []
+        if not self.connected or self.sim_mode:
+            return unset
+        for i in range(self.axis_count):
+            axis_no = str(i + 1)
+            ax = NO_AXIS.get(axis_no, axis_no)
+            # 未接滑台的軸本來就不該復歸，不算「未設定」
+            st, _ = self.query_status(axis_no)
+            if st == "Stage not connected":
+                continue
+            if self._serial_write_read(f"AXI{axis_no}:MEMSW0?").strip() == "0":
+                unset.append(ax)
+
+        self.homing_unconfigured = unset
+        if unset:
+            self._log(
+                "WARN",
+                f"軸 {'、'.join(unset)} 的復歸樣式 MEMSW0=0（Type0＝不執行）"
+                f"——原點復歸會直接略過這些軸。控制器斷電後 MEMSW 會全部歸零，"
+                f"需要復歸的話請先設定各軸樣式。",
+            )
+        return unset
+
+    def connect_sim(self) -> None:
         self.connected = True
         self.sim_mode = True
         self.firmware = "Simulator"
         self.axis_count = 6
         self._log("INFO", "模擬模式啟動")
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         if self.ser and self.ser.is_open:
             self.ser.close()
         self.connected = False
         self.sim_mode = False
         self._log("INFO", "已中斷連線")
-
-    # =========================================================================
-    # 單位管理
-    # =========================================================================
-    def set_unit(self, unit: str):
-        """
-        切換單位並傳送 UNIT 指令給所有已啟用軸。
-        內部 _positions_pulse 不受影響，永遠以 pulse 儲存。
-        """
-        self._unit = unit
-        if self.connected:
-            for i in range(self.axis_count):
-                self._serial_write(f"AXI{i+1}:UNIT {UNIT_CODE.get(unit,'0')}")
-        self._log("INFO", f"移動單位切換為 {unit}")
-
-    def pulse_to_display(self, pulse_val: float) -> float:
-        """pulse 轉換為當前顯示單位的數值（供 GUI 顯示用）"""
-        if self._unit == "um":
-            return pulse_val  # DS102 1 pulse = 1 um（依實際系統調整）
-        elif self._unit == "mm":
-            return pulse_val / 1000.0
-        return pulse_val  # pulse
-
-    def display_to_pulse(self, display_val: float) -> float:
-        """當前顯示單位的數值轉換回 pulse（供指令發送用）"""
-        if self._unit == "um":
-            return display_val
-        elif self._unit == "mm":
-            return display_val * 1000.0
-        return display_val
 
     # =========================================================================
     # 軟體行程限制
@@ -471,16 +783,115 @@ class DS102Controller:
         """
         連續點動（長按不放，放開後送 STOP 0）。
         格式：AXI{n}:L0 {l}:R0 {r}:S0 {s}:F0 {f}:GO CWJ / CCWJ
+
+        點動沒有目標座標，無法像 move_step 那樣事先攔截，所以分兩層防護：
+          1. 出發前：已經在該方向的軟體限位上就拒絕啟動
+          2. 移動中：背景執行緒監看座標，越界立刻送 STOP
         """
         if self.ems_active or self.playback_running:
             return
+
+        ax = NO_AXIS.get(axis_no)
+        lim = None
+        if ax:
+            ccw_lim, cw_lim = self.sw_limits.get(ax, (None, None))
+            lim = cw_lim if direction == "CW" else ccw_lim
+            if lim is not None:
+                with self._lock:
+                    cur = self._positions_pulse.get(ax, 0.0)
+                over = cur >= lim if direction == "CW" else cur <= lim
+                if over:
+                    reason = (
+                        f"軸 {ax} 目前 {cur:.0f} pulse 已達 {direction} "
+                        f"軟體限位 {lim:.0f} pulse"
+                    )
+                    self._log("WARN", f"點動被軟體限位攔截: {reason}")
+                    if self._alarm_cb:
+                        self._alarm_cb("軟體行程限制", reason)
+                    return
+
         dir_str = "CWJ" if direction == "CW" else "CCWJ"
         cmd = (
             f"AXI{axis_no}:L0 {l_speed}:R0 {rate}"
             f":S0 {s_rate}:F0 {f_speed}:GO {dir_str}"
         )
+        self._jog_stop.clear()
         self._serial_write(cmd)
         self._log("INFO", f"連續點動 軸{axis_no} {direction}", tx=cmd)
+
+        if lim is not None and not self.sim_mode:
+            threading.Thread(
+                target=self._watch_jog_limit,
+                args=(axis_no, direction, lim, f_speed, rate),
+                daemon=True,
+            ).start()
+
+    def _watch_jog_limit(
+        self, axis_no: str, direction: str, lim: float, f_speed: str, rate: str
+    ) -> None:
+        """
+        點動期間監看軟體限位，越界即送 STOP。
+
+        這是「事後偵測」，從發現越界到真正停穩還會再前進一段，提前量要把
+        兩件事都算進去：
+
+          1. **偵測延遲** —— 一輪的實際耗時（送 POS? 約 56ms ＋ 等待間隔），
+             最壞情況是剛量完就往前跑滿一輪。這個週期會隨序列埠負載變動，
+             所以用實測值而非常數：每輪記下真正花掉的時間。
+          2. **減速距離** —— 送出 STOP 後由 f_speed 減速到 0，減速時間為
+             rate(ms)，期間平均速度約 f_speed/2，故距離 ≈ f_speed × rate / 2000
+
+        兩次實測都證明少算會滑出限位外：只算等待間隔（60ms）時超出 24 pulse，
+        補上減速項但週期仍用常數時超出 36 pulse——因為真正的週期是 116ms
+        而非 60ms。寧可提早停，也不要越過限位，軟體限位的用途就是不該被越過。
+        """
+        ax = NO_AXIS.get(axis_no)
+        if not ax:
+            return
+        try:
+            f = abs(float(f_speed))
+            r = abs(float(rate))
+        except (ValueError, TypeError):
+            f = r = 0.0
+        brake = f * r / 2000.0
+        # 首輪還沒有實測值，先用「查詢往返 ＋ 等待」的保守估計
+        period = JOG_WATCH_INTERVAL + 0.06
+
+        while not self._jog_stop.is_set():
+            if self.ems_active:
+                return
+            t_start = time.time()
+            pos = self._serial_write_read(f"AXI{axis_no}:POS?")
+            try:
+                cur = float(pos)
+            except (ValueError, TypeError):
+                # 回應空的或不是數字時要照樣睡一輪再重試。
+                # 直接 continue 會變成不睡眠的忙迴圈，在序列埠本來就已經
+                # 出狀況的當下再灌一堆查詢進去，只會讓情況更糟。
+                self._jog_stop.wait(JOG_WATCH_INTERVAL)
+                continue
+            with self._lock:
+                self._positions_pulse[ax] = cur
+
+            lookahead = f * period + brake
+            hit = (
+                cur + lookahead >= lim
+                if direction == "CW"
+                else cur - lookahead <= lim
+            )
+            if hit:
+                self.stop()
+                reason = (
+                    f"軸 {ax} 於 {cur:.0f} pulse 觸及 {direction} "
+                    f"軟體限位 {lim:.0f} pulse，已停止"
+                )
+                self._log("WARN", reason)
+                if self._alarm_cb:
+                    self._alarm_cb("軟體行程限制", reason)
+                return
+            self._jog_stop.wait(JOG_WATCH_INTERVAL)
+            # 實測這一輪的完整耗時，供下一輪推算提前量
+            period = max(time.time() - t_start, JOG_WATCH_INTERVAL)
 
     def move_step(
         self,
@@ -497,17 +908,19 @@ class DS102Controller:
         步進移動（一次性）。
         格式：AXI{n}:L0 {l}:R0 {r}:S0 {s}:F0 {f}:PULS {p}:GO CW / CCW
         wait_done=True 時，發送後阻塞直到到位（輪詢 SB1? Driving 位元清除）。
-        amount 單位依當前 _unit，內部換算為 pulse 後進行限制檢查。
+        amount 單位為 pulse。
+
+        回傳 True=順利到位（或未要求等待），False=被攔截／逾時／撞限位。
+        呼叫端請務必看這個回傳值：連續移動多軸時，第一軸撞了限位還往下跑
+        就會演變成一路撞端點。
         """
         if self.ems_active or self.playback_running:
-            return
-        # 換算為 pulse，進行軟體限位檢查
+            return False
         try:
-            amount_f = float(amount)
-            pulse_amt = self.display_to_pulse(amount_f)
+            pulse_amt = amount_f = float(amount)
         except ValueError:
             self._log("ERROR", f"步進距離格式錯誤: {amount}")
-            return
+            return False
 
         ax = NO_AXIS.get(axis_no)
         if ax:
@@ -519,17 +932,22 @@ class DS102Controller:
                 self._log("WARN", f"軟體限位攔截: {reason}")
                 if self._alarm_cb:
                     self._alarm_cb("軟體行程限制", reason)
-                return
+                return False
+
+        # DS102 韌體會「靜默忽略」帶小數點的 PULS 值：實測 PULS 500.0000
+        # 完全不動且不回報錯誤，PULS 500 才會動。一律送整數。
+        amount = f"{amount_f:.0f}"
 
         cmd = (
             f"AXI{axis_no}:L0 {l_speed}:R0 {rate}"
             f":S0 {s_rate}:F0 {f_speed}:PULS {amount}:GO {direction}"
         )
         self._serial_write(cmd)
-        self._log("INFO", f"步進 軸{axis_no} {direction} {amount} {self._unit}", tx=cmd)
+        self._log("INFO", f"步進 軸{axis_no} {direction} {amount} pulse", tx=cmd)
 
         if wait_done and not self.sim_mode:
-            self._wait_axis_stop(axis_no)
+            return self._wait_axis_stop(axis_no)
+        return True
 
     def move_origin(
         self,
@@ -542,28 +960,295 @@ class DS102Controller:
         wait_done: bool = True,
     ):
         """
-        原點返回。
+        單軸原點返回。
         格式：AXI{n}:MEMSW0 {type} → AXI{n}:L0...:GO ORG
-        wait_done=True 時等待到位。
+
+        回傳 True=完成並已歸零，False=逾時或歸零失敗。
+
+        等待用 `_wait_origin_done()` 而**不是** `_wait_axis_stop()`：
+        復歸樣式本來就靠偵測限位感測器的邊緣來定位，途中壓到限位是正常
+        流程，`_wait_axis_stop` 會把它當異常而提早回報失敗，逾時長度
+        （30s）對橫跨整個行程的復歸也不夠。這點與 origin_all 一致。
+
+        另外實測（2026-08-05，COM2）：**即使 MEMSW7 讀回是 0，GO ORG
+        完成後 POS 也不會自動歸零**——所以復歸後一律確認並強制寫入 0，
+        這正是「歸位後 0 點不固定」的成因。
         """
         if self.ems_active or self.playback_running:
-            return
+            return False
         self._serial_write(f"AXI{axis_no}:MEMSW0 {org_type}")
         time.sleep(0.1)
         cmd = f"AXI{axis_no}:L0 {l_speed}:R0 {rate}" f":S0 {s_rate}:F0 {f_speed}:GO ORG"
         self._serial_write(cmd)
         self._log("INFO", f"原點返回 軸{axis_no} ORG{org_type}", tx=cmd)
-        if wait_done and not self.sim_mode:
-            self._wait_axis_stop(axis_no)
+        if not (wait_done and not self.sim_mode):
+            return True
 
-    def stop(self):
-        """停止所有軸（STOP 0）"""
+        ax = NO_AXIS.get(axis_no, axis_no)
+        if not self._wait_origin_done(axis_no):
+            self._log("ERROR", f"軸 {ax} 原點復歸逾時")
+            if self._alarm_cb:
+                self._alarm_cb(f"軸 {ax} 復歸逾時", "原點復歸未在時限內完成")
+            return False
+
+        _, pos = self.query_status(axis_no)
+        try:
+            if abs(float(pos)) < 0.5:
+                return True
+        except (ValueError, TypeError):
+            pass
+        self._log("WARN", f"軸 {ax} 復歸後 POS={pos} 未自動歸零，強制設為 0")
+        self.set_position(axis_no, "0")
+        return True
+
+    @staticmethod
+    def limit_direction(status: str) -> Optional[str]:
+        """
+        從狀態字串判斷「目前壓在哪一側的限位」，回傳 "CW" / "CCW" / None。
+
+        涵蓋四種寫法：Detect CW limit / Detect CCW limit /
+        Detect CW SW limit / Detect CCW SW limit。
+        必須先判斷 CCW——"CCW" 字串本身就含有 "CW"，順序反了會全部誤判成 CW。
+        """
+        if "limit" not in status.lower():
+            return None
+        if "CCW" in status:
+            return "CCW"
+        if "CW" in status:
+            return "CW"
+        return None
+
+    def _set_soft_limits_enabled(self, axis_no: str, on: bool) -> None:
+        """開關單軸的控制器軟體限位（CWSLE / CCWSLE）。"""
+        v = "1" if on else "0"
+        self._serial_write(f"AXI{axis_no}:CWSLE {v}")
+        self._serial_write(f"AXI{axis_no}:CCWSLE {v}")
+
+    def _soft_limits_enabled(self, axis_no: str) -> Tuple[str, str]:
+        """讀回 (CWSLE, CCWSLE) 目前值，供事後還原。"""
+        return (
+            self._serial_write_read(f"AXI{axis_no}:CWSLE?"),
+            self._serial_write_read(f"AXI{axis_no}:CCWSLE?"),
+        )
+
+    def _wait_origin_done(self, axis_no: str, timeout: float = 180.0) -> bool:
+        """
+        等待原點復歸結束——只看 Driving 旗標清除，不把限位當失敗。
+
+        不能沿用 _wait_axis_stop()：復歸樣式 5/6 本來就是靠偵測限位感測器
+        的邊緣來定位，途中壓到限位是正常流程而非異常。
+        復歸可能橫跨整個行程，所以逾時比一般移動寬鬆得多。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.ems_active:
+                return False
+            sb1 = self._serial_write_read(f"AXI{axis_no}:SB1?")
+            try:
+                if not (int(sb1) & 0x40):  # bit6 Driving 清除
+                    return True
+            except (ValueError, TypeError):
+                pass
+            time.sleep(WAIT_INTERVAL)
+        self._log("WARN", f"軸{axis_no} 原點復歸逾時（{timeout}s）")
+        return False
+
+    def origin_all(
+        self,
+        l_speed: str,
+        f_speed: str,
+        rate: str,
+        s_rate: str,
+        progress_cb=None,
+    ) -> Tuple[bool, str]:
+        """
+        全軸依序原點復歸（GO ORG），使用各軸自己已設定的 MEMSW0 樣式。
+
+        MEMSW7=0 時控制器會在復歸完成後自動把 POS 歸零，這是 DS102 設計上
+        的「歸零」做法——比起把座標 0 當成目標點去追，這才是正解。
+
+        復歸期間暫時停用控制器軟體限位：原點通常就落在行程末端（POS≈0），
+        會在軟限位之外，不關掉會被自己設的保護擋住。結束後還原原本的啟用狀態。
+
+        某一軸失敗不中止整批，繼續跑其餘各軸。
+        回傳 (全部成功?, 摘要訊息)。
+        """
+        if self.ems_active or self.playback_running:
+            return False, "EMS 作用中或重播進行中，已略過"
+
+        done, skipped, failed = [], [], []
+        saved: Dict[str, Tuple[str, str]] = {}
+
+        try:
+            for i in range(self.axis_count):
+                axis_no = str(i + 1)
+                ax = NO_AXIS.get(axis_no, axis_no)
+                if progress_cb:
+                    progress_cb(ax, "檢查中")
+
+                st, _ = self.query_status(axis_no)
+                if st == "Stage not connected":
+                    skipped.append(f"{ax}(未接滑台)")
+                    continue
+
+                org_type = self._serial_write_read(f"AXI{axis_no}:MEMSW0?")
+                if org_type.strip() == "0":
+                    skipped.append(f"{ax}(復歸樣式 Type0＝不執行)")
+                    continue
+
+                # 暫時解除軟體限位，記下原值以便還原
+                saved[axis_no] = self._soft_limits_enabled(axis_no)
+                self._set_soft_limits_enabled(axis_no, False)
+
+                # MEMSW7=0 才會讓控制器在復歸完成後自動把 POS 歸零。
+                # 程式以前從來沒讀過也沒設過它，只是「假設」已經是 0——
+                # 這正是「歸位後 0 點不固定」的成因：控制器若不是 0，
+                # 復歸後座標會停在任意值。這裡明確設定，不再靠假設。
+                msw7 = self._serial_write_read(f"AXI{axis_no}:MEMSW7?").strip()
+                if msw7 != "0":
+                    self._log(
+                        "WARN",
+                        f"軸 {ax} MEMSW7={msw7 or '讀取失敗'}（非 0），"
+                        f"復歸不會自動歸零——已改設為 0",
+                    )
+                    self._serial_write(f"AXI{axis_no}:MEMSW7 0")
+                    time.sleep(0.1)
+
+                if progress_cb:
+                    progress_cb(ax, f"復歸中 (Type{org_type})")
+                cmd = (
+                    f"AXI{axis_no}:L0 {l_speed}:R0 {rate}"
+                    f":S0 {s_rate}:F0 {f_speed}:GO ORG"
+                )
+                self._serial_write(cmd)
+                self._log("INFO", f"原點復歸 軸{ax} Type{org_type}", tx=cmd)
+                time.sleep(0.1)  # 給控制器一點時間啟動復歸
+                if self.sim_mode:
+                    done.append(ax)
+                    continue
+
+                if not self._wait_origin_done(axis_no):
+                    failed.append(f"{ax}(復歸逾時)")
+                    continue
+
+                _, pos2 = self.query_status(axis_no)
+                try:
+                    zeroed = abs(float(pos2)) < 0.5
+                except (ValueError, TypeError):
+                    zeroed = False
+                if zeroed:
+                    done.append(f"{ax}(POS=0)")
+                else:
+                    # 已經先設過 MEMSW7=0 還是沒歸零 → 直接強制寫入 POS 0。
+                    # 「原點復歸後座標必為 0」是後續所有教點與限位的共同前提，
+                    # 讓它停在任意值等於整組座標系失準。
+                    self._log(
+                        "WARN",
+                        f"軸 {ax} 復歸後 POS={pos2} 未自動歸零，強制設為 0",
+                    )
+                    self.set_position(axis_no, "0")
+                    _, pos3 = self.query_status(axis_no)
+                    try:
+                        forced_ok = abs(float(pos3)) < 0.5
+                    except (ValueError, TypeError):
+                        forced_ok = False
+                    if forced_ok:
+                        done.append(f"{ax}(POS=0 強制)")
+                    else:
+                        failed.append(f"{ax}(歸零失敗 POS={pos3})")
+        finally:
+            # 無論成功與否都要把軟體限位還原回去。
+            #
+            # 還原不到就一律開啟（"1"），絕不 fallback 到停用：
+            # _serial_write_read 三次失敗會回傳空字串，舊寫法的 `cw or '0'`
+            # 會把它變成 '0'＝停用，於是「序列埠壅塞一下」就等於把韌體端
+            # 唯一可靠的那層保護永久關掉，而且不留任何痕跡。
+            # 保護該有的失效方向是「寧可多擋」，不是「寧可放行」。
+            for axis_no, (cw, ccw) in saved.items():
+                ax = NO_AXIS.get(axis_no, axis_no)
+                for cmd, val in (("CWSLE", cw), ("CCWSLE", ccw)):
+                    v = (val or "").strip()
+                    if v not in ("0", "1"):
+                        self._log(
+                            "ERROR",
+                            f"軸 {ax} {cmd} 原始值讀不到（收到 {val!r}），"
+                            f"改以啟用(1)還原——請確認限位設定是否符合預期",
+                        )
+                        v = "1"
+                    self._serial_write(f"AXI{axis_no}:{cmd} {v}")
+
+        parts = []
+        if done:
+            parts.append("已復歸: " + "、".join(done))
+        if skipped:
+            parts.append("略過: " + "、".join(skipped))
+        if failed:
+            parts.append("失敗: " + "、".join(failed))
+        msg = "；".join(parts) if parts else "沒有可動作的軸"
+
+        # 一軸都沒真的復歸 → 不可回報成功。
+        #
+        # 實機踩過：控制器斷電後 MEMSW 全組回到 0，而 MEMSW0=0 的語意是
+        # 「復歸樣式 Type0＝不執行」，於是每一軸都被合法略過、耗時 0.9 秒、
+        # 舊寫法回傳 True。使用者按下「全軸原點復歸」看到成功訊息，
+        # 但滑台根本沒動、座標也沒歸零——比直接報錯更危險。
+        if not done:
+            hint = (
+                "；沒有任何軸完成復歸。若略過原因是「復歸樣式 Type0」，"
+                "表示控制器的 MEMSW0 未設定（斷電後會回到 0），"
+                "需先對各軸設定復歸樣式再試"
+            )
+            self._log("ERROR", f"全軸原點復歸 — {msg}{hint}")
+            return False, msg + hint
+
+        self._log("INFO" if not failed else "ERROR", f"全軸原點復歸 — {msg}")
+        return (not failed), msg
+
+    def stop(self) -> None:
+        """
+        停止所有軸（STOP 0）。同時收掉點動的限位監看執行緒。
+
+        **不會無限等 _serial_lock。** 這是「長按點動放開後卡死」的成因：
+        position worker 若正卡在 read_until 的逾時裡（最壞 2s × 3 retry ≈ 6s），
+        舊寫法走 _serial_write 會傻等整段時間，期間 UI 凍結而滑台持續前進。
+
+        改成只短暫嘗試取鎖（STOP_LOCK_TIMEOUT），取不到就直接寫入。
+        STOP 是唯寫、不讀回應，插隊最壞只會打斷別人的一次查詢，
+        對方本來就有 MAX_RETRY 重送機制。用一次重送換即時停止很划算。
+        """
+        self._jog_stop.set()  # 先讓監看執行緒收工——這一步不需要序列埠
         cmd = "STOP 0"
-        self._serial_write(cmd)
-        self._log("INFO", "停止所有軸", tx=cmd)
 
-    def emergency_stop(self):
-        """緊急停止：繞過所有佇列直接寫入串列埠"""
+        if self.sim_mode:
+            self._log("INFO", "停止所有軸（模擬）", tx=cmd)
+            return
+        if not (self.ser and self.ser.is_open):
+            return
+
+        raw = (cmd + "\r").encode("utf-8")
+        got = self._serial_lock.acquire(timeout=STOP_LOCK_TIMEOUT)
+        try:
+            self.ser.write(raw)
+        except Exception as e:  # 停止路徑不可讓例外逃逸
+            self._log("ERROR", f"停止指令送出失敗: {e}", tx=cmd)
+            return
+        finally:
+            if got:
+                self._serial_lock.release()
+
+        if got:
+            self._log("INFO", "停止所有軸", tx=cmd)
+        else:
+            self._log(
+                "WARN", "停止所有軸（序列埠忙碌，已插隊送出）", tx=cmd
+            )
+
+    def emergency_stop(self) -> None:
+        """
+        緊急停止：繞過所有佇列直接寫入串列埠。
+        刻意「不」取 _serial_lock——若此刻有查詢正卡在讀取逾時，
+        等鎖會延遲停止指令數秒。安全性上寧可讓這個位元組插隊。
+        """
         self.ems_active = True
         self.playback_running = False
         raw = b"STOP 0\r"
@@ -574,7 +1259,7 @@ class DS102Controller:
                 pass
         self._log("ERROR", "🚨 緊急停止！", tx="STOP 0")
 
-    def release_ems(self):
+    def release_ems(self) -> None:
         """解除緊急停止（GUI 層需額外要求位置確認）"""
         self.ems_active = False
         self._log("INFO", "緊急停止已解除，請確認各軸位置後再操作")
@@ -593,15 +1278,8 @@ class DS102Controller:
         while time.time() < deadline:
             if self.ems_active:
                 return False
-            status, pos = self.query_status(axis_no)
-            # 更新機械位置
-            ax = NO_AXIS.get(axis_no)
-            if ax and pos:
-                try:
-                    with self._lock:
-                        self._positions_pulse[ax] = float(pos)
-                except ValueError:
-                    pass
+            # query_status 內部已完成位置換算與寫入，此處不重複處理
+            status, _pos = self.query_status(axis_no)
             # 記錄數據
             if self._data_logging:
                 self._record_data_point()
@@ -611,10 +1289,13 @@ class DS102Controller:
             if status == "Driving":
                 time.sleep(WAIT_INTERVAL)
                 continue
-            # 其他狀態（Limit / 異常）→ 觸發警報
-            self._log("WARN", f"軸{axis_no} 異常狀態: {status}")
+            # 其他狀態（Limit / 異常）→ 記錄並觸發警報。
+            # 這段一度被註解掉，加上呼叫端忽略回傳值，結果是撞限位全程靜默：
+            # teaching point 超出行程時三軸會接連撞端點而畫面與 LOG 都沒有警告。
+            ax = NO_AXIS.get(axis_no, axis_no)
+            self._log("WARN", f"軸 {ax} 等待到位時進入異常狀態: {status}")
             if self._alarm_cb:
-                self._alarm_cb(f"軸 {NO_AXIS.get(axis_no,'?')} 異常", status)
+                self._alarm_cb(f"軸 {ax} 異常", status)
             return False
 
         self._log("WARN", f"軸{axis_no} 等待到位逾時（{timeout}s）")
@@ -670,6 +1351,7 @@ class DS102Controller:
         ax = NO_AXIS.get(axis_no)
         if ax and pos:
             try:
+                # 控制器 UNIT 固定為 pulse（連線時設定），POS? 回傳值即 pulse。
                 with self._lock:
                     self._positions_pulse[ax] = float(pos)
             except ValueError:
@@ -677,19 +1359,19 @@ class DS102Controller:
 
         return status, pos
 
-    def set_position(self, axis_no: str, value: str):
+    def set_position(self, axis_no: str, value: str) -> None:
         """設定當前位置（AXI{n}:POS {val}）"""
         cmd = f"AXI{axis_no}:POS {value}"
         self._serial_write(cmd)
-        # 同步更新內部值（換算為 pulse）
+        # 同步更新內部值
         ax = NO_AXIS.get(axis_no)
         if ax:
             try:
                 with self._lock:
-                    self._positions_pulse[ax] = self.display_to_pulse(float(value))
+                    self._positions_pulse[ax] = float(value)
             except ValueError:
                 pass
-        self._log("INFO", f"軸{axis_no} 位置設為 {value} {self._unit}", tx=cmd)
+        self._log("INFO", f"軸{axis_no} 位置設為 {value} pulse", tx=cmd)
 
     # =========================================================================
     # 速度 Profile 管理
@@ -708,43 +1390,54 @@ class DS102Controller:
         self._persist_profiles()
         self._log("INFO", f"速度 Profile [{name}] 已儲存")
 
-    def delete_speed_profile(self, name: str):
+    def delete_speed_profile(self, name: str) -> None:
         self.speed_profiles.pop(name, None)
         self._persist_profiles()
         self._log("INFO", f"速度 Profile [{name}] 已刪除")
 
-    def _persist_profiles(self):
+    def _persist_profiles(self) -> None:
         p = RECORDING_DIR / "speed_profiles.json"
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(self.speed_profiles, f, ensure_ascii=False, indent=2)
+        # 與 _persist_points() 同一套防護：沒 load 過就寫回，等於拿一份不完整的
+        # 記憶體狀態覆蓋磁碟。teaching points 早就有這層保護，profiles 一直沒有。
+        if not self._profiles_loaded and p.exists():
+            try:
+                existing = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            missing = set(existing) - set(self.speed_profiles)
+            if missing:
+                self._log(
+                    "ERROR",
+                    f"拒絕寫入 speed_profiles.json：未先 load_speed_profiles() 就儲存，"
+                    f"會遺失 {len(missing)} 個既有 Profile（{'、'.join(sorted(missing))}）",
+                )
+                return
+        _write_json_with_backup(p, self.speed_profiles, self._log)
 
-    def load_speed_profiles(self):
+    def load_speed_profiles(self) -> None:
         p = RECORDING_DIR / "speed_profiles.json"
         if p.exists():
             with open(p, encoding="utf-8") as f:
                 self.speed_profiles = json.load(f)
+            self._profiles_loaded = True
             self._log("INFO", f"載入 {len(self.speed_profiles)} 個速度 Profile")
 
     # =========================================================================
     # Teaching Points
     # =========================================================================
-    def save_point(self, name: str, positions: Dict[str, float], unit: str):
+    def save_point(self, name: str, positions: Dict[str, float]) -> None:
         """
-        儲存 Teaching Point。
-        同時記錄當時的單位，避免日後換算混亂。
-        positions: 以當前 unit 為單位的座標值。
+        儲存 Teaching Point（工作座標，單位 pulse）。
+        只有有填值的軸會被納入；未納入的軸在 goto_point 時不動。
         """
-        # 統一換算為 pulse 儲存
-        pos_pulse = {ax: self.display_to_pulse(v) for ax, v in positions.items()}
         self.saved_points[name] = {
-            "positions_pulse": pos_pulse,
-            "unit_at_save": unit,
+            "positions_pulse": dict(positions),
             "ts": datetime.now().isoformat(timespec="seconds"),
         }
-        self._log("INFO", f"Teaching Point [{name}] 已儲存 (單位={unit}): {positions}")
+        self._log("INFO", f"Teaching Point [{name}] 已儲存: {positions}")
         self._persist_points()
 
-    def delete_point(self, name: str):
+    def delete_point(self, name: str) -> None:
         self.saved_points.pop(name, None)
         self._log("INFO", f"Teaching Point [{name}] 已刪除")
         self._persist_points()
@@ -772,13 +1465,20 @@ class DS102Controller:
         pos_pulse = pt.get("positions_pulse", {})
         self._log("INFO", f"移動至 Teaching Point [{name}]")
 
-        for ax, target_pulse in pos_pulse.items():
+        # Teaching Point 存的是「工作座標」（已扣除 offset），
+        # 而 _positions_pulse 與 sw_limits 都是機械座標，比較前必須換到同一個座標系。
+        for ax, target_work in pos_pulse.items():
             axis_no = AXIS_NO.get(ax)
             if not axis_no:
                 continue
             # 僅移動有啟用的軸
             if int(axis_no) > self.axis_count and not self.sim_mode:
                 continue
+
+            with self._lock:
+                cur_pulse = self._positions_pulse.get(ax, 0.0)
+                target_pulse = target_work + self._offsets.get(ax, 0.0)
+
             ok, reason = self._check_sw_limit(axis_no, target_pulse)
             if not ok:
                 self._log("WARN", f"Teaching goto 軟體限位: {reason}")
@@ -786,42 +1486,82 @@ class DS102Controller:
                     self._alarm_cb("軟體行程限制", reason)
                 return False
 
-            with self._lock:
-                cur_pulse = self._positions_pulse.get(ax, 0.0)
             delta_pulse = target_pulse - cur_pulse
             if abs(delta_pulse) < 0.5:  # 已在目標位置（<0.5 pulse）
                 continue
             direction = "CW" if delta_pulse > 0 else "CCW"
-            # 換算為當前顯示單位發送
-            amt_display = abs(self.pulse_to_display(delta_pulse))
-            self.move_step(
+
+            # 送出前先確認這一軸真的能往那個方向走。
+            # 原點復歸後座標 0 就落在限位開關上，(0,0,0) 這種點會把每一軸
+            # 都往端點推；再加上未接滑台的軸，結果就是一連串限位警報。
+            if not self.sim_mode:
+                st, _ = self.query_status(axis_no)
+                if st == "Stage not connected":
+                    self._log("WARN", f"軸 {ax} 未接滑台，跳過")
+                    continue
+                if self.limit_direction(st) == direction:
+                    self._log(
+                        "WARN",
+                        f"軸 {ax} 已在 {direction} 限位上（{st}），"
+                        f"無法再往 {direction} 走，跳過",
+                    )
+                    continue
+            moved = self.move_step(
                 axis_no,
                 direction,
-                f"{amt_display:.4f}",
+                f"{abs(delta_pulse):.0f}",
                 l_speed,
                 f_speed,
                 rate,
                 s_rate,
                 wait_done=wait_done,
             )
+
+            # 這一軸若不是正常停下來（撞限位／逾時），後面的軸不要再跑。
+            # 目標點超出行程時，逐軸執行會演變成連續撞端點——而且因為
+            # 以前這裡沒有檢查、move_step 也沒回傳值，全程不會有任何警告。
+            if wait_done and not self.sim_mode and not moved:
+                st, _ = self.query_status(axis_no)
+                self._log(
+                    "ERROR", f"軸 {ax} 未能正常到位（{st}），中止 Teaching 移動"
+                )
+                if self._alarm_cb:
+                    self._alarm_cb(f"軸 {ax} 未到位", f"{st}（已中止後續軸）")
+                return False
         return True
 
-    def _persist_points(self):
+    def _persist_points(self) -> None:
         p = RECORDING_DIR / "teaching_points.json"
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(self.saved_points, f, ensure_ascii=False, indent=2)
+        # 沒 load 過就寫回，等於拿一份不完整的記憶體狀態覆蓋磁碟。
+        # 正常流程 GUI 啟動一定會 load_points()，會走到這裡的多半是
+        # 直接 new 一個 controller 的測試腳本。
+        if not self._points_loaded and p.exists():
+            try:
+                existing = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            missing = set(existing) - set(self.saved_points)
+            if missing:
+                self._log(
+                    "ERROR",
+                    f"拒絕寫入 teaching_points.json：未先 load_points() 就儲存，"
+                    f"會遺失 {len(missing)} 個既有點位（{'、'.join(sorted(missing))}）",
+                )
+                return
+        _write_json_with_backup(p, self.saved_points, self._log)
 
-    def load_points(self):
+    def load_points(self) -> None:
         p = RECORDING_DIR / "teaching_points.json"
         if p.exists():
             with open(p, encoding="utf-8") as f:
                 self.saved_points = json.load(f)
+            self._points_loaded = True
             self._log("INFO", f"載入 {len(self.saved_points)} 個 Teaching Points")
 
     # =========================================================================
     # 行程錄製與重播
     # =========================================================================
-    def start_recording(self, name: str = ""):
+    def start_recording(self, name: str = "") -> None:
         self.recording = True
         self.recorded_steps = []
         self._recording_name = name or f"rec_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -834,16 +1574,34 @@ class DS102Controller:
             "created": datetime.now().isoformat(timespec="seconds"),
             "steps": list(self.recorded_steps),
             "count": len(self.recorded_steps),
-            "unit": self._unit,
         }
         self.recordings.append(rec)
-        path = RECORDING_DIR / f"{self._recording_name}.json"
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(rec, f, ensure_ascii=False, indent=2)
+        self.save_recording(rec)
         self._log(
             "INFO", f"行程 [{rec['name']}] 已儲存，{rec['count']} 步（純驅動指令）"
         )
         return rec
+
+    def save_recording(self, rec: dict) -> bool:
+        """
+        把單一行程寫回它自己的 json。
+
+        改動步驟延遲（單步或整批）以前只改了記憶體裡的 dict，重開程式就
+        變回原值。任何修改 rec 內容的地方都要呼叫這個，否則使用者會以為
+        設定有存到。走 _write_json_with_backup 以取得 .bak 與原子置換。
+        """
+        name = rec.get("name")
+        if not name:
+            self._log("ERROR", "行程沒有名稱，無法儲存")
+            return False
+        try:
+            _write_json_with_backup(
+                RECORDING_DIR / f"{name}.json", rec, self._log
+            )
+            return True
+        except OSError as e:
+            self._log("ERROR", f"行程 [{name}] 寫入失敗: {e}")
+            return False
 
     def play_recording(
         self,
@@ -851,21 +1609,28 @@ class DS102Controller:
         repeat: int = 1,
         stop_event: Optional[threading.Event] = None,
         progress_cb=None,
+        delay_override_ms: Optional[int] = None,
     ):
         """
         重播行程。
         - 重播前設定 playback_running=True，鎖定其他移動操作。
         - 每步先等待前一步到位，再發送下一步，確保精度。
         - 發送完畢才等待 delay_ms（不含到位等待時間）。
+
+        delay_override_ms 不為 None 時，**忽略每一步各自的 delay_ms**，
+        全部改用這個值。用途是「這次重播想跑快一點／慢一點」而不必去改
+        （並存檔）每個步驟的延遲。
         """
         self.playback_running = True
         steps = rec.get("steps", [])
         total = len(steps) * repeat
         done = 0
+        completed = False  # 只有正常跑完才會被設 True，見 finally
         self._log("INFO", f"開始重播 [{rec['name']}] × {repeat}，共 {total} 步")
 
         try:
             for _ in range(repeat):
+                time.sleep(3)
                 for step in steps:
                     if stop_event and stop_event.is_set():
                         self._log("WARN", "重播已中止")
@@ -876,24 +1641,89 @@ class DS102Controller:
                     tx = step.get("tx", "")
                     if tx:
                         self._serial_write(tx)
-                        # 若為驅動指令，等待到位
-                        if "GO" in tx and "GO ORG" not in tx:
+                        # 只有「有終點」的指令才等到位。
+                        #
+                        # GO CWJ / CCWJ 是連續點動，沒有終點——它會一直跑到
+                        # 下一個 step 的 STOP 0 才停。舊寫法用 `"GO" in tx`
+                        # 把點動也納入等待，於是重播時 _wait_axis_stop 會阻塞
+                        # 到 30 秒逾時（或撞上硬體限位），STOP 0 遲遲送不出去。
+                        # ORG 同樣排除：它可能橫跨整個行程且途中壓限位屬正常。
+                        if _is_finite_move(tx):
                             ax_m = re.search(r"AXI(\d)", tx)
                             if ax_m and not self.sim_mode:
-                                self._wait_axis_stop(ax_m.group(1))
-                    delay_ms = step.get("delay_ms", 200)
-                    time.sleep(delay_ms / 1000.0)
+                                if not self._wait_axis_stop(ax_m.group(1)):
+                                    self._log(
+                                        "ERROR", "重播中某軸未能正常到位，已中止"
+                                    )
+                                    return
+                    delay_ms = (
+                        delay_override_ms
+                        if delay_override_ms is not None
+                        else step.get("delay_ms", 200)
+                    )
+                    time.sleep(max(0, delay_ms) / 1000.0)
                     done += 1
                     if progress_cb:
                         progress_cb(done, total)
+            completed = True
         finally:
             self.playback_running = False
+            # 中途離開（使用者中止、EMS、某軸未到位、例外）時務必送出停止。
+            # 被中斷的那一步若是 GO CWJ（連續點動、沒有終點），錄製檔裡負責
+            # 收尾的 STOP 0 就永遠送不出去了，該軸會一路跑到硬體限位。
+            # 正常跑完不送——最後一步本來就有自己的收尾。
+            if not completed:
+                self.stop()
+                self._log("WARN", "重播未完整結束，已送出停止指令")
 
         self._log("INFO", f"行程 [{rec['name']}] 重播完成")
 
-    def load_recordings_from_disk(self):
+    def delete_recording(self, name: str) -> Tuple[bool, str]:
+        """
+        刪除已儲存的行程：從記憶體清單移除，並把它的 json 改名成 .bak。
+
+        刻意用「改名成 .bak」而不是真的 unlink——這個專案已經因為
+        「整份覆蓋」的寫法弄丟過兩次 teaching points，行程檔同樣是使用者
+        花時間錄出來的東西，留一份可救回的副本成本很低。
+        `.bak` 不符合 `*.json` 的 glob，所以不會再被載入清單。
+
+        回傳 (成功?, 給人看的訊息)。
+        """
+        if self.recording:
+            return False, "錄製進行中，請先停止錄製"
+        if self.playback_running:
+            return False, "重播進行中，無法刪除行程"
+
+        idx = next(
+            (i for i, r in enumerate(self.recordings) if r.get("name") == name), None
+        )
+        if idx is None:
+            return False, f"找不到行程 [{name}]"
+
+        p = RECORDING_DIR / f"{name}.json"
+        backup = ""
+        if p.exists():
+            bak = p.with_suffix(p.suffix + ".bak")
+            try:
+                p.replace(bak)  # 原子改名，比「讀出→寫入→刪除」安全
+                backup = str(bak)
+            except OSError as e:
+                self._log("ERROR", f"行程 [{name}] 檔案刪除失敗: {e}")
+                return False, f"檔案刪除失敗: {e}"
+
+        self.recordings.pop(idx)
+        msg = f"行程 [{name}] 已刪除"
+        if backup:
+            msg += f"（備份保留於 {Path(backup).name}）"
+        self._log("INFO", msg)
+        return True, msg
+
+    def load_recordings_from_disk(self) -> None:
+        # RECORDING_DIR 同時放行程檔與設定檔，載入行程時必須把設定檔排除，
+        # 否則它們會以「沒有 steps 的行程」身分出現在清單裡。
+        # 新增設定檔時記得同步加進這個集合。
         for p in sorted(RECORDING_DIR.glob("*.json")):
-            if p.name in ("teaching_points.json", "speed_profiles.json"):
+            if p.name in NON_RECORDING_JSON:
                 continue
             try:
                 with open(p, encoding="utf-8") as f:
@@ -906,7 +1736,7 @@ class DS102Controller:
     # =========================================================================
     # 實驗數據記錄（CSV）
     # =========================================================================
-    def start_data_log(self):
+    def start_data_log(self) -> None:
         self._data_log = []
         self._data_logging = True
         self._log("INFO", "實驗數據記錄已啟動")
@@ -922,7 +1752,7 @@ class DS102Controller:
         self._log("INFO", f"實驗數據已匯出: {path}（{len(self._data_log)} 筆）")
         return str(path)
 
-    def _record_data_point(self):
+    def _record_data_point(self) -> None:
         """記錄當前時間戳與各軸位置（在 _wait_axis_stop 中定期呼叫）"""
         with self._lock:
             row = {"ts": datetime.now().isoformat(timespec="milliseconds")}
@@ -933,7 +1763,7 @@ class DS102Controller:
     # =========================================================================
     # LOG 匯出
     # =========================================================================
-    def export_log(self, path: str):
+    def export_log(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
             with self._history_lock:
                 history = list(self.action_history)
@@ -948,12 +1778,11 @@ class DS102Controller:
 # 常駐狀態列
 # =============================================================================
 class StatusBar(tk.Frame):
-    """每個分頁底部的常駐狀態列：顯示所有軸工作座標、單位、最新 LOG。"""
+    """每個分頁底部的常駐狀態列：顯示所有軸工作座標（pulse）與最新 LOG。"""
 
-    def __init__(self, parent, ctrl: DS102Controller, unit_var: tk.StringVar, **kwargs):
+    def __init__(self, parent, ctrl: DS102Controller, **kwargs):
         super().__init__(parent, bg=CLR_BORDER, **kwargs)
         self.ctrl = ctrl
-        self._unit_var = unit_var  # 共用全域單位變數
 
         coord_frame = tk.Frame(self, bg=CLR_CARD)
         coord_frame.pack(fill="x", padx=1, pady=(1, 0))
@@ -981,19 +1810,13 @@ class StatusBar(tk.Frame):
             lbl.pack(side="left")
             self._coord_labels[ax] = lbl
 
-        unit_frame = tk.Frame(coord_frame, bg=CLR_CARD)
-        unit_frame.pack(side="right", padx=6)
         tk.Label(
-            unit_frame, text="單位:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
-        ).pack(side="left")
-        tk.Label(
-            unit_frame,
-            textvariable=self._unit_var,
+            coord_frame,
+            text="pulse",
             bg=CLR_CARD,
-            fg=CLR_ACCENT,
-            font=("Segoe UI", 9, "bold"),
-            width=6,
-        ).pack(side="left")
+            fg=CLR_MUTED,
+            font=("Segoe UI", 8),
+        ).pack(side="right", padx=6)
 
         log_frame = tk.Frame(self, bg="#E8E7E2")
         log_frame.pack(fill="x", padx=1, pady=(0, 1))
@@ -1008,15 +1831,10 @@ class StatusBar(tk.Frame):
         ).pack(fill="x", padx=6, pady=1)
 
     def update_coords(self):
-        """刷新各軸工作座標（含偏置）及換算顯示"""
-        pos_work = self.ctrl.positions  # 已扣除 offset
-        unit = self._unit_var.get()
+        """刷新各軸工作座標（機械位置扣除 offset，單位 pulse）"""
+        pos_work = self.ctrl.positions
         for ax, lbl in self._coord_labels.items():
-            pulse_val = pos_work.get(ax, 0.0)
-            disp = self.ctrl.pulse_to_display(pulse_val)
-            # 依單位選擇小數位數
-            decimals = 0 if unit == "pulse" else (3 if unit == "um" else 6)
-            lbl.config(text=f"{disp:,.{decimals}f}")
+            lbl.config(text=f"{pos_work.get(ax, 0.0):,.0f}")
 
     def update_log(self, msg: str):
         self._log_var.set(msg[:100])
@@ -1034,15 +1852,20 @@ class DS102GUI:
         self.ctrl.set_alarm_callback(self._on_alarm)
 
         # 全域 StringVar
-        self._unit_var = tk.StringVar(value="pulse")
         self._axis_no_var = tk.StringVar(value="1")
 
         # 事件
         self._stop_playback = threading.Event()
+        # 狀態輪詢中旗標，避免連按驅動鍵時疊出多條輪詢執行緒搶序列埠
+        self._poll_busy = threading.Event()
+        # 關閉旗標，讓背景位置刷新執行緒能收工
+        self._shutting_down = threading.Event()
+        # 全軸原點復歸進行中。_update_stat_ui 每輪都會重設按鈕狀態，
+        # 沒有這個旗標的話它會在 100ms 後把復歸期間的鎖定解掉。
+        self._homing = threading.Event()
 
         # 按鈕組（多分頁同步更新）
         self._all_axis_btn_groups: List[Dict[str, tk.Button]] = []
-        self._all_unit_btn_groups: List[Dict[str, tk.Button]] = []
 
         # StatusBar 清單
         self._status_bars: List[StatusBar] = []
@@ -1059,19 +1882,82 @@ class DS102GUI:
         # 驅動按鈕參考（連線前 disable）
         self._drive_buttons: List[tk.Button] = []
 
+        # 非強制的提醒橫幅（取代會卡住 UI 的 messagebox）
+        self._banner_after_id: Optional[str] = None
+
         self._build_window()
         self._build_top_bar()
+        self._build_banner()
         self._build_notebook()
 
         self.ctrl.load_points()
         self.ctrl.load_recordings_from_disk()
         self.ctrl.load_speed_profiles()
+        # 先載入，連線時才知道要補回哪些被斷電清掉的設定
+        self.ctrl.load_controller_config()
+        self._cfg_status_var.set(self._cfg_summary())
         self._refresh_points()
         self._refresh_recordings()
         self._refresh_profiles()
-        self._start_poller()
+        self._start_poller()          # UI 重繪（Tk 主執行緒）
+        self._start_position_worker()  # 硬體位置刷新（背景執行緒）
 
         self.ctrl._log("INFO", "DS102  圖形化控制器啟動")
+
+    # =========================================================================
+    # 提醒橫幅（非強制，取代 modal messagebox）
+    # =========================================================================
+    def _build_banner(self):
+        """
+        建立一條可自動消失的提醒橫幅。
+
+        限位是很常見的正常狀況（點動到底、教點超界），以前每次都跳 modal
+        messagebox，使用者必須按確認、期間整個 UI 停擺。改用這條橫幅：
+        看得到、不擋操作、幾秒後自己收起來。
+        """
+        self._banner = tk.Frame(self.root, bg=CLR_WARN)
+        self._banner_var = tk.StringVar(value="")
+        tk.Label(
+            self._banner,
+            textvariable=self._banner_var,
+            bg=CLR_WARN,
+            fg="white",
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+            justify="left",
+        ).pack(side="left", padx=(12, 6), pady=6, fill="x", expand=True)
+        tk.Button(
+            self._banner,
+            text="✕",
+            bg=CLR_WARN,
+            fg="white",
+            relief="flat",
+            cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+            command=self._hide_banner,
+        ).pack(side="right", padx=(0, 10))
+        # 先不 pack——有訊息時才顯示
+
+    def _flash_banner(self, msg: str, ms: int = 8000):
+        """顯示提醒並在 ms 毫秒後自動收起。重複呼叫會重設倒數。"""
+        try:
+            self._banner_var.set(msg)
+            if not self._banner.winfo_ismapped():
+                self._banner.pack(fill="x", side="top", before=self._nb)
+            if self._banner_after_id:
+                self.root.after_cancel(self._banner_after_id)
+            self._banner_after_id = self.root.after(ms, self._hide_banner)
+        except tk.TclError:
+            pass  # 關閉流程中 widget 可能已銷毀
+
+    def _hide_banner(self):
+        try:
+            if self._banner_after_id:
+                self.root.after_cancel(self._banner_after_id)
+                self._banner_after_id = None
+            self._banner.pack_forget()
+        except tk.TclError:
+            pass
 
     # =========================================================================
     # 視窗骨架
@@ -1163,6 +2049,22 @@ class DS102GUI:
         )
         self._ems_btn.pack(side="right", padx=(10, 0))
 
+        self._home_btn = tk.Button(
+            right,
+            text="🏠  全軸原點復歸",
+            bg=CLR_INFO,
+            fg="white",
+            font=("Segoe UI", 11, "bold"),
+            relief="flat",
+            padx=14,
+            pady=6,
+            cursor="hand2",
+            state="disabled",
+            command=self._do_home_all,
+        )
+        self._home_btn.pack(side="right", padx=(10, 0))
+        self._drive_buttons.append(self._home_btn)
+
         conn_f = tk.Frame(right, bg=CLR_CARD)
         conn_f.pack(side="right")
         self._conn_dot = tk.Canvas(
@@ -1226,7 +2128,7 @@ class DS102GUI:
             cursor="hand2",
             command=self._toggle_connect,
         )
-        # self._conn_btn.grid(row=0, column=5, padx=(0, 4))
+        self._conn_btn.grid(row=0, column=5, padx=(0, 4))
         # tk.Button(
         #     cr,
         #     text="模擬模式",
@@ -1295,7 +2197,7 @@ class DS102GUI:
         return inner
 
     def _add_status_bar(self, parent) -> StatusBar:
-        sb = StatusBar(parent, self.ctrl, self._unit_var)
+        sb = StatusBar(parent, self.ctrl)
         sb.pack(side="bottom", fill="x")
         self._status_bars.append(sb)
         return sb
@@ -1332,26 +2234,8 @@ class DS102GUI:
             side="left", fill="y", padx=10, pady=4
         )
         tk.Label(
-            row, text="移動單位:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+            row, text="單位: pulse", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
         ).pack(side="left", padx=(0, 6))
-
-        cur_unit = self._unit_var.get()
-        unit_btns: Dict[str, tk.Button] = {}
-        for unit in ["pulse", "um", "mm"]:
-            b = tk.Button(
-                row,
-                text=unit,
-                width=6,
-                relief="flat",
-                font=("Segoe UI", 9),
-                cursor="hand2",
-                bg=CLR_ACCENT if unit == cur_unit else CLR_BORDER,
-                fg="white" if unit == cur_unit else CLR_TEXT,
-                command=lambda u=unit: self._select_unit(u),
-            )
-            b.pack(side="left", padx=2, pady=4)
-            unit_btns[unit] = b
-        self._all_unit_btn_groups.append(unit_btns)
 
     def _select_axis(self, ax_name: str, ax_no: str):
         self.ctrl.axis_no = ax_no
@@ -1364,16 +2248,9 @@ class DS102GUI:
                 )
         self.ctrl._log("INFO", f"選取軸 {ax_name} ({ax_no})")
         self._async_query()
-
-    def _select_unit(self, unit: str):
-        self._unit_var.set(unit)
-        self.ctrl.set_unit(unit)
-        for grp in self._all_unit_btn_groups:
-            for u, b in grp.items():
-                b.config(
-                    bg=CLR_ACCENT if u == unit else CLR_BORDER,
-                    fg="white" if u == unit else CLR_TEXT,
-                )
+        # 復歸樣式是各軸自己的設定，換軸就要重讀，否則下拉會停在上一軸的值——
+        # 按下原點返回時會把這一軸的樣式改成上一軸的。
+        self._sync_org_mode()
 
     # =========================================================================
     # TAB：儀表板
@@ -1582,6 +2459,42 @@ class DS102GUI:
             command=self._apply_sw_limits,
         ).pack(padx=12, pady=(0, 8))
 
+        # ── 控制器設定的存檔／還原 ──
+        cfg_card = self._card(scr, "控制器設定（MEMSW0 復歸樣式 + 韌體軟體限位）")
+        tk.Label(
+            cfg_card,
+            text="這些設定存在控制器的 RAM，斷電後會全部回到出廠值。\n"
+                 "存檔後，往後每次連線都會自動補回被清空的項目。",
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 9),
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(4, 2))
+        self._cfg_status_var = tk.StringVar(value="—")
+        tk.Label(
+            cfg_card,
+            textvariable=self._cfg_status_var,
+            bg=CLR_CARD,
+            fg=CLR_TEXT,
+            font=("Segoe UI", 9),
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+        cfg_btns = tk.Frame(cfg_card, bg=CLR_CARD)
+        cfg_btns.pack(anchor="w", padx=12, pady=(0, 8))
+        ttk.Button(
+            cfg_btns,
+            text="儲存控制器設定",
+            style="Accent.TButton",
+            command=self._save_controller_config,
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            cfg_btns,
+            text="立即還原",
+            style="Flat.TButton",
+            command=self._restore_controller_config,
+        ).pack(side="left")
+
         # ── 實驗數據記錄 ──
         data_card = self._card(scr, "實驗數據記錄（CSV）")
         data_row = tk.Frame(data_card, bg=CLR_CARD)
@@ -1619,7 +2532,9 @@ class DS102GUI:
         mode_f = tk.Frame(mode_card, bg=CLR_CARD)
         mode_f.pack(fill="x", padx=12, pady=8)
         self._step_dist_var = tk.StringVar(value="1000")
-        self._org_mode_var = tk.StringVar(value="ORG 0")
+        # 留空，等連線後由 _sync_org_mode() 從控制器讀當前軸的實際樣式填入。
+        # 不給預設值是刻意的：任何寫死的預設都可能覆蓋掉該軸真正的復歸樣式。
+        self._org_mode_var = tk.StringVar(value="")
         for mode_val, mode_lbl in [
             (MODE_CONTINUE, "連續點動 (Continue)"),
             (MODE_STEP, "步進 (Step)"),
@@ -1646,7 +2561,7 @@ class DS102GUI:
                 )
                 tk.Label(
                     rf,
-                    text="（當前單位）",
+                    text="pulse",
                     bg=CLR_CARD,
                     fg=CLR_MUTED,
                     font=("Segoe UI", 8),
@@ -1735,6 +2650,11 @@ class DS102GUI:
             command=self._do_stop,
         )
         stop_btn.pack(side="left", padx=4)
+        # 停止鍵**不可**放進 _drive_buttons——那串會被
+        # _set_drive_buttons_state("disabled") 整批關掉，時機包含重播中與
+        # 全軸復歸中，也就是滑台正在動、最需要停止的時候。
+        # 它只受「有沒有連線」影響，其餘一律保持可按。
+        self._stop_btn = stop_btn
 
         self._cw_btn = tk.Button(
             btn_row,
@@ -1752,10 +2672,11 @@ class DS102GUI:
         self._cw_btn.bind("<ButtonRelease-1>", self._on_cw_release)
         self._cw_btn.pack(side="left", padx=12)
 
-        self._drive_buttons.extend([self._ccw_btn, stop_btn, self._cw_btn])
+        # 只有「會發起移動」的按鈕才進這串（停止鍵見上方註解）
+        self._drive_buttons.extend([self._ccw_btn, self._cw_btn])
         tk.Label(
             drv_card,
-            text="連線後方可使用；EMS 或重播中驅動按鈕自動鎖定",
+            text="連線後方可使用；EMS 或重播中驅動按鈕自動鎖定（停止鍵不受此限）",
             bg=CLR_CARD,
             fg=CLR_MUTED,
             font=("Segoe UI", 8),
@@ -1800,17 +2721,7 @@ class DS102GUI:
             ).start()
             self._poll_status()
         elif mode == MODE_ORIGIN:
-            org_idx = (
-                ORG_MODES.index(self._org_mode_var.get())
-                if self._org_mode_var.get() in ORG_MODES
-                else 0
-            )
-            threading.Thread(
-                target=self.ctrl.move_origin,
-                args=(ax, org_idx, l, f, r, s, True),
-                daemon=True,
-            ).start()
-            self._poll_status()
+            self._do_origin_move(ax, (l, f, r, s))
 
     def _on_ccw_release(self, event):
         if self._drive_mode_var.get() == MODE_CONTINUE:
@@ -1837,17 +2748,7 @@ class DS102GUI:
             ).start()
             self._poll_status()
         elif mode == MODE_ORIGIN:
-            org_idx = (
-                ORG_MODES.index(self._org_mode_var.get())
-                if self._org_mode_var.get() in ORG_MODES
-                else 0
-            )
-            threading.Thread(
-                target=self.ctrl.move_origin,
-                args=(ax, org_idx, l, f, r, s, True),
-                daemon=True,
-            ).start()
-            self._poll_status()
+            self._do_origin_move(ax, (l, f, r, s))
 
     def _on_cw_release(self, event):
         if self._drive_mode_var.get() == MODE_CONTINUE:
@@ -1862,15 +2763,28 @@ class DS102GUI:
             self.ctrl.set_position(self.ctrl.axis_no, val)
 
     def _poll_status(self):
-        """非同步輪詢狀態直到停止"""
+        """
+        非同步輪詢狀態直到停止。
+        整個迴圈都必須留在背景執行緒：改用 time.sleep 而非 root.after 排下一輪，
+        否則第 2 輪起會被排回 Tk 主執行緒執行阻塞式序列查詢，UI 直接凍結。
+        只有 UI 更新才 marshal 回主執行緒。
+        """
+        if self._poll_busy.is_set():
+            return  # 已有輪詢在跑，不要疊第二條上去搶序列埠
+        self._poll_busy.set()
 
         def _check():
-            status, pos = self.ctrl.query_status(self.ctrl.axis_no)
-            self.root.after(0, lambda: self._ctrl_status_var.set(status))
-            if pos:
-                self.root.after(0, lambda: self._ctrl_pos_var.set(pos))
-            if status == "Driving":
-                self.root.after(100, _check)
+            try:
+                while True:
+                    status, pos = self.ctrl.query_status(self.ctrl.axis_no)
+                    self.root.after(0, lambda s=status: self._ctrl_status_var.set(s))
+                    if pos:
+                        self.root.after(0, lambda p=pos: self._ctrl_pos_var.set(p))
+                    if status != "Driving":
+                        return
+                    time.sleep(0.1)
+            finally:
+                self._poll_busy.clear()
 
         threading.Thread(target=_check, daemon=True).start()
 
@@ -1906,7 +2820,7 @@ class DS102GUI:
         self._pt_pos_vars: Dict[str, tk.StringVar] = {}
         tk.Label(
             af,
-            text="座標（pulse: −99999999~99999999 | um/mm: −9.9999999~9.9999999）",
+            text="座標（pulse，−99999999~99999999）。留空 = 該軸不動。",
             bg=CLR_CARD,
             fg=CLR_MUTED,
             font=("Segoe UI", 8),
@@ -1923,7 +2837,9 @@ class DS102GUI:
                 width=3,
                 anchor="e",
             ).grid(row=r_base, column=col_base, sticky="e", padx=(8, 2), pady=2)
-            v = tk.StringVar(value="0")
+            # 預設留空 = 「這一軸不動」。若預設 "0"，使用者只填 X 也會連帶把
+            # Y/Z 命令到座標 0——原點復歸後 0 就在限位開關上，等於撞端點。
+            v = tk.StringVar(value="")
             self._pt_pos_vars[ax] = v
             ttk.Entry(
                 af, textvariable=v, width=14, validate="key", validatecommand=vcmd
@@ -1947,22 +2863,21 @@ class DS102GUI:
             pbtn,
             text="清除",
             style="Flat.TButton",
-            command=lambda: [v.set("0") for v in self._pt_pos_vars.values()],
+            command=lambda: [v.set("") for v in self._pt_pos_vars.values()],
         ).pack(side="left", padx=4)
 
         list_card = self._card(scr, "已儲存 Teaching Points")
         self._pts_tree = ttk.Treeview(
             list_card,
-            columns=("name", "X", "Y", "Z", "unit", "ts"),
+            columns=("name", "X", "Y", "Z", "ts"),
             show="headings",
             height=8,
         )
         for col, w, lbl in [
             ("name", 120, "名稱"),
-            ("X", 90, "X"),
-            ("Y", 90, "Y"),
-            ("Z", 90, "Z"),
-            ("unit", 60, "單位"),
+            ("X", 90, "X (pulse)"),
+            ("Y", 90, "Y (pulse)"),
+            ("Z", 90, "Z (pulse)"),
             ("ts", 160, "時間"),
         ]:
             self._pts_tree.heading(col, text=lbl)
@@ -1989,15 +2904,11 @@ class DS102GUI:
         ).pack(side="left", padx=4)
 
     def _validate_coord(self, value: str) -> bool:
-        if value in ("", "-", ".", "-.", "+"):
+        """座標輸入檢核：pulse 為整數，範圍依手冊 ±99999999。"""
+        if value in ("", "-", "+"):
             return True
         try:
-            f = float(value)
-            return (
-                (-9.9999999 <= f <= 9.9999999)
-                if "." in value
-                else (-99999999 <= int(value) <= 99999999)
-            )
+            return -99999999 <= int(value) <= 99999999
         except ValueError:
             return False
 
@@ -2006,45 +2917,49 @@ class DS102GUI:
         if not name:
             messagebox.showerror("錯誤", "請輸入點名稱")
             return
+        # 只收有填值的軸；留空代表「goto 時不動這一軸」。
         positions = {}
         for ax, var in self._pt_pos_vars.items():
+            raw = var.get().strip()
+            if raw in ("", "-", ".", "-.", "+"):
+                continue
             try:
-                positions[ax] = float(var.get() or "0")
+                positions[ax] = float(raw)
             except ValueError:
-                positions[ax] = 0.0
-        unit = self._unit_var.get()
-        self.ctrl.save_point(name, positions, unit)
+                continue
+        if not positions:
+            messagebox.showerror("錯誤", "請至少填入一個軸的座標")
+            return
+        self.ctrl.save_point(name, positions)
         self._refresh_points()
 
     def _do_fill_current(self):
-        unit = self._unit_var.get()
+        # 用公開的 positions（已扣除 offset）而非機械座標 _positions_pulse，
+        # 否則設過 offset 後填入的數字會與畫面上顯示的座標對不起來
+        pos_work = self.ctrl.positions
         for ax, var in self._pt_pos_vars.items():
-            pulse = self.ctrl._positions_pulse.get(ax, 0.0)
-            disp = self.ctrl.pulse_to_display(pulse)
-            dec = 0 if unit == "pulse" else (3 if unit == "um" else 6)
-            var.set(f"{disp:.{dec}f}")
+            var.set(f"{pos_work.get(ax, 0.0):.0f}")
 
     def _do_load_point(self):
         sel = self._pts_tree.selection()
         if not sel:
             return
-        name = self._pts_tree.item(sel[0])["values"][0]
+        name = sel[0]  # iid 即點名稱，不經 Treeview 的型別轉換
         pt = self.ctrl.saved_points.get(name, {})
         self._pt_name_var.set(name)
         pos_pulse = pt.get("positions_pulse", {})
-        unit = self._unit_var.get()
         for ax, var in self._pt_pos_vars.items():
-            p_val = pos_pulse.get(ax, 0.0)
-            disp = self.ctrl.pulse_to_display(p_val)
-            dec = 0 if unit == "pulse" else (3 if unit == "um" else 6)
-            var.set(f"{disp:.{dec}f}")
+            if ax not in pos_pulse:
+                var.set("")  # 該軸未納入此點 → 保持留空
+                continue
+            var.set(f"{pos_pulse[ax]:.0f}")
 
     def _do_goto_point(self):
         sel = self._pts_tree.selection()
         if not sel:
             messagebox.showwarning("警告", "請先選取 Teaching Point")
             return
-        name = self._pts_tree.item(sel[0])["values"][0]
+        name = sel[0]
         l, f, r, s = self._get_spd()
         threading.Thread(
             target=self.ctrl.goto_point, args=(name, l, f, r, s, True), daemon=True
@@ -2055,7 +2970,7 @@ class DS102GUI:
         sel = self._pts_tree.selection()
         if not sel:
             return
-        name = self._pts_tree.item(sel[0])["values"][0]
+        name = sel[0]
         if messagebox.askyesno("確認", f"確定刪除 [{name}]？"):
             self.ctrl.delete_point(name)
             self._refresh_points()
@@ -2064,22 +2979,24 @@ class DS102GUI:
         self._pts_tree.delete(*self._pts_tree.get_children())
         for name, data in self.ctrl.saved_points.items():
             pos_p = data.get("positions_pulse", {})
-            unit = data.get("unit_at_save", "um")
 
-            def _fmt(p, u=unit):
-                d = self.ctrl.pulse_to_display(p)
-                dec = 0 if u == "pulse" else (3 if u == "um" else 6)
-                return f"{d:.{dec}f}"
+            def _fmt(ax, pp=pos_p):
+                if ax not in pp:
+                    return "—"  # 此點未含該軸 → goto 時不動
+                return f"{pp[ax]:.0f}"
 
+            # iid 直接用點名稱：Treeview 會把看起來像數字的儲存格值轉成 int
+            # （"123"→123、"007"→7），從 values 讀回來的名稱對不上 saved_points 的
+            # 字串 key。iid 不會被轉型，是唯一可靠的取名方式。
             self._pts_tree.insert(
                 "",
                 "end",
+                iid=name,
                 values=(
                     name,
-                    _fmt(pos_p.get("X", 0)),
-                    _fmt(pos_p.get("Y", 0)),
-                    _fmt(pos_p.get("Z", 0)),
-                    unit,
+                    _fmt("X"),
+                    _fmt("Y"),
+                    _fmt("Z"),
                     data.get("ts", "")[:19],
                 ),
             )
@@ -2172,14 +3089,13 @@ class DS102GUI:
         list_card = self._card(scr, "已儲存行程")
         self._rec_tree = ttk.Treeview(
             list_card,
-            columns=("name", "count", "unit", "created"),
+            columns=("name", "count", "created"),
             show="headings",
             height=5,
         )
         for col, w, lbl in [
             ("name", 160, "名稱"),
             ("count", 60, "步數"),
-            ("unit", 60, "單位"),
             ("created", 180, "建立時間"),
         ]:
             self._rec_tree.heading(col, text=lbl)
@@ -2189,6 +3105,22 @@ class DS102GUI:
         self._rec_tree.configure(yscrollcommand=sy3.set)
         self._rec_tree.pack(side="left", fill="x", expand=True, padx=12, pady=8)
         sy3.pack(side="right", fill="y", pady=8)
+
+        recbtn = tk.Frame(list_card, bg=CLR_CARD)
+        recbtn.pack(side="bottom", anchor="w", padx=12, pady=(0, 8))
+        ttk.Button(
+            recbtn,
+            text="🗑 刪除行程",
+            style="Danger.TButton",
+            command=self._do_delete_rec,
+        ).pack(side="left")
+        tk.Label(
+            recbtn,
+            text="（檔案會改名成 .bak 保留，可手動救回）",
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 8),
+        ).pack(side="left", padx=8)
 
         play_card = self._card(scr, "重播設定")
         pf = tk.Frame(play_card, bg=CLR_CARD)
@@ -2209,6 +3141,25 @@ class DS102GUI:
             font=("Segoe UI", 9),
         ).grid(row=0, column=2, padx=16)
 
+        # ── 重播固定延遲：只影響「這次重播」，不會改到行程檔裡的每步 delay ──
+        self._fixed_delay_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            pf,
+            text="重播使用固定延遲:",
+            variable=self._fixed_delay_on,
+        ).grid(row=1, column=0, sticky="w", pady=3)
+        self._fixed_delay_var = tk.StringVar(value="200")
+        ttk.Entry(pf, textvariable=self._fixed_delay_var, width=8).grid(
+            row=1, column=1, sticky="w", padx=8
+        )
+        tk.Label(
+            pf,
+            text="ms（勾選後忽略各步驟自己的延遲，不會改到行程檔）",
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 8),
+        ).grid(row=1, column=2, sticky="w", padx=8)
+
         plbtn = tk.Frame(play_card, bg=CLR_CARD)
         plbtn.pack(padx=12, pady=(0, 8))
         ttk.Button(
@@ -2218,7 +3169,7 @@ class DS102GUI:
             plbtn,
             text="■ 停止重播",
             style="Danger.TButton",
-            command=lambda: self._stop_playback.set(),
+            command=self._do_stop_playback,
         ).pack(side="left", padx=4)
 
     def _do_start_rec(self):
@@ -2300,9 +3251,20 @@ class DS102GUI:
             if rec_sel:
                 ridx = self._rec_tree.index(rec_sel[0])
                 if 0 <= ridx < len(self.ctrl.recordings):
-                    steps = self.ctrl.recordings[ridx].get("steps", [])
+                    rec = self.ctrl.recordings[ridx]
+                    steps = rec.get("steps", [])
                     if 0 <= step_idx < len(steps):
                         steps[step_idx]["delay_ms"] = ms
+                        # 寫回磁碟：以前只改記憶體，重開就變回原值
+                        if self.ctrl.save_recording(rec):
+                            self._flash_banner(
+                                f"步驟 #{vals[0]} 延遲已改為 {ms}ms 並存檔", 4000
+                            )
+                        else:
+                            messagebox.showerror(
+                                "錯誤", "延遲已修改，但寫入檔案失敗（詳見 LOG）",
+                                parent=win,
+                            )
             win.destroy()
 
         ttk.Button(win, text="確認", style="Accent.TButton", command=_apply).pack()
@@ -2318,11 +3280,20 @@ class DS102GUI:
             vals = self._steps_tree.item(item)["values"]
             self._steps_tree.item(item, values=(vals[0], vals[1], vals[2], ms))
         rec_sel = self._rec_tree.selection()
-        if rec_sel:
-            ridx = self._rec_tree.index(rec_sel[0])
-            if 0 <= ridx < len(self.ctrl.recordings):
-                for step in self.ctrl.recordings[ridx].get("steps", []):
-                    step["delay_ms"] = ms
+        if not rec_sel:
+            messagebox.showwarning("警告", "請先選擇行程")
+            return
+        ridx = self._rec_tree.index(rec_sel[0])
+        if not (0 <= ridx < len(self.ctrl.recordings)):
+            return
+        rec = self.ctrl.recordings[ridx]
+        for step in rec.get("steps", []):
+            step["delay_ms"] = ms
+        # 寫回磁碟：以前只改記憶體，重開程式就變回原值
+        if self.ctrl.save_recording(rec):
+            self._flash_banner(f"行程 [{rec.get('name')}] 全部步驟延遲已設為 {ms}ms 並存檔", 4000)
+        else:
+            messagebox.showerror("錯誤", "延遲已修改，但寫入檔案失敗（詳見 LOG）")
 
     def _do_play_rec(self):
         sel = self._rec_tree.selection()
@@ -2332,6 +3303,16 @@ class DS102GUI:
         idx = self._rec_tree.index(sel[0])
         if idx >= len(self.ctrl.recordings):
             return
+        # 重播固定延遲（勾選才生效；不會改到行程檔裡的每步 delay）
+        override = None
+        if self._fixed_delay_on.get():
+            try:
+                override = int(self._fixed_delay_var.get())
+                assert override >= 0
+            except (ValueError, AssertionError):
+                messagebox.showerror("錯誤", "固定延遲請輸入 0 或正整數毫秒")
+                return
+
         self._stop_playback.clear()
 
         def _progress(done, total):
@@ -2340,14 +3321,66 @@ class DS102GUI:
 
         threading.Thread(
             target=self.ctrl.play_recording,
-            args=(
-                self.ctrl.recordings[idx],
-                self._repeat_var.get(),
-                self._stop_playback,
-                _progress,
-            ),
+            kwargs={
+                "rec": self.ctrl.recordings[idx],
+                "repeat": self._repeat_var.get(),
+                "stop_event": self._stop_playback,
+                "progress_cb": _progress,
+                "delay_override_ms": override,
+            },
             daemon=True,
         ).start()
+
+
+    def _do_stop_playback(self):
+        """
+        停止重播——**同時要真的把馬達停下來**。
+
+        舊寫法只有 `self._stop_playback.set()`，而 play_recording 收到旗標後
+        直接 return，不送任何停止指令。若中斷的那一步是 `GO CWJ`（連續點動，
+        沒有終點），錄製檔裡負責收尾的 `STOP 0` 就永遠送不出去了，該軸會
+        一路跑到硬體限位——按鈕寫「停止」，失效方向卻是「繼續移動」。
+
+        先送 STOP 再 set 旗標：stop() 有 STOP_LOCK_TIMEOUT(0.15s) 上限，
+        在主執行緒呼叫可以接受，而且越早送出滑台滑行越短。
+        """
+        if self.ctrl.connected:
+            self.ctrl.stop()
+        self._stop_playback.set()
+        self._flash_banner("■ 已中止重播並送出停止指令", 5000)
+
+    def _do_delete_rec(self):
+        sel = self._rec_tree.selection()
+        if not sel:
+            messagebox.showwarning("警告", "請先選擇要刪除的行程")
+            return
+        idx = self._rec_tree.index(sel[0])
+        if not (0 <= idx < len(self.ctrl.recordings)):
+            return
+        rec = self.ctrl.recordings[idx]
+        name = rec.get("name", "")
+        n_steps = len(rec.get("steps", []))
+
+        if not messagebox.askyesno(
+            "確認刪除",
+            f"確定刪除行程 [{name}]？\n\n"
+            f"步數：{n_steps}\n"
+            f"建立：{rec.get('created', '?')[:19]}\n\n"
+            f"檔案會改名成 {name}.json.bak 保留，可手動救回。",
+            icon="warning",
+            default="no",
+        ):
+            return
+
+        ok, msg = self.ctrl.delete_recording(name)
+        if not ok:
+            messagebox.showerror("刪除失敗", msg)
+            return
+
+        # 被刪的若正好是目前顯示步驟的那一筆，把步驟表一併清掉
+        self._steps_tree.delete(*self._steps_tree.get_children())
+        self._refresh_recordings()
+        self._flash_banner(f"🗑 {msg}", 6000)
 
     def _refresh_recordings(self):
         self._rec_tree.delete(*self._rec_tree.get_children())
@@ -2358,7 +3391,6 @@ class DS102GUI:
                 values=(
                     rec.get("name", ""),
                     rec.get("count", 0),
-                    rec.get("unit", "—"),
                     rec.get("created", "")[:19],
                 ),
             )
@@ -2453,6 +3485,11 @@ class DS102GUI:
         if self._log_text:
             self._log_text.config(state="normal")
             self._log_text.insert("end", line, level)
+            # 無上限成長的 Text widget 會讓 Tk 越跑越慢終至無回應。
+            # 超過上限就從頭砍掉一批（不是每行砍一行，避免頻繁重排）。
+            n_lines = int(self._log_text.index("end-1c").split(".")[0])
+            if n_lines > LOG_TEXT_MAX_LINES:
+                self._log_text.delete("1.0", f"{n_lines - LOG_TEXT_MAX_LINES + 1}.0")
             if self._log_auto_scroll.get():
                 self._log_text.see("end")
             self._log_text.config(state="disabled")
@@ -2467,8 +3504,20 @@ class DS102GUI:
         self.root.after(0, lambda: self._show_alarm(title, msg))
 
     def _show_alarm(self, title: str, msg: str):
-        self.ctrl.stop()
-        messagebox.showwarning(f"⚠️  {title}", msg)
+        """
+        顯示限位／異常提醒。
+
+        刻意「不」做兩件以前會做的事：
+          1. 不再呼叫 ctrl.stop()。`STOP 0` 是停**全部**軸，但觸發限位的
+             只有一軸；其他軸正在進行的動作沒有理由被連坐。該軸自己早已
+             被控制器擋停，不需要軟體再補一刀。
+          2. 不再用 messagebox 強制確認。它是 modal 的，會卡住整個 UI 直到
+             使用者按下確認——限位是很常見的正常狀況（點動到底、教點超界），
+             每次都要按一下非常干擾，而且期間畫面完全不更新。
+
+        改用畫面上的橫幅提示：會自己淡出，不阻塞任何操作。
+        """
+        self._flash_banner(f"⚠ {title}：{msg}")
 
     # =========================================================================
     # 連線 / EMS
@@ -2481,6 +3530,9 @@ class DS102GUI:
 
     def _toggle_connect(self):
         if self.ctrl.connected:
+            # 先停再斷。少了這行，移動中按「中斷」會關掉 port 卻讓馬達繼續跑，
+            # 程式從此失去對它的控制（_on_close 有做，這裡以前漏了）。
+            self.ctrl.stop()
             self.ctrl.disconnect()
             self._conn_dot.itemconfig(self._conn_dot_id, fill=CLR_DANGER)
             self._conn_lbl.config(text="未連線")
@@ -2520,6 +3572,25 @@ class DS102GUI:
                             else "disabled"
                         )
                     )
+            # 控制器設定是 RAM-only，斷電就沒了。連線時已嘗試從設定檔補回，
+            # 這裡把結果告訴使用者：補了什麼、還缺什麼。
+            # 復歸樣式下拉要填當前軸的實際值（設定檔還原之後才讀才準）
+            self._sync_org_mode()
+            restored = self.ctrl.config_restored
+            unset = self.ctrl.homing_unconfigured
+            if restored:
+                self._flash_banner(
+                    "✔ 已從設定檔還原控制器設定（斷電後會被清空）："
+                    + "、".join(restored),
+                    10000,
+                )
+            if unset:
+                self._flash_banner(
+                    f"⚠ 軸 {'、'.join(unset)} 的復歸樣式未設定（MEMSW0=0），"
+                    f"原點復歸會略過這些軸。設好之後按「儲存控制器設定」，"
+                    f"下次連線就會自動補回。",
+                    14000,
+                )
         else:
             self._conn_btn.config(text="連線", bg=CLR_ACCENT)
             messagebox.showerror("連線失敗", msg)
@@ -2544,11 +3615,84 @@ class DS102GUI:
             self.root.after(800, self._sim_tick)
 
     def _set_drive_buttons_state(self, state: str):
+        """
+        切換「會發起移動」的按鈕狀態。
+
+        停止鍵刻意不在 self._drive_buttons 裡，所以不受這裡影響——
+        它由 _sync_stop_button() 單獨管理，只看有沒有連線。
+        """
         for b in self._drive_buttons:
             try:
                 b.config(state=state)
             except tk.TclError:
                 pass
+
+    def _selected_org_type(self) -> Optional[int]:
+        """
+        取得下拉目前選的復歸樣式編號；未選或不合法時回 None。
+
+        ⚠ 不可用 `ORG_MODES.index(...)`：ORG_MODES 從 "ORG 1" 開始，
+        index 會差一位（"ORG 1" 的 index 是 0）。而且舊寫法的
+        `else 0` fallback 正好會送出 MEMSW0 0＝把復歸樣式毀掉。
+        一律直接解析字串裡的數字，解析不出來就回 None、不動作。
+        """
+        raw = self._org_mode_var.get().strip()
+        m = re.match(r"ORG\s+(\d+)$", raw)
+        if not m:
+            return None
+        n = int(m.group(1))
+        return n if 1 <= n <= 12 else None
+
+    def _do_origin_move(self, ax: str, spd):
+        """按下原點返回：樣式未知就明確拒絕，不要猜一個值送出去。"""
+        org_type = self._selected_org_type()
+        if org_type is None:
+            self._flash_banner(
+                "⚠ 尚未取得此軸的復歸樣式，無法執行原點返回。"
+                "請先連線；若下拉是空的，表示控制器的 MEMSW0 未設定"
+                "（可到儀表板的「控制器設定」還原）。",
+                10000,
+            )
+            return
+        l, f, r, s = spd
+        threading.Thread(
+            target=self.ctrl.move_origin,
+            args=(ax, org_type, l, f, r, s, True),
+            daemon=True,
+        ).start()
+        self._poll_status()
+
+    def _sync_org_mode(self):
+        """
+        把當前軸在控制器裡的實際復歸樣式填進下拉。
+
+        為什麼不給寫死的預設值：`move_origin()` 送出的第一道指令就是
+        `MEMSW0 {type}`，所以下拉顯示什麼，按下去就會把該軸的復歸樣式
+        改成什麼。以前預設是 `ORG 0`（Type0＝不執行），等於一按就把樣式
+        毀掉。讀不到就留空，並由 `_on_*_press` 拒絕執行原點動作。
+        """
+        if not self.ctrl.connected or self.ctrl.sim_mode:
+            self._org_mode_var.set("")
+            return
+
+        def _work():
+            raw = self.ctrl._serial_write_read(
+                f"AXI{self.ctrl.axis_no}:MEMSW0?"
+            ).strip()
+            val = f"ORG {raw}" if raw in [str(i) for i in range(1, 13)] else ""
+            self.root.after(0, lambda: self._org_mode_var.set(val))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _sync_stop_button(self):
+        """停止鍵只在未連線時 disable，其餘一律可按（含重播中、復歸中）。"""
+        btn = getattr(self, "_stop_btn", None)
+        if btn is None:
+            return
+        try:
+            btn.config(state="normal" if self.ctrl.connected else "disabled")
+        except tk.TclError:
+            pass
 
     def _set_axis_btns_state(self, state: str):
         for grp in self._all_axis_btn_groups:
@@ -2569,6 +3713,54 @@ class DS102GUI:
                 self._ems_btn.config(text="⛔  緊急停止", bg=CLR_DANGER)
                 if self.ctrl.connected:
                     self._set_drive_buttons_state("normal")
+
+    # =========================================================================
+    # 全軸回 HOME
+    # =========================================================================
+    def _do_home_all(self):
+        """
+        全軸原點復歸，按下即執行、不跳確認視窗。
+        某軸失敗不中止整批，繼續跑其餘各軸。
+        結果寫入 LOG 與狀態列；只有出現失敗項目時才彈窗。
+        """
+        if not self.ctrl.connected or self.ctrl.ems_active:
+            return
+        if self._homing.is_set():
+            return  # 已經在復歸，別疊第二條執行緒上去
+
+        # 這個旗標讓 _update_stat_ui 知道「作業進行中」。少了它，那邊每
+        # UI_REDRAW_INTERVAL 就會把下面這行鎖定解掉，於是一顆寫著
+        # 「復歸中…」的按鈕變成可按的。
+        self._homing.set()
+        self._home_btn.config(state="disabled", text="🏠  復歸中…")
+        self._set_drive_buttons_state("disabled")
+        l, f, r, s = self._get_spd()
+
+        def _run():
+            try:
+                ok, msg = self.ctrl.origin_all(l, f, r, s, progress_cb=_progress)
+            except Exception as e:  # 背景執行緒的例外不可讓旗標卡在 set
+                self.root.after(0, lambda: _done(False, f"復歸過程發生例外: {e}"))
+                return
+            self.root.after(0, lambda: _done(ok, msg))
+
+        def _progress(ax, state):
+            self.root.after(
+                0, lambda: self._home_btn.config(text=f"🏠  {ax} {state}")
+            )
+
+        def _done(ok, msg):
+            # 先清旗標再還原狀態，否則 _update_stat_ui 會再把它鎖回去
+            self._homing.clear()
+            self._home_btn.config(state="normal", text="🏠  全軸原點復歸")
+            if self.ctrl.connected and not self.ctrl.ems_active:
+                self._set_drive_buttons_state("normal")
+            for sb in self._status_bars:
+                sb.update_log(f"全軸原點復歸 — {msg}")
+            if not ok:
+                messagebox.showwarning("全軸原點復歸", msg)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # =========================================================================
     # 速度 Profile
@@ -2621,20 +3813,108 @@ class DS102GUI:
             self._profile_var.set(names[0])
 
     # =========================================================================
+    # 控制器設定存檔 / 還原
+    # =========================================================================
+    def _cfg_summary(self) -> str:
+        cfg = self.ctrl.controller_config or {}
+        axes = cfg.get("axes", {})
+        if not axes:
+            return "尚未儲存過控制器設定"
+        parts = []
+        for ax, v in axes.items():
+            bits = [f"樣式{v.get('memsw0', '?')}"]
+            if v.get("cwsle") == "1" or v.get("ccwsle") == "1":
+                bits.append("含軟限位")
+            parts.append(f"{ax}({'/'.join(bits)})")
+        return f"存於 {cfg.get('saved', '?')}｜" + "、".join(parts)
+
+    def _save_controller_config(self):
+        if not self.ctrl.connected or self.ctrl.sim_mode:
+            messagebox.showwarning("未連線", "請先連線到實體控制器再儲存設定")
+            return
+
+        def _work():
+            cfg = self.ctrl.capture_controller_config()
+            self.root.after(0, lambda: self._on_cfg_saved(cfg))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_cfg_saved(self, cfg: dict):
+        self._cfg_status_var.set(self._cfg_summary())
+        if cfg:
+            self._flash_banner("✔ 控制器設定已存檔，往後連線會自動補回", 6000)
+
+    def _restore_controller_config(self):
+        if not self.ctrl.connected or self.ctrl.sim_mode:
+            messagebox.showwarning("未連線", "請先連線到實體控制器")
+            return
+
+        def _work():
+            self.ctrl.load_controller_config()
+            done = self.ctrl.restore_controller_config()
+            self.root.after(0, lambda: self._on_cfg_restored(done))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_cfg_restored(self, done: List[str]):
+        self._cfg_status_var.set(self._cfg_summary())
+        if done:
+            self._flash_banner("✔ 已還原：" + "、".join(done), 8000)
+        else:
+            self._flash_banner("控制器設定與存檔一致，無須還原", 5000)
+
+    # =========================================================================
     # 軟體行程限制
     # =========================================================================
     def _apply_sw_limits(self):
+        """
+        把輸入框的值套進 ctrl.sw_limits。
+
+        兩件事以前是靜默發生的，現在都會講出來：
+          1. 格式錯（例如打成 10,613 帶逗號）以前直接吃掉變 None＝無限制，
+             卻照樣跳「已套用」的成功視窗。
+          2. 輸入框開機是空的，只填 X 就按套用會把 Y/Z 既有的限制一併歸零。
+        兩者都是「以為有保護、其實沒有」，比沒設還危險。
+        """
+        bad: List[str] = []
+        cleared: List[str] = []
+
+        def _parse(raw: str, ax: str, side: str) -> Optional[float]:
+            raw = raw.strip()
+            if not raw:
+                return None
+            try:
+                return float(raw)
+            except ValueError:
+                bad.append(f"軸 {ax} {side}「{raw}」")
+                return None
+
         for ax, (ccw_v, cw_v) in self._lim_vars.items():
-            try:
-                ccw = float(ccw_v.get()) if ccw_v.get().strip() else None
-            except ValueError:
-                ccw = None
-            try:
-                cw = float(cw_v.get()) if cw_v.get().strip() else None
-            except ValueError:
-                cw = None
+            prev = self.ctrl.sw_limits.get(ax, (None, None))
+            ccw = _parse(ccw_v.get(), ax, "CCW")
+            cw = _parse(cw_v.get(), ax, "CW")
+            if any(p is not None for p in prev) and ccw is None and cw is None:
+                cleared.append(ax)
             self.ctrl.sw_limits[ax] = (ccw, cw)
             self.ctrl._log("INFO", f"軸 {ax} 軟體限制: CCW={ccw}, CW={cw}")
+
+        if bad:
+            self.ctrl._log("ERROR", f"軟體限制格式錯誤（已視為無限制）: {'、'.join(bad)}")
+            messagebox.showerror(
+                "格式錯誤",
+                "以下欄位無法解析，已視為「無限制」：\n\n"
+                + "\n".join(bad)
+                + "\n\n請只填數字（不要有逗號或單位）後重新套用。",
+            )
+            return
+        if cleared:
+            self.ctrl._log("WARN", f"以下軸的軟體限制被清空: {'、'.join(cleared)}")
+            messagebox.showwarning(
+                "限制已清空",
+                f"軸 {'、'.join(cleared)} 的欄位是空的，其原有限制已被清除"
+                f"（＝無限制）。\n\n若非本意，請重新填入數值再套用。",
+            )
+            return
         messagebox.showinfo("完成", "軟體行程限制已套用")
 
     # =========================================================================
@@ -2673,33 +3953,75 @@ class DS102GUI:
             self._stat_vars["play"].set(
                 "🔴 重播中" if self.ctrl.playback_running else "閒置"
             )
-        if self.ctrl.playback_running:
+        # ⚠ 這段每 UI_REDRAW_INTERVAL 就跑一次，會覆蓋掉別處設定的按鈕狀態。
+        # 以前只認得 playback_running 與 ems_active，不認得「復歸中」，
+        # 所以 _do_home_all 剛鎖上的按鈕會在 100ms 後全部復活——包含那顆
+        # 文字還停在「🏠 復歸中…」的按鈕，再按一次就疊出第二條復歸執行緒。
+        # 任何新增的「作業進行中」狀態都必須同步加進這個判斷。
+        busy = self.ctrl.playback_running or self._homing.is_set()
+        if busy:
             self._set_drive_buttons_state("disabled")
         elif self.ctrl.connected and not self.ctrl.ems_active:
             self._set_drive_buttons_state("normal")
+        self._sync_stop_button()
 
     # =========================================================================
     # 座標定時輪詢
     # =========================================================================
     def _start_poller(self):
-        def _poll():
-            unit = self._unit_var.get()
-            dec = 0 if unit == "pulse" else (3 if unit == "um" else 6)
-            pos_work = self.ctrl.positions
-            for ax, lbl in self._dash_pos_vars.items():
-                disp = self.ctrl.pulse_to_display(pos_work.get(ax, 0.0))
-                lbl.set(f"{disp:,.{dec}f}")
-            for sb in self._status_bars:
-                sb.update_coords()
-            self._update_stat_ui()
-            self.root.after(300, _poll)
+        """
+        把快取的座標重繪到畫面上。不做任何 I/O。
 
-        self.root.after(300, _poll)
+        間隔從 10ms 放寬到 UI_REDRAW_INTERVAL：資料來源（position worker）
+        只有 2 Hz，10ms 等於 49/50 次在重繪同一個數字，代價是每秒約 600 次
+        _lock 取放與數千次 Label.config()。那些工全部堆在 Tk 主執行緒上，
+        跟 LOG 洪水疊加就是「介面越跑越鈍、偶發沒回應」。
+        """
+
+        def _poll():
+            if self._shutting_down.is_set():
+                return  # 關閉後不要再排下一輪，否則會對已銷毀的 widget 動作
+            try:
+                pos_work = self.ctrl.positions
+                for ax, lbl in self._dash_pos_vars.items():
+                    lbl.set(f"{pos_work.get(ax, 0.0):,.0f}")
+                for sb in self._status_bars:
+                    sb.update_coords()
+                self._update_stat_ui()
+            except tk.TclError:
+                return  # widget 已被銷毀（關閉流程中），安靜收工
+            self.root.after(UI_REDRAW_INTERVAL, _poll)
+
+        self.root.after(UI_REDRAW_INTERVAL, _poll)
+
+    def _start_position_worker(self):
+        """
+        背景定時把硬體的實際位置讀回 _positions_pulse。
+
+        _start_poller() 只是把快取的座標重繪到畫面上，不會去問硬體；
+        而 query_status() 一次只更新它被傳入的那一軸。沒有這條執行緒的話，
+        未選取的軸永遠停在舊值、選取的軸也只有移動時才會變。
+
+        必須留在 worker 用 time.sleep——用 root.after 會把阻塞式序列查詢
+        搬回 Tk 主執行緒而凍結 UI。
+        """
+
+        def _worker():
+            while not self._shutting_down.is_set():
+                if self.ctrl.connected and not self.ctrl.playback_running:
+                    try:
+                        self.ctrl.refresh_positions()
+                    except Exception as e:  # 背景執行緒不可讓例外逃逸
+                        logger.debug(f"背景位置刷新失敗: {e}")
+                self._shutting_down.wait(POSITION_POLL_INTERVAL)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # =========================================================================
     # 關閉
     # =========================================================================
     def _on_close(self):
+        self._shutting_down.set()
         self._stop_playback.set()
         if self.ctrl.connected:
             self.ctrl.stop()
@@ -2715,7 +4037,7 @@ class DS102GUI:
 # =============================================================================
 # 程式入口
 # =============================================================================
-def main():
+def main() -> None:
     root = tk.Tk()
     DS102GUI(root)
     root.mainloop()
