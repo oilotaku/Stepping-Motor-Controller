@@ -191,6 +191,10 @@ class FiberAlignmentScanner:
         self.samples: List[Sample] = []
         self._stop_event = threading.Event()
         self._noise_sigma: Optional[float] = None  # 校準後才有值，見 calibrate_noise()
+        # 階段二開始時記下 samples 的長度，_estimate_gradient 只從這個
+        # 索引之後取鄰居——見該方法 docstring 說明為什麼不能用階段一的
+        # 歷史樣本。
+        self._stage2_sample_start = 0
 
     # ------------------------------------------------------------------
     # 對外控制
@@ -403,6 +407,12 @@ class FiberAlignmentScanner:
         scale = axis_scale or {ax: 1.0 for ax in axes}
         k = k or max(2 * (d + 1), 4)
 
+        # 從這裡開始收集的樣本才進入 _estimate_gradient 的鄰居池——階段一
+        # 座標下降的歷史樣本沿軸向堆積（同一輪只動一個軸），距離上常常
+        # 比星形設計的臂點更近，會把星形點擠出 K 近鄰、且本身缺乏多軸
+        # 變化（例如最近 6 點全部同一個 X），迴歸矩陣因此奇異。
+        self._stage2_sample_start = len(self.samples)
+
         origin_sample = self._measure_here()
         if not origin_sample.ok or origin_sample.power is None:
             raise ScanAbort("階段二起點量測失敗，無法開始局部精修")
@@ -410,6 +420,18 @@ class FiberAlignmentScanner:
         self._log(f"階段二開始，起點功率 {best_power:.4f}")
 
         # ── 初始星形設計：每軸 ±1 個臂點，逐臂取樣完畢即撤回中心 ──
+        # ⚠ 撤回中心只是「量測時」暫時回去，不是放棄找到的結果：
+        # 星形設計結束後若某個臂比中心好，要真的走到那個臂點，見下方
+        # best_arm 的處理。之前的寫法量完就撤回、只把數值記進
+        # best_power，位置卻沒有跟著移動——後面梯度下降迴圈重新算出
+        # 同一個方向、踩到同一個點時，量到的功率跟 best_power 打平
+        # （不是更好），嚴格 `>` 判斷會判定「沒有改善」而撤回，
+        # step_length 跟著減半，星形設計已經找到的方向就這樣白費，
+        # 最終回報「階段二沒有幫助」——實測用旋轉橢圓高斯耦合合成
+        # 函式踩到，星形設計量到 X-24 功率 8.9236（優於中心 8.6545），
+        # 梯度下降卻只敢踩 X-4、X-24 都因為打平 best_power 被拒絕，
+        # 20 輪後回到原點，跟純座標下降結果完全相同。
+        best_arm: Optional[Tuple[str, int]] = None
         for ax in axes:
             r = max(self.step_min, int(local_radius.get(ax, self.step_min * 4)))
             for sign in (1, -1):
@@ -424,7 +446,18 @@ class FiberAlignmentScanner:
                     s = self._measure_here()
                     if s.ok and s.power is not None and s.power > best_power:
                         best_power = s.power
+                        best_arm = (ax, sign * r)
                     self._move_relative(ax, -sign * r)  # 撤回中心
+
+        if best_arm is not None:
+            ax, delta = best_arm
+            if self._move_relative(ax, delta):
+                self._log(f"階段二星形取樣找到更好的起點：{ax}{delta:+d} pulse，功率 {best_power:.4f}")
+            else:
+                # 走不過去（撞限位/逾時）：位置仍在中心，best_power 要
+                # 跟著改回中心的功率，否則後面梯度下降迴圈永遠贏不了
+                # 一個實際上沒有站上去的數字，重演這裡要修的同一種 bug。
+                best_power = origin_sample.power
 
         step_length = max(local_radius.values()) if local_radius else self.step_min * 4
         stall_count = 0
@@ -494,10 +527,35 @@ class FiberAlignmentScanner:
         距離依 `scale` 正規化後計算（避免行程小的軸被系統性低估變化量）。
         權重用高斯核，核寬度取鄰居距離的中位數。樣本不足（少於軸數+2，
         即含截距項的自由度）時無法擬合，回傳 None。
+
+        ⚠ 鄰居池只取 `self.samples[self._stage2_sample_start:]`（階段二
+        開始之後收集的樣本），不用階段一的歷史樣本。原因是實測踩到的
+        兩層 bug：
+
+        1. 同座標重複點：`_search_axis_once` 的方向探測在「兩側都沒有
+           改善」時會在同一個座標連續量測 2~3 次，`run_stage1` 每輪前
+           後也各測一次目前位置。這些點距離全是 0，若混進鄰居池會排
+           在 K 近鄰最前面，把星形取樣點擠出去——加了去重仍不夠，見下一點。
+        2. 軸向退化：座標下降每輪只沿單一軸移動，即使去重後，階段一
+           收斂末期在目前位置附近留下的樣本仍集中在「同一座標、只有
+           最後一個處理的軸在變化」（例如全部 6 個最近鄰居的 X 座標
+           完全相同，只有 Y 不同）。這種鄰居集合對那個沒有變化的軸
+           而言，設計矩陣的截距欄與該軸欄位線性相依，迴歸矩陣依然
+           奇異——不是重複點造成的，是鄰居集合本身缺乏該軸方向的
+           變異。星形設計每軸都刻意留了 ±r 的取樣點，具備多軸變化，
+           排除階段一的歷史樣本後鄰居池自然只剩這些有效點。
         """
         center = self.ctrl.positions_machine
-        valid = [s for s in self.samples if s.ok and s.power is not None]
-        if len(valid) < len(axes) + 2:
+        pool = self.samples[self._stage2_sample_start:]
+        valid = [s for s in pool if s.ok and s.power is not None]
+
+        dedup: Dict[Tuple[float, ...], Sample] = {}
+        for s in valid:
+            key = tuple(round(s.coords.get(ax, center[ax]), 3) for ax in axes)
+            dedup[key] = s  # 同座標保留最後一次量測
+        unique_samples = list(dedup.values())
+
+        if len(unique_samples) < len(axes) + 2:
             return None
 
         def dist2(s: Sample) -> float:
@@ -510,7 +568,7 @@ class FiberAlignmentScanner:
                 for ax in axes
             )
 
-        neighbors = sorted(valid, key=dist2)[: max(k, len(axes) + 2)]
+        neighbors = sorted(unique_samples, key=dist2)[: max(k, len(axes) + 2)]
         dists = sorted(dist2(s) ** 0.5 for s in neighbors)
         ell = dists[len(dists) // 2] or 1.0
 
