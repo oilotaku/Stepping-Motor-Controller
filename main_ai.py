@@ -26,6 +26,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import serial
 import serial.tools.list_ports
+import sys
 import threading
 import time
 import json
@@ -37,26 +38,86 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
 # =============================================================================
-# 目錄建立與 LOG 系統初始化
+# 執行期目錄與 LOG 系統
 # =============================================================================
-LOG_DIR = Path("logs")
-RECORDING_DIR = Path("recordings")
-DATA_DIR = Path("data")  # 實驗數據 CSV 輸出目錄
-LOG_DIR.mkdir(exist_ok=True)
-RECORDING_DIR.mkdir(exist_ok=True)
-DATA_DIR.mkdir(exist_ok=True)
+def _app_dir() -> Path:
+    """
+    程式所在目錄——**不是**目前工作目錄。
 
-log_filename = LOG_DIR / f"ds102_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-_file_handler = logging.FileHandler(log_filename, encoding="utf-8")
-_file_handler.setLevel(logging.DEBUG)
-_stream_handler = logging.StreamHandler()
-_stream_handler.setLevel(logging.INFO)
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[_file_handler, _stream_handler],
-)
+    以前三個資料目錄都是 `Path("logs")` 這種相對路徑，等於綁在 CWD 上。
+    直接跑 .py 時 CWD 通常就是專案資料夾所以看不出問題，但打包成 exe 之後：
+      - 從開始功能表／捷徑啟動，CWD 可能是 C:\\Windows\\System32
+        → 教點與行程會被存到那裡，使用者以為資料不見了
+      - 每次從不同位置啟動，看到的行程清單都不一樣
+    改成以執行檔位置為基準，走到哪都指向同一份資料。
+    """
+    if getattr(sys, "frozen", False):  # PyInstaller 打包後為 True
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+_BASE_DIR = _app_dir()
+LOG_DIR = _BASE_DIR / "logs"
+RECORDING_DIR = _BASE_DIR / "recordings"
+DATA_DIR = _BASE_DIR / "data"  # 實驗數據 CSV 輸出目錄
+
+# 只取得 logger 物件（不做任何 I/O）。真正的檔案 handler 由
+# init_runtime() 在 main() 裡建立——見該函式的說明。
 logger = logging.getLogger("DS102")
+log_filename: Optional[Path] = None
+
+
+def init_runtime() -> Tuple[bool, str]:
+    """
+    建立執行期目錄並初始化 LOG，回傳 (成功?, 錯誤訊息)。
+
+    **刻意不在 module import 時做這件事。** 以前 mkdir 與
+    logging.FileHandler() 都寫在模組層級，也就是在 main() 與任何 GUI
+    之前執行；一旦目錄不可寫（exe 放在 Program Files、磁碟唯讀），
+    例外會在「還沒有視窗可以顯示錯誤」的階段拋出——打包成 windowed exe
+    的話，使用者看到的就是雙擊之後什麼都沒發生，連錯誤訊息都沒有。
+    改成由 main() 呼叫並回傳結果，失敗時還來得及用 messagebox 說明。
+    """
+    global log_filename
+    try:
+        for d in (LOG_DIR, RECORDING_DIR, DATA_DIR):
+            d.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return False, (
+            f"無法建立資料目錄：\n{e}\n\n"
+            f"程式需要在下列位置寫入 logs / recordings / data：\n{_BASE_DIR}\n\n"
+            f"請把程式移到有寫入權限的位置（例如桌面或 D:\\），"
+            f"不要放在 Program Files。"
+        )
+
+    handlers: List[logging.Handler] = []
+    try:
+        log_filename = LOG_DIR / (
+            f"ds102_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        fh = logging.FileHandler(log_filename, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        handlers.append(fh)
+    except OSError as e:
+        log_filename = None
+        return False, f"無法建立 LOG 檔：\n{e}\n\n位置：{LOG_DIR}"
+
+    # ⚠ PyInstaller 的 --windowed 會把 sys.stdout / sys.stderr 設成 None，
+    # 而 StreamHandler() 預設綁 sys.stderr。少了這道檢查，每一筆 log 的
+    # emit() 都會踩 AttributeError 再被 logging 內部吞掉——不會崩，
+    # 但這支程式 log 量不小，等於每筆都白付一次例外成本。
+    if sys.stderr is not None:
+        sh = logging.StreamHandler()
+        sh.setLevel(logging.INFO)
+        handlers.append(sh)
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    return True, ""
 
 
 def _write_json_with_backup(path: Path, data: dict, log=None) -> None:
@@ -80,11 +141,27 @@ def _write_json_with_backup(path: Path, data: dict, log=None) -> None:
             if log:
                 log("WARN", f"備份 {path.name} 失敗: {e}")
 
+    # 目錄可能不存在（測試直接指定路徑、或 init_runtime() 沒跑過）
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 例外要在這裡收掉並轉成 LOG + 例外往上拋給呼叫端判斷，不能讓
+    # OSError 直接穿過 Tk callback 變成 traceback。磁碟滿、防毒鎖檔、
+    # 或 exe 被放在唯讀位置時都會走到這裡——打包之後尤其容易遇上。
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    tmp.replace(path)
+    try:
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp.replace(path)
+    except OSError as e:
+        if log:
+            log("ERROR", f"寫入 {path.name} 失敗: {e}")
+        # 別把半成品的 .tmp 留在資料夾裡
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # =============================================================================
@@ -1742,7 +1819,7 @@ class DS102Controller:
         """記錄當前時間戳與各軸位置（在 _wait_axis_stop 中定期呼叫）"""
         with self._lock:
             row = {"ts": datetime.now().isoformat(timespec="milliseconds")}
-            row.update({ax: self._positions_pulse[ax] for ax in AXES})
+            row.update({ax: self._positions_pulse[ax] for ax in AXES}) # type: ignore
         with self._history_lock:
             self._data_log.append(row)
 
@@ -4522,11 +4599,14 @@ class DS102GUI:
         if self.ctrl.connected:
             self.ctrl.stop()
             self.ctrl.disconnect()
-        auto = str(log_filename).replace(".log", "_history.txt")
-        try:
-            self.ctrl.export_log(auto)
-        except Exception:
-            pass
+        # log_filename 在 init_runtime() 失敗或未呼叫時會是 None（例如
+        # 測試直接建 DS102GUI 而沒走 main()），那就跳過歷程匯出
+        if log_filename is not None:
+            auto = str(log_filename).replace(".log", "_history.txt")
+            try:
+                self.ctrl.export_log(auto)
+            except Exception:
+                logger.exception("Failed to export log on close")
         self.root.destroy()
 
 
@@ -4534,7 +4614,19 @@ class DS102GUI:
 # 程式入口
 # =============================================================================
 def main() -> None:
+    # 先把視窗建起來，才有東西可以顯示錯誤訊息。
+    # 初始化失敗時 messagebox 需要一個 root，而且打包成 windowed exe 後
+    # 沒有 console，這是使用者唯一看得到原因的管道。
     root = tk.Tk()
+    root.withdraw()
+
+    ok, err = init_runtime()
+    if not ok:
+        messagebox.showerror("啟動失敗", err)
+        root.destroy()
+        return
+
+    root.deiconify()
     DS102GUI(root)
     root.mainloop()
 

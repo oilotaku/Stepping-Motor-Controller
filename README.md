@@ -113,11 +113,28 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 
 ## 執行期產出（皆已 gitignore）
 
+這三個目錄建在**程式所在位置**（不是目前工作目錄），所以從哪裡啟動都指向同一份資料：
+
 | 路徑 | 內容 |
 |---|---|
 | `logs/` | 每次啟動一個檔；關閉時另存 `*_history.txt` |
 | `recordings/` | 錄製的行程；同目錄的 `teaching_points.json`、`speed_profiles.json`、`controller_config.json` 是設定檔 |
 | `data/` | 實驗數據 CSV |
+
+---
+
+## 打包成 exe
+
+venv 內已裝 `pyinstaller` 與 `auto-py-to-exe`。
+
+```bash
+venv/Scripts/pyinstaller.exe --onedir --windowed --name DS102 main_ai.py
+```
+
+- **用 `--onedir` 而非 `--onefile`** — 未簽章的 onefile exe 會自解壓縮到 temp，行為特徵與 packer 相同，是防毒誤判的典型目標；這台機器的 SentinelOne 有前科（見 [DRIVER_ISSUE_REPORT.md](DRIVER_ISSUE_REPORT.md)）。onedir 也省掉每次啟動的解壓時間。
+- **程式必須放在有寫入權限的位置**（桌面、`D:\` 等），不要放 `Program Files`——它需要在自己的目錄下建 `logs/` `recordings/` `data/`。權限不足時會跳錯誤視窗說明，不會無聲關閉。
+- 不需要把 `ds102 (2).pdf` 或驅動資料夾打包進去，執行期用不到。
+- 沒有單一實例保護：兩個 exe 同時執行會搶同一個 COM 埠。
 
 ---
 
