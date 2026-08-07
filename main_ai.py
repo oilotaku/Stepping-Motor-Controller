@@ -353,6 +353,11 @@ class DS102Controller:
 
         # 重播鎖定旗標（重播中禁止其他移動操作）
         self.playback_running = False
+        # 尋光掃描鎖定旗標（見 FiberAlignmentScanner）。掃描期間演算法會
+        # 自行決定何時移動哪一軸，其他來源（GUI 手動操作、_start_position_worker
+        # 的背景輪詢）都必須讓路，否則會跟演算法的移動指令交錯、
+        # 或在演算法等待到位時搶走 _serial_lock 拖慢量測預算。
+        self.scanning_active = False
 
         # 點動結束訊號：放開按鈕（stop）時設起，讓限位監看執行緒收工
         self._jog_stop = threading.Event()
@@ -372,6 +377,20 @@ class DS102Controller:
         """
         with self._lock:
             return {ax: self._positions_pulse[ax] - self._offsets[ax] for ax in AXES}
+
+    @property
+    def positions_machine(self) -> Dict[str, float]:
+        """
+        回傳各軸機械座標（未扣除 offset）。
+
+        `positions` 回傳的是工作座標，給人看／給 Teaching Point 用；
+        軟體限位（`sw_limits`）與 `check_sw_limits_batch` 比對的都是
+        機械座標——CLAUDE.md〈單位與座標〉已載明這條分界，跨界線前
+        先確認在同一個座標系。FiberAlignmentScanner 的搜尋全程在
+        機械座標下進行（跟限位比對用同一個座標系），不透過 offset。
+        """
+        with self._lock:
+            return dict(self._positions_pulse)
 
     def set_offset_here(self, axis_no: str) -> None:
         """將當前位置設為工作原點（offset = 目前機械位置）"""
@@ -824,6 +843,27 @@ class DS102Controller:
             )
         return True, ""
 
+    def check_sw_limits_batch(self, targets: Dict[str, float]) -> Tuple[bool, str]:
+        """
+        一次性檢查多個軸的目標座標（機械座標，pulse）是否都在軟體限位內。
+
+        給 FiberAlignmentScanner 的多軸同時出發流程使用：那個情境要求
+        「全部通過才送任何一軸的 GO」，若只逐軸檢查再逐軸送出，會出現
+        「已經送了兩軸的 GO，第三軸才發現超限」的半出發狀態——此時已出發
+        的軸該怎麼收尾又是另一個問題（DS102 沒有單軸停止指令）。批次
+        檢查把這個問題挪到「送出前」解決，一根軸都不送就是最乾淨的失敗。
+
+        targets: {軸名: 目標機械座標}。回傳 (全部通過?, 若失敗的原因)。
+        """
+        for ax, target in targets.items():
+            axis_no = AXIS_NO.get(ax)
+            if not axis_no:
+                continue
+            ok, reason = self._check_sw_limit(axis_no, target)
+            if not ok:
+                return False, reason
+        return True, ""
+
     # =========================================================================
     # 驅動指令（依照 main.py move_stage() 格式）
     # =========================================================================
@@ -844,7 +884,7 @@ class DS102Controller:
           1. 出發前：已經在該方向的軟體限位上就拒絕啟動
           2. 移動中：背景執行緒監看座標，越界立刻送 STOP
         """
-        if self.ems_active or self.playback_running:
+        if self.ems_active or self.playback_running or self.scanning_active:
             return
 
         ax = NO_AXIS.get(axis_no)
@@ -961,7 +1001,8 @@ class DS102Controller:
         wait_done: bool = True,
     ):
         """
-        步進移動（一次性）。
+        步進移動（一次性），供 GUI／使用者操作使用。
+
         格式：AXI{n}:L0 {l}:R0 {r}:S0 {s}:F0 {f}:PULS {p}:GO CW / CCW
         wait_done=True 時，發送後阻塞直到到位（輪詢 SB1? Driving 位元清除）。
         amount 單位為 pulse。
@@ -969,9 +1010,54 @@ class DS102Controller:
         回傳 True=順利到位（或未要求等待），False=被攔截／逾時／撞限位。
         呼叫端請務必看這個回傳值：連續移動多軸時，第一軸撞了限位還往下跑
         就會演變成一路撞端點。
+
+        搜尋演算法（FiberAlignmentScanner）期間請呼叫 `scan_move_step()`
+        而非這個方法——這裡的守衛包含 `scanning_active`，會把演算法
+        自己的移動也一併擋下（`scanning_active` 存在的目的是擋「其他
+        來源」，不是擋演算法本身）。
         """
-        if self.ems_active or self.playback_running:
+        if self.ems_active or self.playback_running or self.scanning_active:
             return False
+        return self._do_move_step(axis_no, direction, amount, l_speed, f_speed, rate, s_rate, wait_done)
+
+    def scan_move_step(
+        self,
+        axis_no: str,
+        direction: str,
+        amount: str,
+        l_speed: str,
+        f_speed: str,
+        rate: str,
+        s_rate: str,
+        wait_done: bool = True,
+    ):
+        """
+        `move_step()` 的搜尋演算法專用版本：只受 `ems_active` 攔截，
+        不檢查 `scanning_active`（那個旗標本來就是搜尋演算法自己設的，
+        用來擋 GUI 手動操作與背景輪詢，不該連自己也一併擋下）。
+
+        `playback_running` 也不檢查——搜尋與重播本來就是互斥的兩種
+        「作業進行中」狀態，`run()` 一開始就已經確認沒有其他搜尋在跑，
+        重播互斥交給 GUI 層的按鈕鎖定處理（比照既有的 `_homing` 模式）。
+
+        只給 `FiberAlignmentScanner` 呼叫，不對 GUI 開放這個入口。
+        """
+        if self.ems_active:
+            return False
+        return self._do_move_step(axis_no, direction, amount, l_speed, f_speed, rate, s_rate, wait_done)
+
+    def _do_move_step(
+        self,
+        axis_no: str,
+        direction: str,
+        amount: str,
+        l_speed: str,
+        f_speed: str,
+        rate: str,
+        s_rate: str,
+        wait_done: bool,
+    ) -> bool:
+        """`move_step` / `scan_move_step` 共用的實作，守衛檢查交給呼叫端。"""
         try:
             pulse_amt = amount_f = float(amount)
         except ValueError:
@@ -1030,7 +1116,7 @@ class DS102Controller:
         完成後 POS 也不會自動歸零**——所以復歸後一律確認並強制寫入 0，
         這正是「歸位後 0 點不固定」的成因。
         """
-        if self.ems_active or self.playback_running:
+        if self.ems_active or self.playback_running or self.scanning_active:
             return False
         self._serial_write(f"AXI{axis_no}:MEMSW0 {org_type}")
         time.sleep(0.1)
@@ -1129,7 +1215,7 @@ class DS102Controller:
         某一軸失敗不中止整批，繼續跑其餘各軸。
         回傳 (全部成功?, 摘要訊息)。
         """
-        if self.ems_active or self.playback_running:
+        if self.ems_active or self.playback_running or self.scanning_active:
             return False, "EMS 作用中或重播進行中，已略過"
 
         done, skipped, failed = [], [], []
@@ -1351,6 +1437,18 @@ class DS102Controller:
         self._log("WARN", f"軸{axis_no} 等待到位逾時（{timeout}s）")
         return False
 
+    def wait_axis_stop(self, axis_no: str, timeout: float = WAIT_TIMEOUT) -> bool:
+        """
+        `_wait_axis_stop()` 的公開版本。
+
+        `move_step(wait_done=False)` 只負責送出 GO 指令、立刻回傳，不等到位。
+        FiberAlignmentScanner 的多軸同時出發流程需要「先送完所有軸的 GO，
+        再依序等每一軸到位」，這個等待步驟因此要獨立於 move_step 之外被
+        呼叫——供給 controller 以外的模組（fiber_scanner.py）使用，不必
+        讓它碰底線用底線開頭的內部方法。
+        """
+        return self._wait_axis_stop(axis_no, timeout)
+
     # =========================================================================
     # 狀態查詢（對應 main.py update_status()）
     # =========================================================================
@@ -1508,7 +1606,7 @@ class DS102Controller:
         if name not in self.saved_points:
             self._log("ERROR", f"Teaching Point [{name}] 不存在")
             return False
-        if self.ems_active or self.playback_running:
+        if self.ems_active or self.playback_running or self.scanning_active:
             return False
 
         pt = self.saved_points[name]
@@ -4581,7 +4679,15 @@ class DS102GUI:
 
         def _worker():
             while not self._shutting_down.is_set():
-                if self.ctrl.connected and not self.ctrl.playback_running:
+                # scanning_active 排除比照 playback_running 的既有模式：
+                # 演算法的 hot loop 對移動+量測的時間預算很緊（0.5~1s 量級），
+                # 這條背景輪詢若繼續搶 _serial_lock，會讓演算法自己的
+                # move_step / _wait_axis_stop 排隊等候，白白吃掉預算。
+                if (
+                    self.ctrl.connected
+                    and not self.ctrl.playback_running
+                    and not self.ctrl.scanning_active
+                ):
                     try:
                         self.ctrl.refresh_positions()
                     except Exception as e:  # 背景執行緒不可讓例外逃逸

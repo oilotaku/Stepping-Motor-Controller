@@ -42,9 +42,11 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | [main.py](main.py) | 廠商 SURUGA SEIKI 官方範例（模組層級全域變數風格），是**指令格式的權威來源**。main_ai.py 的每個指令組法都對應此檔某段程式。修改指令時先回頭比對 |
 | [test.py](test.py) | 無 GUI 的連線 / 狀態查詢腳本（含 `find_ds_port()` 自動搜埠）。名稱誤導——不是單元測試 |
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
-| [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝（PyVISA），目前尚未與馬達程式整合 |
+| [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝（PyVISA）。已補上節流與例外處理，但**尚未接上真實儀器驗證過**，也還沒被任何地方 import——見下方尋光演算法段落 |
+| [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`：光纖對準尋光演算法（座標下降＋K近鄰精修＋收尾微擾），**尚未接上 GUI**。刻意不 import main_ai.py（避免循環相依），軸命名自成一份 |
 | [Gtest.py](Gtest.py) | 外部第三方範例（NTT-Mabuchi），`import control` 的模組不存在於本 repo，**無法執行**，僅作參考 |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖與 GPIB 側注意事項。⚠ 但其中的 **DS112 通訊細節全部是錯的**（宣稱結束符 `\r\n`、鮑率 9600、用 `!:` 輪詢 B/R 狀態）——實機是 `\r`、38400、查 `SB1?`。此檔只採信 HP 8153A 與「馬達動則不讀光」那幾段 |
+| [FIBER_ALIGNMENT_SCAN_DESIGN.md](FIBER_ALIGNMENT_SCAN_DESIGN.md) | 尋光演算法的完整設計文件：mathematician 兩輪演算法討論、architect 落地評估、無硬體驗證方式、待實測參數清單 |
 
 ## main_ai.py 架構
 
@@ -100,6 +102,14 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 第二層是「事後偵測」，從發現到停穩還會滑一段，提前量 `lookahead = f_speed × period + f_speed × rate / 2000`。`period` **必須用每輪實測值**（`time.time()` 差）而非常數：實測用常數 60ms 時真正的週期是 116ms，結果滑出限位 36 pulse。改動這裡前先讀該函式的 docstring，兩次超限的數據都記在裡面。
 
 `self._jog_stop` 事件負責讓監看執行緒收工——`stop()` 會 set 它，所以任何新增的停止路徑都要記得 set，否則執行緒會活到程式結束。
+
+#### `scanning_active` 與 `scan_move_step`（尋光演算法用，2026-08-07）
+
+`FiberAlignmentScanner`（[fiber_scanner.py](fiber_scanner.py)，完整設計見 [FIBER_ALIGNMENT_SCAN_DESIGN.md](FIBER_ALIGNMENT_SCAN_DESIGN.md)）跑的時候會把 `ctrl.scanning_active` 設為 `True`，`move_step` / `move_continue` / `move_origin` / `origin_all` / `goto_point` 的守衛都比照 `playback_running` 加上這個判斷，`_start_position_worker` 也排除它，避免背景輪詢跟演算法搶 `_serial_lock`。
+
+🔴 **`move_step` 因此不能被 scanner 自己呼叫**——它的守衛會把演算法自己的移動也一併擋下（這是實作時真的踩到的 bug：第一版直接讓 `scanning_active` 進 `move_step`，結果所有收斂測試都卡住不動，因為演算法呼叫自己的移動時被自己設的旗標擋住）。移動邏輯拆成 `_do_move_step()`（實作，無守衛）+ `move_step()`（GUI 用，含 `scanning_active` 守衛）+ `scan_move_step()`（scanner 專用，只受 `ems_active` 攔截）三層。**新增任何呼叫移動的程式碼前，先想清楚是 GUI 操作還是 scanner 內部邏輯，選對入口。**
+
+`check_sw_limits_batch()` 與 `wait_axis_stop()`（`_wait_axis_stop` 的公開版本）是專門給 scanner 多軸批次移動流程用的公開方法。`positions_machine` 屬性回傳機械座標，供 scanner 全程在同一個座標系下運作（不透過 offset）。
 
 ### 單位與座標（容易改錯的地方）
 
@@ -336,13 +346,14 @@ DS102 的 **MEMSW（復歸樣式）與韌體軟體限位都是 RAM-only**，控�
 
 ## 子代理分工（常設規則，不需逐次指派）
 
-`.claude/agents/` 底下有四個代理：`architect`（設計與審查）、`coder`（實作）、`tester`（測試）、`ui-designer`（介面與操作體驗）。
+`.claude/agents/` 底下有五個代理：`architect`（設計與審查）、`coder`（實作）、`tester`（測試）、`ui-designer`（介面與操作體驗）、`mathematician`（數值方法與量測數據分析）。
 **以下情況直接派工，不必等使用者開口**：
 
 | 時機 | 派給 |
 |---|---|
 | 動到 `main_ai.py` 的執行緒、序列通訊、限位／安全邏輯、持久化 | 先 `architect` 評估，再實作 |
 | 新增／調整 GUI 元件、分頁版面、對話框、狀態呈現方式 | 先 `ui-designer` 提案，再實作 |
+| 設計掃描尋光演算法、擬合光功率曲線、座標系換算或誤差分析 | 先 `mathematician` 設計，`coder` 落地 |
 | 改動完成後 | `architect` 審查；有測試價值的邏輯再交 `tester` |
 | 使用者只給規格、要求產出實作 | `coder` |
 
