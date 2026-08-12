@@ -37,6 +37,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
+from meter_GPIB import HP8153APowerMeter
+
 # =============================================================================
 # 執行期目錄與 LOG 系統
 # =============================================================================
@@ -164,6 +166,48 @@ def _write_json_with_backup(path: Path, data: dict, log=None) -> None:
         raise
 
 
+def _log_level_adapter(level: str, msg: str) -> None:
+    """
+    把 `_write_json_with_backup` 期待的 `log(level, msg)` 呼叫轉給模組 logger。
+
+    既有呼叫端（DS102Controller）傳的都是 `self._log`（(level, msg) 簽章的
+    bound method），但 meter 設定檔是模組層級函式，沒有 controller 實例
+    可用。直接傳 `logger`（`logging.Logger` 物件）不可行——`log(...)`
+    內部會呼叫 `log("WARN", msg)`，而 `Logger` 物件本身不可呼叫，會在第一次
+    寫入失敗時丟出 `TypeError`。這個轉接函式沿用 `DS102Controller._log`
+    同一套 level 對應表。
+    """
+    getattr(
+        logger,
+        {"ERROR": "error", "WARN": "warning", "DEBUG": "debug"}.get(level, "info"),
+    )(msg)
+
+
+def _load_meter_config() -> dict:
+    """讀取光功率計連線設定（GPIB 位址／channel／波長）。找不到或壞檔都回空字典。"""
+    p = RECORDING_DIR / "meter_config.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.exception("meter_config.json 讀取失敗")
+        return {}
+
+
+def _save_meter_config(data: dict) -> None:
+    """
+    整份覆寫光功率計連線設定。
+
+    不需要比照 teaching_points 的 `_points_loaded` 拒寫保護——那道保護
+    是為了防止「累積型集合」被空的記憶體狀態覆寫掉既有內容；這裡的欄位
+    只有位址／channel／波長三個純量值，整份覆寫本來就是正確行為。
+    """
+    _write_json_with_backup(
+        RECORDING_DIR / "meter_config.json", data, log=_log_level_adapter
+    )
+
+
 # =============================================================================
 # 常數定義
 # =============================================================================
@@ -238,7 +282,7 @@ CONFIG_FILE = "controller_config.json"
 # RECORDING_DIR 底下「不是行程檔」的 json——載入錄製清單時要跳過它們。
 # 新增任何設定檔都要記得加進來。
 NON_RECORDING_JSON = frozenset(
-    {"teaching_points.json", "speed_profiles.json", CONFIG_FILE}
+    {"teaching_points.json", "speed_profiles.json", CONFIG_FILE, "meter_config.json"}
 )
 # GUI LOG 文字框保留的最大行數，超過就從頭截掉。
 LOG_TEXT_MAX_LINES = 2000
@@ -252,6 +296,8 @@ COMM_FAIL_THRESHOLD = 3
 # 超過就直接換掉目前這則——超過表示新訊息多半是使用者剛按下按鈕的回饋，
 # 那不該排隊等好幾秒才出現。
 BANNER_COALESCE_SEC = 1.0
+# 光功率面板自動輪詢的預設間隔（秒）。
+METER_POLL_INTERVAL = 0.5
 
 # 顏色主題
 CLR_BG = "#F4F3F0"
@@ -2066,6 +2112,34 @@ class DS102GUI:
         self.ctrl.set_log_callback(self._on_log_entry)
         self.ctrl.set_alarm_callback(self._on_alarm)
 
+        # ── 光功率計（HP 8153A，獨立於 DS102 連線）──
+        self.meter: Optional[HP8153APowerMeter] = None
+        self._pm_auto_poll = tk.BooleanVar(value=False)
+        self._pm_poll_interval = tk.StringVar(value=str(METER_POLL_INTERVAL))
+        self._pm_comm_failures = 0
+        self._pm_last_ok_time = 0.0
+        self._pm_power_var = tk.StringVar(value="—")
+        self._pm_unit_var = tk.StringVar(value="")
+        self._pm_status_var = tk.StringVar(value="未連線")
+        self._pm_age_var = tk.StringVar(value="—")
+        self._pm_gpib_addr_var = tk.StringVar(value="21")
+        self._pm_channel_var = tk.StringVar(value="2")
+        self._pm_wavelength_var = tk.StringVar(value="1550")
+        self._pm_range_mode_var = tk.StringVar(value="auto")  # "auto" / "manual"
+        self._pm_range_manual_var = tk.StringVar(value="-20")
+        # 獨立浮動視窗：調滑台軸時不必切到「光功率」分頁就能看到讀值。
+        # 不記憶上次開關狀態與視窗位置——每次啟動預設關閉。
+        self._pm_float_win: Optional[tk.Toplevel] = None
+        self._pm_float_open = tk.BooleanVar(value=False)
+        # 開機時只把設定檔的值填進輸入框，不觸發連線——與 DS102 一致。
+        _meter_cfg = _load_meter_config()
+        if "gpib_address" in _meter_cfg:
+            self._pm_gpib_addr_var.set(str(_meter_cfg["gpib_address"]))
+        if "channel" in _meter_cfg:
+            self._pm_channel_var.set(str(_meter_cfg["channel"]))
+        if "wavelength_nm" in _meter_cfg:
+            self._pm_wavelength_var.set(str(_meter_cfg["wavelength_nm"]))
+
         # 全域 StringVar
         self._axis_no_var = tk.StringVar(value="1")
         # 軸名（X/Y/Z…）——畫面上一律用軸名，軸號只在組指令時用
@@ -2124,6 +2198,7 @@ class DS102GUI:
         self._refresh_profiles()
         self._start_poller()          # UI 重繪（Tk 主執行緒）
         self._start_position_worker()  # 硬體位置刷新（背景執行緒）
+        self._start_meter_poll_worker()  # 光功率背景輪詢（獨立於上述兩條迴圈）
 
         self.ctrl._log("INFO", "DS102  圖形化控制器啟動")
 
@@ -2413,6 +2488,7 @@ class DS102GUI:
             ("移動控制", self._build_tab_control),
             ("Teaching", self._build_tab_points),
             ("行程錄製", self._build_tab_recording),
+            ("光功率", self._build_tab_power),
             ("LOG", self._build_tab_log),
         ]:
             f = ttk.Frame(self._nb)
@@ -2912,6 +2988,12 @@ class DS102GUI:
             fg=CLR_TEXT,
             font=("Segoe UI", 11, "bold"),
         ).pack(side="left", padx=4)
+        # 調軸時常需要同時盯著光功率——開一個不搶焦點的浮動視窗，
+        # 不必來回切到「光功率」分頁。與該分頁的核取方塊共用同一個 BooleanVar。
+        ttk.Checkbutton(
+            info_row, text="📊 浮動視窗",
+            variable=self._pm_float_open, command=self._toggle_pm_float_window,
+        ).pack(side="left", padx=(16, 0))
 
         # 位置設定
         pos_row = tk.Frame(drv_f, bg=CLR_CARD)
@@ -3914,6 +3996,228 @@ class DS102GUI:
         )
 
     # =========================================================================
+    # TAB：光功率（HP 8153A / GPIB，監看面板——不整合尋光演算法）
+    # =========================================================================
+    def _build_tab_power(self, parent):
+        self._add_status_bar(parent)
+        scr = self._scrollable(parent)
+
+        # ── 卡片一：連線設定 ──
+        conn_card = self._card(scr, "連線設定")
+        conn_f = tk.Frame(conn_card, bg=CLR_CARD)
+        conn_f.pack(fill="x", padx=12, pady=8)
+
+        tk.Label(
+            conn_f, text="GPIB 位址", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+        ).grid(row=0, column=0, sticky="w", pady=3)
+        self._pm_addr_entry = ttk.Entry(
+            conn_f, textvariable=self._pm_gpib_addr_var, width=8
+        )
+        self._pm_addr_entry.grid(row=0, column=1, padx=(6, 20), sticky="w")
+
+        tk.Label(
+            conn_f, text="Channel", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+        ).grid(row=0, column=2, sticky="w", pady=3)
+        self._pm_ch_cb = ttk.Combobox(
+            conn_f,
+            textvariable=self._pm_channel_var,
+            values=["1", "2"],
+            width=6,
+            state="readonly",
+        )
+        self._pm_ch_cb.grid(row=0, column=3, padx=(6, 20), sticky="w")
+
+        tk.Label(
+            conn_f, text="波長 (nm)", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+        ).grid(row=0, column=4, sticky="w", pady=3)
+        self._pm_wl_cb = ttk.Combobox(
+            conn_f,
+            textvariable=self._pm_wavelength_var,
+            values=["1310", "1550"],
+            width=8,
+        )
+        self._pm_wl_cb.grid(row=0, column=5, padx=(6, 20), sticky="w")
+
+        # 連線狀態指示燈（獨立於卡片二那顆——這顆只反映連線是否建立）
+        pm_conn_f = tk.Frame(conn_f, bg=CLR_CARD)
+        pm_conn_f.grid(row=0, column=6, padx=(0, 12))
+        self._pm_conn_dot = tk.Canvas(
+            pm_conn_f, width=10, height=10, bg=CLR_CARD, highlightthickness=0
+        )
+        self._pm_conn_dot.pack(side="left", padx=(0, 4))
+        self._pm_conn_dot_id = self._pm_conn_dot.create_oval(
+            1, 1, 9, 9, fill=CLR_DANGER, outline=""
+        )
+        self._pm_conn_lbl = tk.Label(
+            pm_conn_f, text="未連線", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 10)
+        )
+        self._pm_conn_lbl.pack(side="left")
+
+        # 手動 bg 三態切換按鈕——比照 main_ai.py 頂部 _conn_btn 既有寫法，
+        # 這是全程式唯一按鈕動態變色的先例，新面板延用同一手法而非另創。
+        self._pm_conn_btn = tk.Button(
+            conn_f,
+            text="連線",
+            bg=CLR_ACCENT,
+            fg="white",
+            font=("Segoe UI", 10, "bold"),
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            command=self._toggle_meter_connect,
+        )
+        self._pm_conn_btn.grid(row=0, column=7)
+
+        # ── 卡片二：光功率讀值 ──
+        pow_card = self._card(scr, "光功率讀值")
+        top_row = tk.Frame(pow_card, bg=CLR_CARD)
+        top_row.pack(fill="x", padx=12, pady=(6, 0))
+
+        status_f = tk.Frame(top_row, bg=CLR_CARD)
+        status_f.pack(side="left")
+        self._pm_status_dot = tk.Canvas(
+            status_f, width=10, height=10, bg=CLR_CARD, highlightthickness=0
+        )
+        self._pm_status_dot.pack(side="left", padx=(0, 4))
+        self._pm_status_dot_id = self._pm_status_dot.create_oval(
+            1, 1, 9, 9, fill=CLR_MUTED, outline=""
+        )
+        self._pm_status_lbl = tk.Label(
+            status_f,
+            textvariable=self._pm_status_var,
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 10, "bold"),
+        )
+        self._pm_status_lbl.pack(side="left")
+
+        self._pm_ch_wl_var = tk.StringVar(value="")
+        tk.Label(
+            top_row,
+            textvariable=self._pm_ch_wl_var,
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=16)
+
+        age_f = tk.Frame(top_row, bg=CLR_CARD)
+        age_f.pack(side="right")
+        tk.Label(
+            age_f, text="最後更新：", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+        ).pack(side="left")
+        tk.Label(
+            age_f,
+            textvariable=self._pm_age_var,
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+
+        num_row = tk.Frame(pow_card, bg=CLR_CARD)
+        num_row.pack(pady=(4, 4))
+        self._pm_power_lbl = tk.Label(
+            num_row,
+            textvariable=self._pm_power_var,
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Consolas", 56, "bold"),
+        )
+        self._pm_power_lbl.pack(side="left")
+        tk.Label(
+            num_row,
+            textvariable=self._pm_unit_var,
+            bg=CLR_CARD,
+            fg=CLR_TEXT,
+            font=("Segoe UI", 16),
+        ).pack(side="left", padx=(6, 0), anchor="s", pady=(0, 12))
+
+        query_row = tk.Frame(pow_card, bg=CLR_CARD)
+        query_row.pack(fill="x", padx=12, pady=(0, 10))
+        self._pm_query_btn = ttk.Button(
+            query_row,
+            text="立即查詢",
+            style="Info.TButton",
+            state="disabled",
+            command=self._query_power_once,
+        )
+        self._pm_query_btn.pack(side="right")
+        ttk.Checkbutton(
+            query_row, text="📊 浮動視窗",
+            variable=self._pm_float_open, command=self._toggle_pm_float_window,
+        ).pack(side="right", padx=(0, 8))
+
+        # ── 卡片三：自動更新與量程 ──
+        auto_card = self._card(scr, "自動更新與量程")
+        auto_row = tk.Frame(auto_card, bg=CLR_CARD)
+        auto_row.pack(fill="x", padx=12, pady=8)
+        self._pm_auto_poll_cb = ttk.Checkbutton(
+            auto_row,
+            text="自動輪詢",
+            variable=self._pm_auto_poll,
+            state="disabled",
+            command=self._pm_sync_poll_interval_state,
+        )
+        self._pm_auto_poll_cb.pack(side="left")
+        tk.Label(
+            auto_row, text="間隔 (秒)", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+        ).pack(side="left", padx=(16, 4))
+        self._pm_interval_entry = ttk.Entry(
+            auto_row, textvariable=self._pm_poll_interval, width=6, state="disabled"
+        )
+        self._pm_interval_entry.pack(side="left")
+
+        sep = tk.Frame(auto_card, bg=CLR_BORDER, height=1)
+        sep.pack(fill="x", padx=12, pady=(4, 8))
+
+        range_row = tk.Frame(auto_card, bg=CLR_CARD)
+        range_row.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(
+            range_row, text="量程:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+        ).pack(side="left")
+        self._pm_range_auto_rb = tk.Radiobutton(
+            range_row,
+            text="自動",
+            variable=self._pm_range_mode_var,
+            value="auto",
+            bg=CLR_CARD,
+            fg=CLR_TEXT,
+            font=("Segoe UI", 9),
+            activebackground=CLR_CARD,
+            state="disabled",
+            command=self._pm_sync_range_entry_state,
+        )
+        self._pm_range_auto_rb.pack(side="left", padx=(8, 4))
+        self._pm_range_manual_rb = tk.Radiobutton(
+            range_row,
+            text="手動",
+            variable=self._pm_range_mode_var,
+            value="manual",
+            bg=CLR_CARD,
+            fg=CLR_TEXT,
+            font=("Segoe UI", 9),
+            activebackground=CLR_CARD,
+            state="disabled",
+            command=self._pm_sync_range_entry_state,
+        )
+        self._pm_range_manual_rb.pack(side="left", padx=4)
+        self._pm_range_manual_entry = ttk.Entry(
+            range_row, textvariable=self._pm_range_manual_var, width=8, state="disabled"
+        )
+        self._pm_range_manual_entry.pack(side="left", padx=(4, 4))
+        tk.Label(
+            range_row, text="dBm", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
+        ).pack(side="left", padx=(0, 12))
+        self._pm_apply_range_btn = ttk.Button(
+            range_row,
+            text="套用量程",
+            style="Accent.TButton",
+            state="disabled",
+            command=self._apply_meter_range,
+        )
+        self._pm_apply_range_btn.pack(side="left")
+
+    # =========================================================================
     # TAB：LOG
     # =========================================================================
     def _build_tab_log(self, parent):
@@ -4178,6 +4482,356 @@ class DS102GUI:
         else:
             self._conn_btn.config(text="連線", bg=CLR_ACCENT)
             messagebox.showerror("連線失敗", msg)
+
+    # =========================================================================
+    # 光功率計連線（HP 8153A / GPIB，獨立於 DS102 連線，互不影響按鈕啟用邏輯）
+    # =========================================================================
+    def _toggle_meter_connect(self):
+        if self.meter is not None:
+            self._disconnect_meter()
+            return
+        try:
+            addr = int(self._pm_gpib_addr_var.get())
+            ch = int(self._pm_channel_var.get())
+            wl = int(self._pm_wavelength_var.get())
+        except ValueError:
+            messagebox.showerror("設定錯誤", "GPIB 位址／Channel／波長必須是整數")
+            return
+        self._pm_conn_btn.config(text="連線中...", state="disabled", bg=CLR_WARN)
+        self._pm_set_inputs_state("disabled")
+
+        def _do():
+            try:
+                m = HP8153APowerMeter(gpib_address=addr, channel=ch, wavelength_nm=wl)
+                err = None
+            except Exception as e:
+                m, err = None, str(e)
+            self.root.after(0, lambda: self._on_meter_connect_result(m, err, addr, ch, wl))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_meter_connect_result(self, m, err, addr, ch, wl):
+        if m is None:
+            messagebox.showerror("連線失敗", f"無法連線 HP 8153A：{err}")
+            self._pm_conn_btn.config(text="連線", state="normal", bg=CLR_ACCENT)
+            self._pm_set_inputs_state("normal")
+            return
+        self.meter = m
+        self._pm_conn_btn.config(text="中斷", state="normal", bg=CLR_DANGER)
+        self._pm_conn_dot.itemconfig(self._pm_conn_dot_id, fill=CLR_ACCENT)
+        self._pm_conn_lbl.config(text="已連線")
+        self._pm_status_var.set("已連線")
+        self._pm_status_lbl.config(fg=CLR_ACCENT)
+        self._pm_set_status_dot(CLR_ACCENT)
+        self._pm_comm_failures = 0
+        self._pm_last_ok_time = 0.0
+        self._pm_power_var.set("—")
+        self._pm_unit_var.set("")
+        self._pm_power_lbl.config(fg=CLR_MUTED)
+        self._pm_ch_wl_var.set(f"Ch{ch}·{wl}nm")
+        self._pm_set_widgets_state("connected")
+        _save_meter_config({"gpib_address": addr, "channel": ch, "wavelength_nm": wl})
+        logger.info(f"HP 8153A 已連線：GPIB{addr}, Ch{ch}, {wl}nm")
+
+    def _disconnect_meter(self):
+        self._pm_auto_poll.set(False)
+        if self.meter is not None:
+            try:
+                self.meter.close()
+            except Exception:
+                logger.exception("HP8153A close 失敗")
+            self.meter = None
+        self._pm_comm_failures = 0
+        self._pm_conn_btn.config(text="連線", state="normal", bg=CLR_ACCENT)
+        self._pm_conn_dot.itemconfig(self._pm_conn_dot_id, fill=CLR_DANGER)
+        self._pm_conn_lbl.config(text="未連線")
+        self._pm_set_inputs_state("normal")
+        self._pm_status_var.set("未連線")
+        self._pm_status_lbl.config(fg=CLR_MUTED)
+        self._pm_set_status_dot(CLR_MUTED)
+        self._pm_power_var.set("—")
+        self._pm_unit_var.set("")
+        self._pm_power_lbl.config(fg=CLR_MUTED)
+        self._pm_age_var.set("—")
+        self._pm_ch_wl_var.set("")
+        self._pm_set_widgets_state("disconnected")
+
+    def _pm_set_status_dot(self, color):
+        """
+        同步狀態燈顏色到主分頁與浮動視窗（若開著）。
+        兩個 Canvas 各自持有自己的 item id，浮動視窗若未開啟則 self._pm_float_win
+        為 None，直接略過；TclError 則是視窗剛好在這次呼叫與下次存取之間被
+        使用者關掉的競態，同樣忽略即可。
+        """
+        self._pm_status_dot.itemconfig(self._pm_status_dot_id, fill=color)
+        if self._pm_float_win is not None:
+            try:
+                self._pm_status_dot_float.itemconfig(self._pm_status_dot_float_id, fill=color)
+            except tk.TclError:
+                pass
+
+    def _toggle_pm_float_window(self):
+        """開關獨立光功率浮動視窗（供移動控制／光功率兩分頁的核取方塊共用）。"""
+        if self._pm_float_win is not None and self._pm_float_win.winfo_exists():
+            self._pm_float_win.lift()
+            self._pm_float_win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("光功率")
+        win.configure(bg=CLR_CARD)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.attributes("-topmost", True)
+        win.protocol("WM_DELETE_WINDOW", self._close_pm_float_window)
+
+        # 定位在主視窗右上角外側，避免蓋住主視窗操作區。
+        # 不記憶上次位置——每次開啟都重新算一次，簡單且不會跑到螢幕外。
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + self.root.winfo_width() + 10
+        y = self.root.winfo_y()
+        win.geometry(f"260x200+{x}+{y}")
+
+        # --- 狀態列（燈 + 文字 / channel·波長）---
+        status_row = tk.Frame(win, bg=CLR_CARD)
+        status_row.pack(fill="x", padx=10, pady=(10, 4))
+        self._pm_status_dot_float = tk.Canvas(
+            status_row, width=10, height=10, bg=CLR_CARD, highlightthickness=0
+        )
+        self._pm_status_dot_float.pack(side="left")
+        self._pm_status_dot_float_id = self._pm_status_dot_float.create_oval(
+            1, 1, 9, 9,
+            fill=self._pm_status_dot.itemcget(self._pm_status_dot_id, "fill"),
+            outline="",
+        )
+        tk.Label(
+            status_row, textvariable=self._pm_status_var, bg=CLR_CARD, fg=CLR_TEXT,
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(4, 0))
+        tk.Label(
+            status_row, textvariable=self._pm_ch_wl_var, bg=CLR_CARD, fg=CLR_MUTED,
+            font=("Segoe UI", 9),
+        ).pack(side="right")
+
+        # --- 大字數值 ---
+        value_row = tk.Frame(win, bg=CLR_CARD)
+        value_row.pack(expand=True)
+        tk.Label(
+            value_row, textvariable=self._pm_power_var, bg=CLR_CARD, fg=CLR_TEXT,
+            font=("Consolas", 46, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            value_row, textvariable=self._pm_unit_var, bg=CLR_CARD, fg=CLR_MUTED,
+            font=("Segoe UI", 14),
+        ).pack(side="left", padx=(4, 0), anchor="s", pady=(0, 8))
+
+        # --- 資料年齡 ---
+        tk.Label(
+            win, text="最後更新：", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9),
+        ).pack()
+        tk.Label(
+            win, textvariable=self._pm_age_var, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9),
+        ).pack(pady=(0, 8))
+
+        # --- 操作列 ---
+        op_row = tk.Frame(win, bg=CLR_CARD)
+        op_row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Checkbutton(
+            op_row, text="自動輪詢", variable=self._pm_auto_poll,
+            command=self._pm_sync_poll_interval_state,
+        ).pack(side="left")
+        ttk.Button(
+            op_row, text="立即查詢", style="Info.TButton", command=self._query_power_once,
+        ).pack(side="right")
+
+        self._pm_float_win = win
+        self._pm_float_open.set(True)
+
+    def _close_pm_float_window(self):
+        self._pm_float_open.set(False)
+        if self._pm_float_win is not None:
+            try:
+                self._pm_float_win.destroy()
+            except tk.TclError:
+                pass
+        self._pm_float_win = None
+
+    def _pm_set_inputs_state(self, state: str):
+        """連線參數輸入框（位址／channel／波長）的啟用狀態。"""
+        for w in (self._pm_addr_entry, self._pm_ch_cb, self._pm_wl_cb):
+            try:
+                w.config(state=state)
+            except tk.TclError:
+                pass
+
+    def _pm_set_widgets_state(self, phase: str):
+        """
+        同步「立即查詢／自動輪詢／輪詢間隔／量程」這幾類元件的啟用狀態。
+
+        phase: "disconnected" / "connected"（"connecting" 由呼叫端各自處理
+        連線按鈕本身，不影響這裡管的其他元件——它們在連線中與未連線時
+        狀態相同，都是 disabled）。
+        """
+        connected = phase == "connected"
+        state = "normal" if connected else "disabled"
+        try:
+            self._pm_query_btn.config(state=state)
+        except tk.TclError:
+            pass
+        try:
+            self._pm_auto_poll_cb.config(state=state)
+        except tk.TclError:
+            pass
+        if not connected:
+            self._pm_auto_poll.set(False)
+        self._pm_sync_poll_interval_state()
+        for w in (self._pm_range_auto_rb, self._pm_range_manual_rb, self._pm_apply_range_btn):
+            try:
+                w.config(state=state)
+            except tk.TclError:
+                pass
+        self._pm_sync_range_entry_state()
+
+    def _pm_sync_poll_interval_state(self):
+        """輪詢間隔輸入框：僅當已連線且勾選自動輪詢時才 enabled。"""
+        enabled = self.meter is not None and self._pm_auto_poll.get()
+        try:
+            self._pm_interval_entry.config(state="normal" if enabled else "disabled")
+        except tk.TclError:
+            pass
+
+    def _pm_sync_range_entry_state(self):
+        """手動量程輸入框：僅當已連線且選中「手動」時才 enabled。"""
+        enabled = self.meter is not None and self._pm_range_mode_var.get() == "manual"
+        try:
+            self._pm_range_manual_entry.config(state="normal" if enabled else "disabled")
+        except tk.TclError:
+            pass
+
+    def _query_power_once(self):
+        if self.meter is None:
+            return
+        self._pm_query_btn.config(text="查詢中...", state="disabled")
+
+        def _do():
+            try:
+                ok, val = self.meter.get_power()
+            except Exception:
+                ok, val = False, 0.0
+            self.root.after(0, lambda: self._on_meter_reading(ok, val))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_meter_reading(self, ok: bool, val: float):
+        if self.meter is None:
+            # 已經按過「中斷」，這是斷線前卡在 GPIB 忙碌裡、事後才回來的
+            # 舊查詢結果——不能再更新畫面，否則會在使用者已經看到「未連線」
+            # 之後又跳出一則「已停止更新」橫幅，誤導成剛才的操作出了問題。
+            return
+        self._pm_query_btn.config(text="立即查詢", state="normal")
+        if ok:
+            if self._pm_comm_failures >= COMM_FAIL_THRESHOLD:
+                logger.info("光功率讀取已恢復正常")
+                self._pm_status_var.set("已連線")
+                self._pm_status_lbl.config(fg=CLR_ACCENT)
+                self._pm_set_status_dot(CLR_ACCENT)
+            self._pm_comm_failures = 0
+            self._pm_last_ok_time = time.time()
+            self._pm_power_var.set(f"{val:.2f}")
+            self._pm_unit_var.set("dBm")
+            self._pm_power_lbl.config(fg=CLR_TEXT)
+        else:
+            self._pm_comm_failures += 1
+            if self._pm_comm_failures == COMM_FAIL_THRESHOLD:
+                detail = self.meter.last_error_detail if self.meter is not None else ""
+                logger.warning(f"連續讀不到光功率，畫面數值已不可信：{detail}")
+                banner = "⚠ 光功率讀值已停止更新，請檢查 GPIB 連線"
+                if detail:
+                    banner += f"（{detail}）"
+                self._flash_banner(banner)
+                self._pm_status_var.set(
+                    f"⚠ 已停止更新（{detail}）" if detail else "⚠ 已停止更新"
+                )
+                self._pm_status_lbl.config(fg=CLR_DANGER)
+                self._pm_set_status_dot(CLR_DANGER)
+                self._pm_power_var.set("—")
+                self._pm_unit_var.set("")
+                self._pm_power_lbl.config(fg=CLR_DANGER)
+        self._pm_update_age_label()
+
+    def _pm_update_age_label(self):
+        if self.meter is None or self._pm_last_ok_time <= 0:
+            self._pm_age_var.set("—")
+            return
+        age = time.time() - self._pm_last_ok_time
+        self._pm_age_var.set("剛更新" if age < 1.5 else f"{age:.0f}s 前")
+
+    def _start_meter_poll_worker(self):
+        """
+        光功率背景輪詢，獨立執行緒——不塞進既有四條輪詢迴圈任何一條。
+
+        絕不可用 root.after 排下一輪查詢：那會把阻塞式 GPIB I/O 搬回
+        Tk 主執行緒造成凍結，跟既有四條輪詢迴圈的鐵律相同。
+        """
+        def _worker():
+            while not self._shutting_down.is_set():
+                if (
+                    self.meter is not None
+                    and self._pm_auto_poll.get()
+                    # 預留掛勾：future fiber_scanner 接入時可能要跟 GPIB
+                    # 輪詢互斥。目前 scanning_active 恆為 False，這行不
+                    # 影響現有行為。
+                    and not self.ctrl.scanning_active
+                ):
+                    try:
+                        ok, val = self.meter.get_power()
+                    except Exception as e:
+                        ok, val = False, 0.0
+                        logger.debug(f"背景光功率讀取失敗: {e}")
+                    self.root.after(0, lambda o=ok, v=val: self._on_meter_reading(o, v))
+                try:
+                    interval = float(self._pm_poll_interval.get())
+                except ValueError:
+                    interval = METER_POLL_INTERVAL
+                self._shutting_down.wait(max(interval, 0.1))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_meter_range(self):
+        if self.meter is None:
+            return
+        manual = self._pm_range_mode_var.get() == "manual"
+        dbm = None
+        if manual:
+            try:
+                dbm = float(self._pm_range_manual_var.get())
+            except ValueError:
+                messagebox.showerror("格式錯誤", "手動量程必須是數字（dBm）")
+                return
+
+        self._pm_apply_range_btn.config(text="套用中...", state="disabled")
+
+        def _do():
+            try:
+                if manual:
+                    self.meter.set_range_auto(False)
+                    self.meter.set_range(dbm)
+                else:
+                    self.meter.set_range_auto(True)
+                err = None
+            except Exception as e:
+                logger.exception("設定量程失敗")
+                err = str(e)
+            self.root.after(0, lambda: self._on_meter_range_result(err))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_meter_range_result(self, err):
+        self._pm_apply_range_btn.config(
+            text="套用量程", state="normal" if self.meter is not None else "disabled"
+        )
+        if err is not None:
+            messagebox.showerror("設定失敗", f"無法套用量程設定：{err}")
 
     def _set_drive_buttons_state(self, state: str):
         """
@@ -4705,6 +5359,11 @@ class DS102GUI:
         if self.ctrl.connected:
             self.ctrl.stop()
             self.ctrl.disconnect()
+        if self.meter is not None:
+            try:
+                self.meter.close()
+            except Exception:
+                logger.exception("HP8153A close 失敗（關窗流程）")
         # log_filename 在 init_runtime() 失敗或未呼叫時會是 None（例如
         # 測試直接建 DS102GUI 而沒走 main()），那就跳過歷程匯出
         if log_filename is not None:
