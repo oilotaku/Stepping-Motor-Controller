@@ -183,28 +183,37 @@ def _log_level_adapter(level: str, msg: str) -> None:
     )(msg)
 
 
-def _load_meter_config() -> dict:
-    """讀取光功率計連線設定（GPIB 位址／channel／波長）。找不到或壞檔都回空字典。"""
+def _load_meter_config(log=None) -> dict:
+    """
+    讀取光功率計連線設定（GPIB 位址／channel／波長）。找不到或壞檔都回空字典。
+
+    log：選用的 `(level, msg)` 簽章回呼。呼叫端若已有 DS102Controller 實例
+    （目前只在 DS102GUI.__init__，此時 self.ctrl 已建立），應傳 `self.ctrl._log`，
+    讀取失敗才會同時進 GUI 的 LOG 分頁與匯出的歷程檔，而不只是寫進 log 檔。
+    不傳則退回只寫模組 logger（例如測試腳本直接呼叫，沒有 GUI 可用）。
+    """
     p = RECORDING_DIR / "meter_config.json"
     if not p.exists():
         return {}
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        logger.exception("meter_config.json 讀取失敗")
+    except (OSError, json.JSONDecodeError) as e:
+        (log or _log_level_adapter)("ERROR", f"meter_config.json 讀取失敗: {e}")
         return {}
 
 
-def _save_meter_config(data: dict) -> None:
+def _save_meter_config(data: dict, log=None) -> None:
     """
     整份覆寫光功率計連線設定。
 
     不需要比照 teaching_points 的 `_points_loaded` 拒寫保護——那道保護
     是為了防止「累積型集合」被空的記憶體狀態覆寫掉既有內容；這裡的欄位
     只有位址／channel／波長三個純量值，整份覆寫本來就是正確行為。
+
+    log：見 `_load_meter_config` 的說明，同一套規則。
     """
     _write_json_with_backup(
-        RECORDING_DIR / "meter_config.json", data, log=_log_level_adapter
+        RECORDING_DIR / "meter_config.json", data, log=log or _log_level_adapter
     )
 
 
@@ -388,6 +397,10 @@ class DS102Controller:
         # 實驗數據記錄（CSV）
         self._data_log: List[dict] = []
         self._data_logging = False
+        # 光功率讀值來源（GUI 端注入，見 set_power_reader）。controller 不碰
+        # GPIB，只在記錄每個資料點時問一下「目前快取的 dBm 是多少」——
+        # 不是觸發新查詢，純讀快取值，避免拖慢 _wait_axis_stop 的等待迴圈。
+        self._power_reader_cb = None
 
         # 速度 Profile
         self.speed_profiles: Dict[str, dict] = {}
@@ -463,6 +476,18 @@ class DS102Controller:
     def set_alarm_callback(self, cb):
         """設定狀態異常回調（供 GUI 顯示彈窗警告）"""
         self._alarm_cb = cb
+
+    def set_power_reader(self, cb) -> None:
+        """
+        設定光功率讀值來源：cb() -> Optional[float]。
+
+        回傳「最近一次成功讀值的快取」，不得在這裡觸發新的 GPIB 查詢——
+        本方法會被 _record_data_point() 在 _wait_axis_stop 的等待迴圈裡
+        呼叫，若 cb 內部又去等一次 GPIB I/O（單次約 110~130ms，見
+        diagnose_timing.py 的實測），會把這段延遲疊加進軸的到位判斷。
+        沒有讀值可用（未連線、或連續失敗超過門檻）回傳 None，CSV 該欄留空。
+        """
+        self._power_reader_cb = cb
 
     def _is_poll_cmd(self, cmd: str) -> bool:
         """這條指令是否為每秒重複數次的例行輪詢（預設不寫進 LOG）。"""
@@ -1953,17 +1978,24 @@ class DS102Controller:
         self._data_logging = False
         path = DATA_DIR / f"data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["ts"] + AXES)
+            writer = csv.DictWriter(f, fieldnames=["ts"] + AXES + ["dbm"])
             writer.writeheader()
             writer.writerows(self._data_log)
         self._log("INFO", f"實驗數據已匯出: {path}（{len(self._data_log)} 筆）")
         return str(path)
 
     def _record_data_point(self) -> None:
-        """記錄當前時間戳與各軸位置（在 _wait_axis_stop 中定期呼叫）"""
+        """記錄當前時間戳、各軸位置與光功率快取值（在 _wait_axis_stop 中定期呼叫）"""
         with self._lock:
             row = {"ts": datetime.now().isoformat(timespec="milliseconds")}
             row.update({ax: self._positions_pulse[ax] for ax in AXES}) # type: ignore
+        dbm = None
+        if self._power_reader_cb is not None:
+            try:
+                dbm = self._power_reader_cb()
+            except Exception:
+                dbm = None
+        row["dbm"] = dbm if dbm is not None else ""
         with self._history_lock:
             self._data_log.append(row)
 
@@ -2111,6 +2143,7 @@ class DS102GUI:
         self.ctrl = DS102Controller()
         self.ctrl.set_log_callback(self._on_log_entry)
         self.ctrl.set_alarm_callback(self._on_alarm)
+        self.ctrl.set_power_reader(self._get_last_pm_value)
 
         # ── 光功率計（HP 8153A，獨立於 DS102 連線）──
         self.meter: Optional[HP8153APowerMeter] = None
@@ -2118,6 +2151,7 @@ class DS102GUI:
         self._pm_poll_interval = tk.StringVar(value=str(METER_POLL_INTERVAL))
         self._pm_comm_failures = 0
         self._pm_last_ok_time = 0.0
+        self._pm_last_value: Optional[float] = None  # 最近一次成功讀值（原始 float，供 CSV 記錄取用）
         self._pm_power_var = tk.StringVar(value="—")
         self._pm_unit_var = tk.StringVar(value="")
         self._pm_status_var = tk.StringVar(value="未連線")
@@ -2132,7 +2166,7 @@ class DS102GUI:
         self._pm_float_win: Optional[tk.Toplevel] = None
         self._pm_float_open = tk.BooleanVar(value=False)
         # 開機時只把設定檔的值填進輸入框，不觸發連線——與 DS102 一致。
-        _meter_cfg = _load_meter_config()
+        _meter_cfg = _load_meter_config(log=self.ctrl._log)
         if "gpib_address" in _meter_cfg:
             self._pm_gpib_addr_var.set(str(_meter_cfg["gpib_address"]))
         if "channel" in _meter_cfg:
@@ -2901,6 +2935,13 @@ class DS102GUI:
             data_row, text="■ 停止並匯出", command=self._stop_data_log, state="disabled"
         )
         self._dlog_stop_btn.pack(side="left", padx=4)
+        tk.Label(
+            data_card,
+            text="含光功率(dBm)欄位——需先在「光功率」分頁連線並開啟自動輪詢，否則該欄留空",
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", padx=12, pady=(0, 8))
 
     # =========================================================================
     # TAB：移動控制
@@ -4530,18 +4571,19 @@ class DS102GUI:
         self._pm_power_lbl.config(fg=CLR_MUTED)
         self._pm_ch_wl_var.set(f"Ch{ch}·{wl}nm")
         self._pm_set_widgets_state("connected")
-        _save_meter_config({"gpib_address": addr, "channel": ch, "wavelength_nm": wl})
-        logger.info(f"HP 8153A 已連線：GPIB{addr}, Ch{ch}, {wl}nm")
+        _save_meter_config({"gpib_address": addr, "channel": ch, "wavelength_nm": wl}, log=self.ctrl._log)
+        self.ctrl._log("INFO", f"HP 8153A 已連線：GPIB{addr}, Ch{ch}, {wl}nm")
 
     def _disconnect_meter(self):
         self._pm_auto_poll.set(False)
         if self.meter is not None:
             try:
                 self.meter.close()
-            except Exception:
-                logger.exception("HP8153A close 失敗")
+            except Exception as e:
+                self.ctrl._log("ERROR", f"HP8153A close 失敗: {e}")
             self.meter = None
         self._pm_comm_failures = 0
+        self._pm_last_value = None
         self._pm_conn_btn.config(text="連線", state="normal", bg=CLR_ACCENT)
         self._pm_conn_dot.itemconfig(self._pm_conn_dot_id, fill=CLR_DANGER)
         self._pm_conn_lbl.config(text="未連線")
@@ -4731,12 +4773,13 @@ class DS102GUI:
         self._pm_query_btn.config(text="立即查詢", state="normal")
         if ok:
             if self._pm_comm_failures >= COMM_FAIL_THRESHOLD:
-                logger.info("光功率讀取已恢復正常")
+                self.ctrl._log("INFO", "光功率讀取已恢復正常")
                 self._pm_status_var.set("已連線")
                 self._pm_status_lbl.config(fg=CLR_ACCENT)
                 self._pm_set_status_dot(CLR_ACCENT)
             self._pm_comm_failures = 0
             self._pm_last_ok_time = time.time()
+            self._pm_last_value = val
             self._pm_power_var.set(f"{val:.2f}")
             self._pm_unit_var.set("dBm")
             self._pm_power_lbl.config(fg=CLR_TEXT)
@@ -4744,7 +4787,7 @@ class DS102GUI:
             self._pm_comm_failures += 1
             if self._pm_comm_failures == COMM_FAIL_THRESHOLD:
                 detail = self.meter.last_error_detail if self.meter is not None else ""
-                logger.warning(f"連續讀不到光功率，畫面數值已不可信：{detail}")
+                self.ctrl._log("WARN", f"連續讀不到光功率，畫面數值已不可信：{detail}")
                 banner = "⚠ 光功率讀值已停止更新，請檢查 GPIB 連線"
                 if detail:
                     banner += f"（{detail}）"
@@ -4758,6 +4801,20 @@ class DS102GUI:
                 self._pm_unit_var.set("")
                 self._pm_power_lbl.config(fg=CLR_DANGER)
         self._pm_update_age_label()
+
+    def _get_last_pm_value(self) -> Optional[float]:
+        """
+        供 DS102Controller.set_power_reader 使用：回傳最近一次成功讀值的快取。
+
+        刻意不在這裡呼叫 self.meter.get_power()——這個方法會被
+        _record_data_point() 從移動等待迴圈裡呼叫，觸發新的 GPIB 查詢會
+        把單次約 110~130ms 的 I/O 延遲疊加進軸的到位判斷。連續失敗達
+        COMM_FAIL_THRESHOLD（畫面已顯示「已停止更新」）時視為不可信，
+        回傳 None 讓 CSV 該欄留空，而不是寫入一個過期的舊數值。
+        """
+        if self.meter is None or self._pm_comm_failures >= COMM_FAIL_THRESHOLD:
+            return None
+        return self._pm_last_value
 
     def _pm_update_age_label(self):
         if self.meter is None or self._pm_last_ok_time <= 0:
@@ -4820,7 +4877,7 @@ class DS102GUI:
                     self.meter.set_range_auto(True)
                 err = None
             except Exception as e:
-                logger.exception("設定量程失敗")
+                self.ctrl._log("ERROR", f"設定量程失敗: {e}")
                 err = str(e)
             self.root.after(0, lambda: self._on_meter_range_result(err))
 
@@ -5362,8 +5419,8 @@ class DS102GUI:
         if self.meter is not None:
             try:
                 self.meter.close()
-            except Exception:
-                logger.exception("HP8153A close 失敗（關窗流程）")
+            except Exception as e:
+                self.ctrl._log("ERROR", f"HP8153A close 失敗（關窗流程）: {e}")
         # log_filename 在 init_runtime() 失敗或未呼叫時會是 None（例如
         # 測試直接建 DS102GUI 而沒走 main()），那就跳過歷程匯出
         if log_filename is not None:

@@ -322,11 +322,14 @@ class FakeMeter:
         self.set_range_calls = []
         self._range_auto_delay = 0.0
         self.last_error_detail = ""
+        self.close_should_raise = False
 
     def get_power(self):
         return True, -10.0
 
     def close(self):
+        if self.close_should_raise:
+            raise RuntimeError("模擬 close 失敗")
         self.closed = True
 
     def set_range_auto(self, status):
@@ -595,6 +598,94 @@ def test_layer2():
               "meter_config.json" in main_ai.NON_RECORDING_JSON,
               expected=True,
               actual=("meter_config.json" in main_ai.NON_RECORDING_JSON))
+
+        # ---------------------------------------------------------------
+        # 案例 12：_get_last_pm_value()（供 CSV dbm 欄位取用的快取讀值邏輯）
+        # ---------------------------------------------------------------
+        gui.meter = None
+        check("12a. 未連線 -> _get_last_pm_value() 回傳 None",
+              gui._get_last_pm_value() is None)
+
+        fake_meter3 = FakeMeter()
+        gui.meter = fake_meter3
+        gui._pm_comm_failures = 0
+        gui._pm_last_value = -8.5
+        check("12b. 已連線且未達失敗門檻 -> 回傳快取值",
+              gui._get_last_pm_value() == -8.5,
+              expected=-8.5, actual=gui._get_last_pm_value())
+
+        gui._pm_comm_failures = main_ai.COMM_FAIL_THRESHOLD
+        check("12c. 連續失敗達門檻 -> 回傳 None（不把過期數值當成當下讀值）",
+              gui._get_last_pm_value() is None)
+
+        gui._pm_comm_failures = 0
+        gui.meter = None
+        gui._pm_last_value = None
+
+        # ---------------------------------------------------------------
+        # 案例 13：_record_data_point() 的 dbm 欄位（CSV 資料記錄接上光功率）
+        # ---------------------------------------------------------------
+        gui.ctrl._data_log = []
+        gui.ctrl._record_data_point()
+        check("13a. 無光功率讀值時 -> dbm 欄位為空字串（不是 None，DictWriter 才不會寫成 'None'）",
+              gui.ctrl._data_log[-1]["dbm"] == "",
+              expected="", actual=gui.ctrl._data_log[-1]["dbm"])
+
+        fake_meter4 = FakeMeter()
+        gui.meter = fake_meter4
+        gui._pm_comm_failures = 0
+        gui._pm_last_value = -3.21
+        gui.ctrl._record_data_point()
+        check("13b. 有快取讀值時 -> dbm 欄位帶入該值",
+              gui.ctrl._data_log[-1]["dbm"] == -3.21,
+              expected=-3.21, actual=gui.ctrl._data_log[-1]["dbm"])
+        check("13c. 仍照常記錄各軸位置（未破壞既有欄位）",
+              all(ax in gui.ctrl._data_log[-1] for ax in main_ai.AXES),
+              expected=list(main_ai.AXES), actual=list(gui.ctrl._data_log[-1].keys()))
+
+        gui.meter = None
+        gui._pm_comm_failures = 0
+        gui._pm_last_value = None
+        gui.ctrl._data_log = []
+
+        # ---------------------------------------------------------------
+        # 案例 14：光功率相關事件走統一 LOG 入口（進 action_history，
+        # 不再只寫進 logger 檔案）——連線成功／讀值失聯與恢復／中斷時
+        # meter.close() 失敗 三種情境。
+        # ---------------------------------------------------------------
+        gui.ctrl.action_history = []
+        fake_meter5 = FakeMeter()
+        gui._on_meter_connect_result(fake_meter5, None, 21, 1, 1550)
+        check("14a. 連線成功 -> action_history 有一筆含「已連線」的紀錄",
+              any("已連線" in e["msg"] for e in gui.ctrl.action_history),
+              expected="含 已連線", actual=[e["msg"] for e in gui.ctrl.action_history])
+
+        gui.ctrl.action_history = []
+        gui._pm_comm_failures = main_ai.COMM_FAIL_THRESHOLD - 1
+        with patch.object(gui, "_flash_banner"):
+            gui._on_meter_reading(False, 0.0)
+        check("14b. 讀值連續失敗達門檻 -> action_history 有一筆含「連續讀不到」的紀錄",
+              any("連續讀不到" in e["msg"] for e in gui.ctrl.action_history),
+              expected="含 連續讀不到", actual=[e["msg"] for e in gui.ctrl.action_history])
+
+        gui.ctrl.action_history = []
+        gui._pm_comm_failures = main_ai.COMM_FAIL_THRESHOLD
+        gui._on_meter_reading(True, -1.0)
+        check("14c. 讀值從失聯恢復 -> action_history 有一筆含「恢復正常」的紀錄",
+              any("恢復正常" in e["msg"] for e in gui.ctrl.action_history),
+              expected="含 恢復正常", actual=[e["msg"] for e in gui.ctrl.action_history])
+
+        gui.ctrl.action_history = []
+        gui.meter = fake_meter5
+        fake_meter5.close_should_raise = True
+        gui._disconnect_meter()
+        check("14d. meter.close() 失敗 -> action_history 有一筆含「close 失敗」的紀錄",
+              any("close 失敗" in e["msg"] for e in gui.ctrl.action_history),
+              expected="含 close 失敗", actual=[e["msg"] for e in gui.ctrl.action_history])
+
+        gui.ctrl.action_history = []
+        gui.meter = None
+        gui._pm_comm_failures = 0
 
         # ---------------------------------------------------------------
         # 案例 11（regression 有效性驗證）：暫時關閉 `if self.meter is None: return`
