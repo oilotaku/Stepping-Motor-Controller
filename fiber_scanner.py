@@ -38,6 +38,10 @@ NO_AXIS = {v: k for k, v in AXIS_NO.items()}
 # 契約與 meter_GPIB.HP8153APowerMeter.get_power() 一致（見該檔的修正說明）。
 PowerQuery = Callable[[], Tuple[bool, float]]
 ProgressCallback = Callable[[str], None]
+# 每次「移動＋量測」完成（不論成功與否）都會呼叫一次，用於外部即時視覺化
+# （例如即時軌跡圖）。跟 ProgressCallback 不同：那個只在階段/輪次等巨觀
+# 里程碑觸發，這個是每一筆樣本都觸發，頻率高很多。
+SampleCallback = Callable[["Sample"], None]
 
 # ---- 以下數值皆為「起跳用」的保守預設，不是校準值 ----
 # 全部待接上 HP 8153A、量出真實響應曲線與雜訊水準後才能校準，
@@ -46,12 +50,26 @@ DEFAULT_STEP_MIN = 2           # 最小步長（pulse）。需 ≥ 機械重現�
 DEFAULT_SETTLE_SEC = 0.03      # 到位後等機構震動衰減的時間
 DEFAULT_MAX_CYCLES = 5         # 階段一外層座標下降的最多輪數
 DEFAULT_NOISE_SIGMA_MULT = 3.0  # 功率雜訊底限＝重複量測標準差的幾倍
+DEFAULT_NO_SIGNAL_RANGE_MULT = 2.0  # 全域無訊號偵測的雜訊底限倍數，見 _check_signal_detectable
 REOPEN_STEP_MULT = 8           # 階段一第 2 輪起，每輪從 step_min×這個倍數重新收斂
 
 
 @dataclass
 class Sample:
-    """一次量測樣本：機械座標（pulse）+ 功率讀值。"""
+    """
+    一次量測樣本：機械座標（pulse）+ 功率讀值。
+
+    `ok` 的語意是「這個讀值可信賴、可以拿去比較」，不是單純轉述
+    meter_GPIB.get_power() 的通訊結果——它額外涵蓋了「數值本身是否
+    低於絕對訊號下限」（見 FiberAlignmentScanner.min_valid_power_dbm）。
+
+    `ok=False` 時 `power` 有兩種可能：
+      - 通訊失敗（meter_GPIB 回 ok=False）→ power=None，沒有真實數值。
+      - 讀值低於絕對下限（meter_GPIB 回 ok=True，但演算法判定太小不可信）
+        → power=實際讀值，只是不參與比較邏輯，保留供除錯／事後繪圖使用。
+    兩種情況都會在 `note` 記錄原因。既有的 `if s.ok and s.power is not None`
+    比較寫法對兩種情況都正確排除，不需要另外分支。
+    """
 
     coords: Dict[str, float]
     ok: bool
@@ -162,9 +180,13 @@ class FiberAlignmentScanner:
         settle_sec: float = DEFAULT_SETTLE_SEC,
         max_cycles: int = DEFAULT_MAX_CYCLES,
         noise_sigma_mult: float = DEFAULT_NOISE_SIGMA_MULT,
+        min_valid_power_dbm: Optional[float] = None,
+        no_signal_range_mult: float = DEFAULT_NO_SIGNAL_RANGE_MULT,
+        abort_if_no_signal: bool = True,
         f_speed_min: Optional[str] = None,
         speed_scale_pulses: Optional[Tuple[int, int]] = None,
         progress_cb: Optional[ProgressCallback] = None,
+        sample_cb: Optional[SampleCallback] = None,
     ):
         self.ctrl = ctrl
         self._power_query = power_query
@@ -175,7 +197,17 @@ class FiberAlignmentScanner:
         self.settle_sec = settle_sec
         self.max_cycles = max(1, int(max_cycles))
         self.noise_sigma_mult = noise_sigma_mult
+        # ── 訊號有效性判準（與 _noise_floor 的相對差異門檻是兩件事）──
+        # min_valid_power_dbm：絕對下限，None＝停用（尚未校準時的安全預設，
+        # 向下相容既有行為）。這個值必須來自真機「刻意不耦光」的暗電流
+        # 基準量測，程式無法自己假設，數值待接上 HP 8153A 後才能定案。
+        self.min_valid_power_dbm = min_valid_power_dbm
+        # no_signal_range_mult：階段一第 1 輪若「改善量」與「離散度」都低於
+        # 雜訊底限，判定整個探測範圍沒有偵測到訊號，見 _check_signal_detectable。
+        self.no_signal_range_mult = no_signal_range_mult
+        self.abort_if_no_signal = abort_if_no_signal
         self._progress_cb = progress_cb
+        self._sample_cb = sample_cb
 
         # ── 動態調速：位移量越小、驅動速度 F0 越低（見 _dynamic_speed）──
         # `f_speed` 是「大位移用的上限速度」，`f_speed_min` 是「最小步長
@@ -268,6 +300,7 @@ class FiberAlignmentScanner:
         if not axes:
             raise ScanAbort("沒有可動的軸")
         self._log(f"階段一開始，可動軸：{axes}")
+        stage1_start_idx = len(self.samples)  # 供 cycle==1 的無訊號偵測取樣本範圍
 
         for cycle in range(1, self.max_cycles + 1):
             self._check_abort()
@@ -296,6 +329,8 @@ class FiberAlignmentScanner:
 
             self._log(f"階段一 第 {cycle} 輪結束，本輪改善 {total_improvement:.4f}")
             if total_improvement < self._noise_floor():
+                if cycle == 1 and self.abort_if_no_signal:
+                    self._check_signal_detectable(self.samples[stage1_start_idx:])
                 self._log("階段一收斂（本輪改善低於雜訊底限）")
                 break
 
@@ -719,9 +754,27 @@ class FiberAlignmentScanner:
         self._check_abort()
         time.sleep(self.settle_sec)
         coords = dict(self.ctrl.positions_machine)
-        ok, power = self._safe_power_query()
-        s = Sample(coords=coords, ok=ok, power=power if ok else None)
+        meter_ok, raw_power = self._safe_power_query()
+
+        ok = meter_ok
+        power: Optional[float] = raw_power if meter_ok else None
+        note = ""
+        if meter_ok and self.min_valid_power_dbm is not None and raw_power < self.min_valid_power_dbm:
+            # 通訊成功、數值可解析，但低於絕對訊號下限——判定不可信，收斂
+            # 成 ok=False（見 Sample dataclass 的 docstring），但保留實際
+            # 讀值於 power／note，供事後除錯或繪圖使用。
+            ok = False
+            note = f"low_signal: {raw_power:.3f}dBm < floor {self.min_valid_power_dbm:.3f}dBm"
+            self._log(f"讀值 {raw_power:.3f} dBm 低於絕對訊號下限 "
+                       f"{self.min_valid_power_dbm:.3f} dBm，判定無效")
+
+        s = Sample(coords=coords, ok=ok, power=power, note=note)
         self.samples.append(s)
+        if self._sample_cb:
+            try:
+                self._sample_cb(s)
+            except Exception:
+                pass  # 樣本回呼本身失敗不可拖垮搜尋（比照 _log 的既有寫法）
         return s
 
     def _current_power_estimate(self) -> Optional[float]:
@@ -773,6 +826,40 @@ class FiberAlignmentScanner:
         if self._noise_sigma is None:
             return 0.0  # 尚未校準：不設底限，保守起見一律相信讀值差異
         return self.noise_sigma_mult * self._noise_sigma
+
+    def _check_signal_detectable(self, cycle_samples: List[Sample]) -> None:
+        """
+        階段一第 1 輪結束、且本輪淨改善已低於雜訊底限時呼叫，用來區分兩種
+        外觀相同（total_improvement 都很小）但意義完全不同的情況：
+
+          (a) 起點運氣好，本來就已經站在峰值附近——各方向探測仍會量到
+              明顯偏低的谷值，樣本間離散度（range）大。
+          (b) 整個探測範圍內根本沒有偵測到高於雜訊的訊號（沒耦光、光源
+              沒開、光纖沒插好）——各方向讀值都貼在同一雜訊水準，range 小。
+
+        只有 (b) 中止搜尋；(a) 是正常收斂，讓呼叫端繼續往下跑（不誤殺）。
+
+        ⚠ range 的判斷方向假設 HP 8153A 在固定量程、無光耦合時的讀值是
+        「穩定貼底」而非「因對數壓縮而劇烈跳動」——這是待真機驗證的假設。
+        如果真機量出來的行為相反（無光時讀值反而在 dBm 尺度上劇烈跳動，
+        因為線性功率趨近零時對數會放大雜訊），這個判準的方向需要重新
+        設計，不能沿用「range 小＝無訊號」。這件事必須用真機在「刻意
+        不對準」的位置實測才能確認，不能靠猜測定案。
+        """
+        powers = [s.power for s in cycle_samples if s.ok and s.power is not None]
+        if len(powers) < 4:
+            return  # 樣本太少，無法可靠判斷，留給後續輪次或呼叫端自行判斷
+        rng = max(powers) - min(powers)
+        threshold = self.no_signal_range_mult * self._noise_floor()
+        if threshold <= 0:
+            return  # 尚未校準雜訊（_noise_floor()==0），無法判斷，不誤殺
+        if rng <= threshold:
+            raise ScanAbort(
+                f"第一輪座標下降共 {len(powers)} 個有效讀值，功率變化範圍僅 "
+                f"{rng:.4f}（門檻 {threshold:.4f} = {self.no_signal_range_mult}x 雜訊底限），"
+                "研判整個探測範圍內沒有偵測到高於雜訊的訊號——請確認光纖已耦合、"
+                "光源已開啟，或起始點/initial_step 是否涵蓋了正確的行程範圍"
+            )
 
     # ------------------------------------------------------------------
     # 輔助
