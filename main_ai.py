@@ -2228,7 +2228,14 @@ class DS102GUI:
         self._scanning = threading.Event()  # GUI 層忙碌旗標，比照 self._homing 的既有模式
         self._active_scanner: Optional["FiberAlignmentScanner"] = None
         self._scan_axis_step_vars = {}  # {軸名: tk.StringVar}，_build_tab_scan 建立分頁時才會實際填入
-        self._scan_stage2_var = tk.BooleanVar(value=False)
+        # ⚠ _scan_stage2_var 不在這裡建立——它跟其餘會被 scanner_config.json
+        # 覆寫預設值的欄位（_scan_abort_no_signal_var 等）一樣，要等
+        # _build_tab_scan 讀到 self._scanner_cfg_pending 後才建立，見該處
+        # `cfg.get("enable_stage2", False)`。這裡若先建立成寫死的
+        # BooleanVar(value=False)，_build_tab_scan 就不會是「第一次」建立
+        # 它，等於讓存檔的 enable_stage2 欄位永遠讀不回來（tester 假物件
+        # 測試案例 22e 抓到的真實 bug：使用者勾選過就存檔，但下次開程式
+        # 這個勾選框永遠回到未勾選，且沒有任何提示告訴使用者設定其實有存）。
         self._scan_status_var = tk.StringVar(value="尚未開始")
         self._scan_elapsed_var = tk.StringVar(value="00:00")
         self._scan_start_time = 0.0
@@ -4511,6 +4518,7 @@ class DS102GUI:
             bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
         ).pack(anchor="w", padx=12, pady=(2, 8))
 
+        self._scan_stage2_var = tk.BooleanVar(value=cfg.get("enable_stage2", False))
         ttk.Checkbutton(
             card1, text="啟用階段二局部精修（K 近鄰）",
             variable=self._scan_stage2_var, command=self._on_scan_stage2_toggle,
