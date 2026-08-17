@@ -38,7 +38,15 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
 from meter_GPIB import HP8153APowerMeter
-from fiber_scanner import FiberAlignmentScanner, ScanAbort
+from fiber_scanner import (
+    FiberAlignmentScanner,
+    ScanAbort,
+    DEFAULT_STEP_MIN,
+    DEFAULT_SETTLE_SEC,
+    DEFAULT_MAX_CYCLES,
+    DEFAULT_NOISE_SIGMA_MULT,
+    DEFAULT_NO_SIGNAL_RANGE_MULT,
+)
 
 # matplotlib 是尋光分頁的即時軌跡圖用的，非本程式核心相依（序列通訊與其餘
 # 分頁完全不需要它）。優雅降級：裝不到就停用尋光分頁，不影響其他功能。
@@ -2205,6 +2213,10 @@ class DS102GUI:
         self._scan_status_var = tk.StringVar(value="尚未開始")
         self._scan_elapsed_var = tk.StringVar(value="00:00")
         self._scan_start_time = 0.0
+        # 設定檔載入延後套用：這裡的 tk.StringVar/BooleanVar 要等
+        # _build_tab_scan 建立分頁時才會存在，先把設定檔內容存成普通 dict，
+        # 由 _build_tab_scan 決定哪些欄位用它覆寫函式庫預設值。
+        self._scanner_cfg_pending: dict = _load_scanner_config(log=self.ctrl._log)
 
         # ── 尋光即時軌跡圖（第三階段新增）──
         # sample_cb 跑在 scanner 的背景執行緒，matplotlib／tkinter API 都不能
@@ -4339,6 +4351,43 @@ class DS102GUI:
     # TAB：尋光（FiberAlignmentScanner）。第一階段骨架＋第三階段的嵌入式
     # matplotlib 即時軌跡圖／收斂圖；三層設定卡片與完整確認文案留給第四階段。
     # =========================================================================
+    def _scan_active_axes(self) -> List[str]:
+        """
+        決定尋光分頁要顯示哪幾軸的起始步長／階段二欄位。
+
+        比照連線成功回呼那段既有的按鈕 enable/disable 判斷
+        （`int(AXIS_NO[ax]) <= self.ctrl.axis_count`）。未連線時
+        `axis_count` 是 0，這裡保守降級為實機目前實際可動的 X/Y/Z——
+        U 軸接了控制器但沒接滑台，顯示出來也只會讓使用者誤填。
+        """
+        if self.ctrl.connected and self.ctrl.axis_count:
+            axes = [ax for ax in AXES if int(AXIS_NO[ax]) <= self.ctrl.axis_count]
+            if axes:
+                return axes
+        return ["X", "Y", "Z"]
+
+    def _on_scan_stage2_toggle(self):
+        """階段二勾選狀態連動「進階設定」裡的局部半徑／軸縮放係數 Entry 可否編輯。"""
+        state = "normal" if self._scan_stage2_var.get() else "disabled"
+        for ent in getattr(self, "_scan_stage2_entries", []):
+            ent.config(state=state)
+
+    def _on_scan_abort_toggle(self):
+        """取消勾選「無訊號時中止」要顯示警示；沒有對應收工旗標，純粹是文字顯示。"""
+        if self._scan_abort_no_signal_var.get():
+            self._scan_abort_warn_lbl.pack_forget()
+        else:
+            self._scan_abort_warn_lbl.pack(anchor="w", padx=12, pady=(0, 8))
+
+    def _toggle_scan_advanced(self):
+        self._scan_adv_visible = not self._scan_adv_visible
+        if self._scan_adv_visible:
+            self._scan_adv_frame.pack(fill="x")
+            self._scan_adv_toggle_btn.config(text="▾ 隱藏進階設定")
+        else:
+            self._scan_adv_frame.pack_forget()
+            self._scan_adv_toggle_btn.config(text="▸ 顯示進階設定")
+
     def _build_tab_scan(self, parent):
         if not _MATPLOTLIB_AVAILABLE:
             tk.Label(
@@ -4350,30 +4399,249 @@ class DS102GUI:
             ).pack(padx=20, pady=20)
             return
 
-        frame = tk.Frame(parent, bg=CLR_BG)
-        frame.pack(fill="both", expand=True, padx=12, pady=12)
+        cfg = self._scanner_cfg_pending  # __init__ 已載入的 scanner_config.json 內容，可能是空 dict
+        scan_axes = self._scan_active_axes()
 
-        for ax in ("X", "Y", "Z"):
-            row = tk.Frame(frame, bg=CLR_BG)
-            row.pack(fill="x", pady=2)
-            tk.Label(row, text=f"起始步長 {ax}:", bg=CLR_BG, fg=CLR_TEXT, width=14, anchor="w").pack(side="left")
+        self._add_status_bar(parent)
+
+        # ── 頂端操作列：開始/停止/狀態/耗時，固定在最上方 ──
+        toolbar = tk.Frame(parent, bg=CLR_CARD, highlightbackground=CLR_BORDER, highlightthickness=1)
+        toolbar.pack(side="top", fill="x")
+        self._scan_start_btn = ttk.Button(
+            toolbar, text="▶ 開始尋光", style="Accent.TButton", command=self._do_start_scan
+        )
+        self._scan_start_btn.pack(side="left", padx=(12, 4), pady=8)
+        self._scan_stop_btn = ttk.Button(
+            toolbar, text="■ 停止尋光", style="Danger.TButton", command=self._do_stop_scan, state="disabled"
+        )
+        self._scan_stop_btn.pack(side="left", padx=4, pady=8)
+        tk.Label(
+            toolbar, textvariable=self._scan_status_var, bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 11, "bold")
+        ).pack(side="left", padx=(16, 6))
+        tk.Label(toolbar, text="已耗時", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(16, 2))
+        tk.Label(
+            toolbar, textvariable=self._scan_elapsed_var, bg=CLR_CARD, fg=CLR_TEXT, font=("Consolas", 10, "bold")
+        ).pack(side="left")
+
+        # ── 中間主體：左右分欄 ──
+        body = tk.Frame(parent, bg=CLR_BG)
+        body.pack(side="top", fill="both", expand=True)
+
+        left_outer = tk.Frame(body, bg=CLR_BG, width=340)
+        left_outer.pack(side="left", fill="y")
+        left_outer.pack_propagate(False)  # 固定左欄寬度，不被右欄的圖表擠壓變形
+        left = self._scrollable(left_outer)
+
+        right = tk.Frame(body, bg=CLR_BG)
+        right.pack(side="left", fill="both", expand=True)
+
+        # =================== 左欄卡片一：掃描設定 ===================
+        card1 = self._card(left, "掃描設定")
+
+        step_f = tk.Frame(card1, bg=CLR_CARD)
+        step_f.pack(fill="x", padx=12, pady=(6, 2))
+        tk.Label(
+            step_f, text="起始步長（每軸，pulse）", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w")
+        axes_row = tk.Frame(step_f, bg=CLR_CARD)
+        axes_row.pack(fill="x", pady=(4, 0))
+        for ax in scan_axes:
+            col = tk.Frame(axes_row, bg=CLR_CARD)
+            col.pack(side="left", padx=(0, 8))
+            tk.Label(col, text=ax, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)).pack(anchor="w")
+            # 預設值不可以是 0——那幾乎就是「原地不動」，對座標下降演算法毫無意義。
             var = tk.StringVar(value="64")
             self._scan_axis_step_vars[ax] = var
-            ttk.Entry(row, textvariable=var, width=10).pack(side="left")
+            ttk.Entry(col, textvariable=var, width=8).pack()
+        tk.Label(
+            card1,
+            text="粗定位的起始步長，越大收斂越快但越容易跳過訊號峰值。只列出目前可動的軸。",
+            bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
+        ).pack(anchor="w", padx=12, pady=(2, 8))
 
-        ttk.Checkbutton(frame, text="啟用階段二局部精修", variable=self._scan_stage2_var).pack(anchor="w", pady=(6, 10))
+        ttk.Checkbutton(
+            card1, text="啟用階段二局部精修（K 近鄰）",
+            variable=self._scan_stage2_var, command=self._on_scan_stage2_toggle,
+        ).pack(anchor="w", padx=12, pady=(0, 10))
 
-        btn_row = tk.Frame(frame, bg=CLR_BG)
-        btn_row.pack(fill="x", pady=6)
-        self._scan_start_btn = ttk.Button(btn_row, text="▶ 開始尋光", style="Accent.TButton", command=self._do_start_scan)
-        self._scan_start_btn.pack(side="left", padx=4)
-        self._scan_stop_btn = ttk.Button(btn_row, text="■ 停止尋光", style="Danger.TButton", command=self._do_stop_scan, state="disabled")
-        self._scan_stop_btn.pack(side="left", padx=4)
+        # =================== 左欄卡片二：訊號有效性判準 ===================
+        card2 = self._card(left, "訊號有效性判準")
+        tk.Label(
+            card2, text="選填 · 需真機校準", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        ).pack(anchor="w", padx=12, pady=(0, 6))
 
-        tk.Label(frame, textvariable=self._scan_status_var, bg=CLR_BG, fg=CLR_TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(10, 2))
-        tk.Label(frame, textvariable=self._scan_elapsed_var, bg=CLR_BG, fg=CLR_MUTED).pack(anchor="w")
+        tk.Label(
+            card2, text="有效功率下限 (dBm)", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w", padx=12)
+        self._scan_min_valid_power_var = tk.StringVar(value=cfg.get("min_valid_power_dbm", ""))
+        ttk.Entry(card2, textvariable=self._scan_min_valid_power_var, width=14).pack(
+            anchor="w", padx=12, pady=(2, 2)
+        )
+        tk.Label(
+            card2,
+            text="0 是有效的功率下限值，不代表停用；要停用請保持空白。此值需以真機「刻意不"
+                 "耦光」量出的暗電流基準校準，校準前建議留空。",
+            bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
+        ).pack(anchor="w", padx=12, pady=(0, 8))
 
-        self._build_scan_plot(frame)
+        tk.Label(
+            card2, text="無訊號判定倍數", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w", padx=12)
+        self._scan_range_mult_var = tk.StringVar(
+            value=cfg.get("no_signal_range_mult", str(DEFAULT_NO_SIGNAL_RANGE_MULT))
+        )
+        ttk.Entry(card2, textvariable=self._scan_range_mult_var, width=14).pack(
+            anchor="w", padx=12, pady=(2, 8)
+        )
+
+        self._scan_abort_no_signal_var = tk.BooleanVar(value=cfg.get("abort_if_no_signal", True))
+        ttk.Checkbutton(
+            card2, text="無訊號時中止搜尋",
+            variable=self._scan_abort_no_signal_var, command=self._on_scan_abort_toggle,
+        ).pack(anchor="w", padx=12, pady=(0, 2))
+        self._scan_abort_warn_lbl = tk.Label(
+            card2, text="⚠ 取消勾選後，偵測不到訊號也會繼續跑完整段搜尋",
+            bg=CLR_CARD, fg=CLR_WARN, font=("Segoe UI", 8), justify="left", wraplength=300,
+        )
+        if not self._scan_abort_no_signal_var.get():
+            self._scan_abort_warn_lbl.pack(anchor="w", padx=12, pady=(0, 8))
+
+        # =================== 左欄卡片三：進階設定（可折疊）===================
+        card3 = self._card(left, "")
+        self._scan_adv_visible = False
+        self._scan_adv_toggle_btn = ttk.Button(
+            card3, text="▸ 顯示進階設定", style="Flat.TButton", command=self._toggle_scan_advanced,
+        )
+        self._scan_adv_toggle_btn.pack(anchor="w", padx=12, pady=(6, 0))
+
+        self._scan_adv_frame = tk.Frame(card3, bg=CLR_CARD)
+        # 預設收合，不 pack——_toggle_scan_advanced 負責顯示/隱藏。
+
+        # 速度四參數：沿用「移動控制」分頁速度設定卡（_build_card_speed）的
+        # 既有標籤命名，不要另外發明一套詞彙。
+        spd_f = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
+        spd_f.pack(fill="x", padx=12, pady=(8, 4))
+        self._scan_l_speed_var = tk.StringVar(value=cfg.get("l_speed", "5"))
+        self._scan_f_speed_var = tk.StringVar(value=cfg.get("f_speed", "1000"))
+        self._scan_rate_var = tk.StringVar(value=cfg.get("rate", "100"))
+        self._scan_s_rate_var = tk.StringVar(value=cfg.get("s_rate", "5"))
+        for r, (lbl, var) in enumerate(
+            [
+                ("Start-up Speed (L)", self._scan_l_speed_var),
+                ("Driving Speed (F)", self._scan_f_speed_var),
+                ("Accel/Decel Rate (R)", self._scan_rate_var),
+                ("S-curve Rate (S)", self._scan_s_rate_var),
+            ]
+        ):
+            tk.Label(
+                spd_f, text=lbl, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9), width=20, anchor="w"
+            ).grid(row=r, column=0, sticky="w", pady=3)
+            ttk.Entry(spd_f, textvariable=var, width=10).grid(row=r, column=1, padx=8)
+
+        grid2 = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
+        grid2.pack(fill="x", padx=12, pady=(0, 4))
+        self._scan_step_min_var = tk.StringVar(value=cfg.get("step_min", str(DEFAULT_STEP_MIN)))
+        self._scan_settle_sec_var = tk.StringVar(value=cfg.get("settle_sec", str(DEFAULT_SETTLE_SEC)))
+        self._scan_max_cycles_var = tk.StringVar(value=cfg.get("max_cycles", str(DEFAULT_MAX_CYCLES)))
+        self._scan_noise_sigma_mult_var = tk.StringVar(
+            value=cfg.get("noise_sigma_mult", str(DEFAULT_NOISE_SIGMA_MULT))
+        )
+        for r, (lbl, var) in enumerate(
+            [
+                ("最小步長 step_min", self._scan_step_min_var),
+                ("震動衰減 settle_sec", self._scan_settle_sec_var),
+                ("最多輪數 max_cycles", self._scan_max_cycles_var),
+                ("雜訊倍數 noise_sigma_mult", self._scan_noise_sigma_mult_var),
+            ]
+        ):
+            tk.Label(
+                grid2, text=lbl, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9), width=20, anchor="w"
+            ).grid(row=r, column=0, sticky="w", pady=3)
+            ttk.Entry(grid2, textvariable=var, width=10).grid(row=r, column=1, padx=8)
+
+        f_min_f = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
+        f_min_f.pack(fill="x", padx=12, pady=(4, 4))
+        tk.Label(
+            f_min_f, text="最低速度 f_speed_min", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w")
+        self._scan_f_speed_min_var = tk.StringVar(value=cfg.get("f_speed_min", ""))
+        ttk.Entry(f_min_f, textvariable=self._scan_f_speed_min_var, width=14).pack(anchor="w", pady=(2, 0))
+        tk.Label(
+            f_min_f, text="留空 = 自動（最高速的 1/5）", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        ).pack(anchor="w", pady=(1, 0))
+
+        # 調速下限/上限刻意不存進 scanner_config.json（見 _do_start_scan 存檔
+        # 那段的欄位清單），每次開分頁都是空白、交給函式庫自動決定。
+        scale_f = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
+        scale_f.pack(fill="x", padx=12, pady=(4, 4))
+        tk.Label(
+            scale_f, text="調速下限／上限 (pulse)", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w")
+        scale_row = tk.Frame(scale_f, bg=CLR_CARD)
+        scale_row.pack(fill="x", pady=(2, 0))
+        self._scan_speed_scale_lo_var = tk.StringVar(value="")
+        self._scan_speed_scale_hi_var = tk.StringVar(value="")
+        ttk.Entry(scale_row, textvariable=self._scan_speed_scale_lo_var, width=9).pack(side="left")
+        tk.Label(scale_row, text="～", bg=CLR_CARD, fg=CLR_MUTED).pack(side="left", padx=4)
+        ttk.Entry(scale_row, textvariable=self._scan_speed_scale_hi_var, width=9).pack(side="left")
+        tk.Label(
+            scale_f, text="留空 = 自動", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        ).pack(anchor="w", pady=(1, 0))
+
+        # 階段二專用：局部取樣半徑／軸縮放係數，只在啟用階段二時可編輯。
+        # 同樣不存檔——依當次搜尋範圍而定，存檔只會誘使使用者延用不適合的舊值。
+        tk.Label(
+            self._scan_adv_frame, text="階段二專用（僅啟用階段二局部精修時生效）",
+            bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w", padx=12, pady=(6, 2))
+
+        self._scan_stage2_radius_vars: Dict[str, tk.StringVar] = {}
+        self._scan_stage2_axis_scale_vars: Dict[str, tk.StringVar] = {}
+        self._scan_stage2_entries: List[ttk.Entry] = []
+        stage2_enabled_state = "normal" if self._scan_stage2_var.get() else "disabled"
+
+        radius_f = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
+        radius_f.pack(fill="x", padx=12, pady=(0, 2))
+        tk.Label(
+            radius_f, text="局部取樣半徑（每軸，pulse）", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w")
+        radius_row = tk.Frame(radius_f, bg=CLR_CARD)
+        radius_row.pack(fill="x", pady=(2, 6))
+        for ax in scan_axes:
+            col = tk.Frame(radius_row, bg=CLR_CARD)
+            col.pack(side="left", padx=(0, 8))
+            tk.Label(col, text=ax, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)).pack(anchor="w")
+            var = tk.StringVar(value="")
+            self._scan_stage2_radius_vars[ax] = var
+            ent = ttk.Entry(col, textvariable=var, width=8, state=stage2_enabled_state)
+            ent.pack()
+            self._scan_stage2_entries.append(ent)
+
+        scale_f2 = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
+        scale_f2.pack(fill="x", padx=12, pady=(0, 2))
+        tk.Label(
+            scale_f2, text="軸縮放係數 axis_scale（每軸）", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w")
+        scale_row2 = tk.Frame(scale_f2, bg=CLR_CARD)
+        scale_row2.pack(fill="x", pady=(2, 6))
+        for ax in scan_axes:
+            col = tk.Frame(scale_row2, bg=CLR_CARD)
+            col.pack(side="left", padx=(0, 8))
+            tk.Label(col, text=ax, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)).pack(anchor="w")
+            var = tk.StringVar(value="")
+            self._scan_stage2_axis_scale_vars[ax] = var
+            ent = ttk.Entry(col, textvariable=var, width=8, state=stage2_enabled_state)
+            ent.pack()
+            self._scan_stage2_entries.append(ent)
+
+        tk.Label(
+            self._scan_adv_frame,
+            text="以上皆為函式庫內建的保守預設值，尚未以真機校準；調整前建議先以預設值跑過至少一次完整搜尋。",
+            bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
+        ).pack(anchor="w", padx=12, pady=(4, 8))
+
+        # =================== 右欄：即時圖表（第三階段既有邏輯，不動）===================
+        self._build_scan_plot(right)
 
         # 資料寫入（sample_cb，背景執行緒）與重繪（此迴圈，主執行緒）分離，
         # 見 self._on_scan_sample / self._redraw_scan_plot 的說明。跟
@@ -4673,15 +4941,53 @@ class DS102GUI:
             self._flash_banner("已有搜尋在進行中")
             return
 
-        # 這階段先跳最簡陋的確認視窗，下一階段補完整文案
+        axis_summary = " ".join(
+            f"{ax}={self._scan_axis_step_vars[ax].get()}" for ax in self._scan_axis_step_vars
+        )
+        stage2_txt = "啟用" if self._scan_stage2_var.get() else "不啟用"
+        floor_val = self._scan_min_valid_power_var.get().strip()
+        floor_txt = "未設定（僅依讀值相對變化判斷）" if not floor_val else f"{floor_val} dBm"
+        abort_txt = "是" if self._scan_abort_no_signal_var.get() else "否"
+
         if not messagebox.askyesno(
             "確認開始尋光",
-            "即將開始自動尋光，滑台會依演算法自主移動並持續量測光功率。\n\n"
-            "⚠ 尋光不保證找到訊號。開始前請確認光纖已初步耦合、光功率計讀值正常。\n\n"
-            "確定要開始嗎？",
+            f"即將開始自動尋光，滑台會依演算法自主移動並持續量測光功率。\n\n"
+            f"起始步長：{axis_summary}\n"
+            f"階段二精修：{stage2_txt}\n"
+            f"訊號有效性下限：{floor_txt}\n"
+            f"無訊號時中止：{abort_txt}\n"
+            f"預估時間：無法精確預估，過去測試單輪落在數十秒到數分鐘不等\n\n"
+            f"⚠ 尋光不保證找到訊號，也不代表光纖已對準——搜尋結束仍請自行確認\n"
+            f"　光功率讀值是否落在可接受範圍。\n"
+            f"⚠ 過程中「光功率」分頁的讀值改由本頁提供，該分頁的自動輪詢會暫停。\n"
+            f"⚠ 開始前請確認：光纖已初步耦合、光功率計已連線且讀值正常、\n"
+            f"　目前位置在行程範圍內有足夠的移動空間可供搜尋。\n\n"
+            f"確定要開始嗎？",
             icon="warning", default="no",
         ):
             return
+
+        # 使用者確認後才存檔——只存跨次搜尋穩定的參數。initial_step、
+        # stage2_local_radius、axis_scale 依當次搜尋範圍而定，刻意不存，
+        # 存了只會誘使使用者延用不適合這次的舊值。
+        _save_scanner_config(
+            {
+                "l_speed": self._scan_l_speed_var.get(),
+                "f_speed": self._scan_f_speed_var.get(),
+                "rate": self._scan_rate_var.get(),
+                "s_rate": self._scan_s_rate_var.get(),
+                "f_speed_min": self._scan_f_speed_min_var.get(),
+                "step_min": self._scan_step_min_var.get(),
+                "settle_sec": self._scan_settle_sec_var.get(),
+                "max_cycles": self._scan_max_cycles_var.get(),
+                "noise_sigma_mult": self._scan_noise_sigma_mult_var.get(),
+                "no_signal_range_mult": self._scan_range_mult_var.get(),
+                "abort_if_no_signal": self._scan_abort_no_signal_var.get(),
+                "min_valid_power_dbm": self._scan_min_valid_power_var.get(),
+                "enable_stage2": self._scan_stage2_var.get(),
+            },
+            log=self.ctrl._log,
+        )
 
         self._scanning.set()  # 早於執行緒啟動，避免 _update_stat_ui 的窗口期把按鈕解鎖
         self._scan_start_btn.config(state="disabled")
@@ -4696,12 +5002,88 @@ class DS102GUI:
                 initial_step[ax] = int(var.get())
             except ValueError:
                 initial_step[ax] = 64
-        # 必須在主執行緒讀出來存進區域變數——tkinter Variable.get() 不可從
-        # 背景執行緒呼叫（Python 3.14 的 tkinter 會直接丟
+        # 以下全部必須在主執行緒讀出來存進區域變數——tkinter Variable.get()
+        # 不可從背景執行緒呼叫（Python 3.14 的 tkinter 會直接丟
         # RuntimeError: main thread is not in main loop，2026-08-17 實測
-        # 踩到），下面的 _run() 跑在背景執行緒，不能在裡面呼叫
-        # self._scan_stage2_var.get()。
+        # 踩到），下面的 _run() 跑在背景執行緒，不能在裡面呼叫任何
+        # self._scan_*_var.get()。
         enable_stage2 = self._scan_stage2_var.get()
+
+        def _parse_float_or_none(s):
+            s = s.strip()
+            if not s:
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                return None
+
+        def _parse_float(s, default):
+            try:
+                return float(s)
+            except (ValueError, AttributeError):
+                return default
+
+        def _parse_int(s, default):
+            try:
+                return int(s)
+            except (ValueError, AttributeError):
+                return default
+
+        # 型別刻意混雜（str/int/float/bool），Pylance 對 **kwargs 展開會因此
+        # 把每個參數都推論成聯集型別而報一串資訊等級提示——都是誤報，
+        # 實際值在 _parse_int/_parse_float 已轉成 FiberAlignmentScanner
+        # 建構子要求的正確型別。
+        scanner_kwargs = {
+            "l_speed": self._scan_l_speed_var.get().strip() or "5",
+            "f_speed": self._scan_f_speed_var.get().strip() or "1000",
+            "rate": self._scan_rate_var.get().strip() or "100",
+            "s_rate": self._scan_s_rate_var.get().strip() or "5",
+            "step_min": _parse_int(self._scan_step_min_var.get(), DEFAULT_STEP_MIN),
+            "settle_sec": _parse_float(self._scan_settle_sec_var.get(), DEFAULT_SETTLE_SEC),
+            "max_cycles": _parse_int(self._scan_max_cycles_var.get(), DEFAULT_MAX_CYCLES),
+            "noise_sigma_mult": _parse_float(self._scan_noise_sigma_mult_var.get(), DEFAULT_NOISE_SIGMA_MULT),
+            "min_valid_power_dbm": _parse_float_or_none(self._scan_min_valid_power_var.get()),
+            "no_signal_range_mult": _parse_float(self._scan_range_mult_var.get(), DEFAULT_NO_SIGNAL_RANGE_MULT),
+            "abort_if_no_signal": self._scan_abort_no_signal_var.get(),
+        }
+        f_speed_min_raw = self._scan_f_speed_min_var.get().strip()
+        if f_speed_min_raw:
+            scanner_kwargs["f_speed_min"] = f_speed_min_raw
+
+        lo_raw = self._scan_speed_scale_lo_var.get().strip()
+        hi_raw = self._scan_speed_scale_hi_var.get().strip()
+        if lo_raw and hi_raw:
+            try:
+                scanner_kwargs["speed_scale_pulses"] = (int(lo_raw), int(hi_raw))
+            except ValueError:
+                pass  # 格式錯就讓函式庫走自動預設，不因為進階欄位打錯字而擋下整個尋光
+
+        # 階段二專用參數是 run() 的參數，不是建構子參數——只有勾選階段二
+        # 且欄位有填才組字典傳入，沒填就讓函式庫用它自己的預設半徑/係數。
+        run_kwargs = {}
+        if enable_stage2:
+            radius = {}
+            for ax, var in self._scan_stage2_radius_vars.items():
+                raw = var.get().strip()
+                if raw:
+                    try:
+                        radius[ax] = int(raw)
+                    except ValueError:
+                        pass
+            if radius:
+                run_kwargs["stage2_local_radius"] = radius
+
+            axis_scale = {}
+            for ax, var in self._scan_stage2_axis_scale_vars.items():
+                raw = var.get().strip()
+                if raw:
+                    try:
+                        axis_scale[ax] = float(raw)
+                    except ValueError:
+                        pass
+            if axis_scale:
+                run_kwargs["axis_scale"] = axis_scale
 
         def _progress(msg):
             self.root.after(0, lambda: self._scan_status_var.set(msg))
@@ -4711,12 +5093,13 @@ class DS102GUI:
             self.ctrl, self._scanner_power_query,
             progress_cb=_progress,
             sample_cb=self._on_scan_sample,
+            **scanner_kwargs,
         )
         self._active_scanner = scanner
 
         def _run():
             try:
-                result = scanner.run(initial_step=initial_step, enable_stage2=enable_stage2)
+                result = scanner.run(initial_step=initial_step, enable_stage2=enable_stage2, **run_kwargs)
                 self.root.after(0, lambda: self._on_scan_done(ok=True, result=result, err=None))
             except ScanAbort as e:
                 # ⚠ `except X as e` 的 e 會在 except 區塊結束時被自動 del，
