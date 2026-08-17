@@ -4244,7 +4244,24 @@ class DS102GUI:
             font=("Segoe UI", 9),
         ).pack(side="left")
 
+        # 尋光執行中的狀態提示列——狀態驅動（跟著 ctrl.scanning_active），
+        # 不是 _flash_banner 那種計時後自動消失的提示。預設不 pack，顯示/
+        # 隱藏交給 _pm_sync_scan_notice()（掛在 _redraw_scan_plot 既有的
+        # 250ms 節奏上，見該方法與 main_ai.py 架構說明的〈scanning_active
+        # 與 scan_move_step〉一節）。
+        self._pm_scan_notice = tk.Label(
+            pow_card,
+            text="🔍 尋光進行中 — 讀值由「尋光」分頁提供，本頁自動輪詢已暫停",
+            bg=CLR_WARN,
+            fg="white",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+            padx=10,
+            pady=4,
+        )
+
         num_row = tk.Frame(pow_card, bg=CLR_CARD)
+        self._pm_num_row = num_row
         num_row.pack(pady=(4, 4))
         self._pm_power_lbl = tk.Label(
             num_row,
@@ -4812,6 +4829,7 @@ class DS102GUI:
                 pending, self._scan_plot_pending = self._scan_plot_pending, []
             if pending:
                 self._scan_plot_extend(pending)
+            self._pm_sync_scan_notice()
         except tk.TclError:
             return  # widget 已被銷毀（關閉流程中），安靜收工
         self.root.after(SCAN_PLOT_REDRAW_INTERVAL, self._redraw_scan_plot)
@@ -4846,6 +4864,25 @@ class DS102GUI:
             self._scan_cur_power_var.set("—")
         if self._scan_best_power is not None:
             self._scan_best_power_var.set(f"{self._scan_best_power:.2f}")
+
+        # 這批樣本裡最新一筆有效讀值也回寫光功率分頁的顯示變數——尋光
+        # 期間背景輪詢已暫停（見 _start_meter_poll_worker 的
+        # scanning_active 判斷），光功率分頁不會有其他資料來源。呈現規則
+        # 照抄 _on_meter_reading 的成功分支，只是換了資料來源，不要另立
+        # 一套。刻意不動 _pm_comm_failures——那是背景輪詢自己的失聯計數，
+        # 尋光中它本來就沒在跑，不該被這裡累加或歸零，避免尋光結束後
+        # 失聯判斷的行為被污染。
+        if valid_samples := [s for s in samples if s.ok and s.power is not None]:
+            latest = valid_samples[-1]
+            self._pm_last_ok_time = time.time()
+            self._pm_last_value = latest.power
+            self._pm_power_var.set(f"{latest.power:.2f}")
+            self._pm_unit_var.set("dBm")
+            self._pm_power_lbl.config(fg=CLR_TEXT)
+            self._pm_status_var.set("尋光中（讀值由尋光分頁提供）")
+            self._pm_status_lbl.config(fg=CLR_ACCENT)
+            self._pm_set_status_dot(CLR_ACCENT)
+            self._pm_update_age_label()
 
         if _MATPLOTLIB_AVAILABLE:
             self._scan_redraw_figure()
@@ -5134,6 +5171,10 @@ class DS102GUI:
         else:
             self._scan_status_var.set(f"已結束（{err}）")
             self._flash_banner(f"■ 尋光已結束：{err}")
+        # ctrl.scanning_active 這時已經是 False，靠下一輪 _redraw_scan_plot
+        # （250ms 節奏）也會自然收回提示列，但這裡主動呼叫一次讓收尾更
+        # 即時，不必讓使用者多等最多一個節奏週期。
+        self._pm_sync_scan_notice()
 
     # =========================================================================
     # TAB：LOG
@@ -5610,6 +5651,44 @@ class DS102GUI:
             except tk.TclError:
                 pass
         self._pm_sync_range_entry_state()
+
+    def _pm_sync_scan_notice(self):
+        """
+        依 ctrl.scanning_active 同步光功率分頁的狀態提示列與操作按鈕。
+
+        沒有另開輪詢——搭 _redraw_scan_plot 既有的 250ms 節奏（尋光分頁
+        建立時就啟動，跑到程式結束為止，跟尋光是否進行中無關），加上
+        _on_scan_done 收尾時額外呼叫一次，讓收回不必等到下一輪節奏。
+        """
+        scanning = self.ctrl.scanning_active
+        notice = self._pm_scan_notice
+        mapped = notice.winfo_ismapped()
+        if scanning and not mapped:
+            notice.pack(fill="x", padx=8, pady=(4, 0), before=self._pm_num_row)
+            # 尋光進行中不能讓使用者手動觸發查詢/量程變更跟尋光搶 GPIB——
+            # 直接鎖死這三顆，不透過 _pm_set_widgets_state（它只認
+            # connected/disconnected 兩態，不知道「已連線但尋光中」這個
+            # 第三態）。
+            for w in (self._pm_query_btn, self._pm_auto_poll_cb, self._pm_apply_range_btn):
+                try:
+                    w.config(state="disabled")
+                except tk.TclError:
+                    pass
+        elif not scanning and mapped:
+            notice.pack_forget()
+            # 還原成「目前連線狀態」該有的 enable/disable，不是無條件
+            # normal——尋光中途若 self.meter 被設回 None（使用者按了
+            # 「中斷」），這三顆本來就該維持 disabled。
+            self._pm_set_widgets_state("connected" if self.meter is not None else "disconnected")
+            # _scan_plot_extend 尋光期間把 _pm_status_var 改成「尋光中…」，
+            # 收尾後要還原成正常狀態文字，否則會卡在「尋光中」字樣不放，
+            # 使用者看畫面會誤以為尋光還沒真的結束。
+            if self.meter is not None:
+                self._pm_status_var.set("已連線")
+                self._pm_status_lbl.config(fg=CLR_ACCENT)
+            else:
+                self._pm_status_var.set("未連線")
+                self._pm_status_lbl.config(fg=CLR_MUTED)
 
     def _pm_sync_poll_interval_state(self):
         """輪詢間隔輸入框：僅當已連線且勾選自動輪詢時才 enabled。"""
