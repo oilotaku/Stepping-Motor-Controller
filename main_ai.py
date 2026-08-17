@@ -47,6 +47,12 @@ try:
     matplotlib.use("TkAgg")
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    import numpy as np  # matplotlib 本身就強制依賴 numpy（PathCollection.set_offsets
+    # 內部用 np.asanyarray 處理），不是額外引入的相依，這裡直接借用來組空陣列。
+    # 座標軸標籤／標題有中文，matplotlib 預設字型沒有對應字形會顯示缺字方框。
+    # 只需設定一次，放在任何 Figure 建立之前即可。
+    matplotlib.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "Segoe UI", "SimHei", "Arial"]
+    matplotlib.rcParams["axes.unicode_minus"] = False
     _MATPLOTLIB_AVAILABLE = True
     _MATPLOTLIB_IMPORT_ERROR = None
 except ImportError as e:
@@ -349,6 +355,10 @@ COMM_FAIL_THRESHOLD = 3
 BANNER_COALESCE_SEC = 1.0
 # 光功率面板自動輪詢的預設間隔（秒）。
 METER_POLL_INTERVAL = 0.5
+# 尋光分頁即時軌跡圖的重繪間隔（毫秒）。matplotlib 的 draw_idle() 比
+# Label.config() 貴得多，資料源（sample_cb）本身只有約 1Hz，不必追到
+# UI_REDRAW_INTERVAL 那麼快。
+SCAN_PLOT_REDRAW_INTERVAL = 250
 
 # 顏色主題
 CLR_BG = "#F4F3F0"
@@ -2195,6 +2205,21 @@ class DS102GUI:
         self._scan_status_var = tk.StringVar(value="尚未開始")
         self._scan_elapsed_var = tk.StringVar(value="00:00")
         self._scan_start_time = 0.0
+
+        # ── 尋光即時軌跡圖（第三階段新增）──
+        # sample_cb 跑在 scanner 的背景執行緒，matplotlib／tkinter API 都不能
+        # 在那裡呼叫（Python 3.14 tkinter 會丟 RuntimeError）。做法是資料寫入
+        # 與重繪分離：背景執行緒只把 Sample 塞進這個 list，_redraw_scan_plot
+        # 固定節奏在主執行緒把它清空、套進圖表。
+        self._scan_plot_lock = threading.Lock()
+        self._scan_plot_pending: List = []  # List[Sample]，背景執行緒寫入、主執行緒讀取清空
+        self._scan_samples: List = []  # List[Sample]，完整歷史（主執行緒專用，供重繪整張圖）
+        self._scan_best_power: Optional[float] = None  # 目前為止最佳功率，供收斂圖最佳線與數值摘要
+        self._scan_sample_count = 0
+        self._scan_cur_power_var = tk.StringVar(value="—")
+        self._scan_best_power_var = tk.StringVar(value="—")
+        self._scan_n_var = tk.StringVar(value="0")
+        self._scan_coord_var = tk.StringVar(value="—")
 
         # ── 光功率計（HP 8153A，獨立於 DS102 連線）──
         self.meter: Optional[HP8153APowerMeter] = None
@@ -4311,8 +4336,8 @@ class DS102GUI:
         self._pm_apply_range_btn.pack(side="left")
 
     # =========================================================================
-    # TAB：尋光（FiberAlignmentScanner，第一階段骨架——只求路徑正確，
-    # 版面／即時圖留給下一階段）
+    # TAB：尋光（FiberAlignmentScanner）。第一階段骨架＋第三階段的嵌入式
+    # matplotlib 即時軌跡圖／收斂圖；三層設定卡片與完整確認文案留給第四階段。
     # =========================================================================
     def _build_tab_scan(self, parent):
         if not _MATPLOTLIB_AVAILABLE:
@@ -4348,6 +4373,295 @@ class DS102GUI:
         tk.Label(frame, textvariable=self._scan_status_var, bg=CLR_BG, fg=CLR_TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(10, 2))
         tk.Label(frame, textvariable=self._scan_elapsed_var, bg=CLR_BG, fg=CLR_MUTED).pack(anchor="w")
 
+        self._build_scan_plot(frame)
+
+        # 資料寫入（sample_cb，背景執行緒）與重繪（此迴圈，主執行緒）分離，
+        # 見 self._on_scan_sample / self._redraw_scan_plot 的說明。跟
+        # _start_poller 同一種「自我重新排程」模式，開分頁時啟動一次即可
+        # 持續跑到程式結束，不必等尋光開始/結束再啟動/停止。
+        self.root.after(SCAN_PLOT_REDRAW_INTERVAL, self._redraw_scan_plot)
+
+    def _build_scan_plot(self, parent):
+        """
+        建立尋光分頁的嵌入式即時圖：上排 XY／XZ 投影並排、下排功率收斂全寬，
+        圖表下方一列數值摘要（目前功率／最佳功率／樣本數／目前座標）。
+
+        用單一 Figure + gridspec（而非三張獨立 Figure）：三張子圖共用一次
+        draw_idle()，重繪成本比三個獨立 canvas 各自 draw 低。
+        """
+        chart_card = self._card(parent, "即時軌跡與收斂")
+
+        self._scan_fig = Figure(figsize=(8, 5.5), dpi=100, facecolor=CLR_CARD)
+        gs = self._scan_fig.add_gridspec(2, 2, height_ratios=[1, 1.1], hspace=0.45, wspace=0.28)
+        self._scan_ax_xy = self._scan_fig.add_subplot(gs[0, 0])
+        self._scan_ax_xz = self._scan_fig.add_subplot(gs[0, 1])
+        self._scan_ax_pwr = self._scan_fig.add_subplot(gs[1, :])
+
+        for ax, title, xlabel, ylabel in (
+            (self._scan_ax_xy, "XY 投影", "X (pulse)", "Y (pulse)"),
+            (self._scan_ax_xz, "XZ 投影", "X (pulse)", "Z (pulse)"),
+            (self._scan_ax_pwr, "功率收斂", "樣本編號", "功率 (dBm)"),
+        ):
+            ax.set_facecolor(CLR_CARD)
+            ax.set_title(title, color=CLR_TEXT, fontsize=9)
+            ax.set_xlabel(xlabel, color=CLR_TEXT, fontsize=8)
+            ax.set_ylabel(ylabel, color=CLR_TEXT, fontsize=8)
+            ax.tick_params(colors=CLR_TEXT, labelsize=7)
+            ax.grid(True, color=CLR_BORDER, linewidth=0.6)
+            for spine in ax.spines.values():
+                spine.set_color(CLR_BORDER)
+
+        # XY／XZ 投影：走過的路徑（細線、低對比）+ 起點／目前位置／最佳點
+        # （不同色 marker）+ 無效樣本（叉號）。用 set_data / set_offsets
+        # 重繪既有 artist，不必每輪 ax.clear() 重畫全部。
+        (self._scan_line_xy_path,) = self._scan_ax_xy.plot(
+            [], [], "-", color=CLR_MUTED, linewidth=0.8, zorder=1
+        )
+        self._scan_scatter_xy_bad = self._scan_ax_xy.scatter(
+            [], [], color=CLR_DANGER, marker="x", s=28, zorder=2, label="無效"
+        )
+        self._scan_scatter_xy_start = self._scan_ax_xy.scatter(
+            [], [], color=CLR_INFO, marker="o", s=32, zorder=3, label="起點"
+        )
+        self._scan_scatter_xy_best = self._scan_ax_xy.scatter(
+            [], [], color=CLR_WARN, marker="*", s=90, zorder=4, label="最佳"
+        )
+        self._scan_scatter_xy_cur = self._scan_ax_xy.scatter(
+            [], [], color=CLR_ACCENT, marker="o", s=40, zorder=5, label="目前"
+        )
+        self._scan_ax_xy.legend(
+            fontsize=6, facecolor=CLR_CARD, edgecolor=CLR_BORDER, labelcolor=CLR_TEXT, loc="best"
+        )
+
+        (self._scan_line_xz_path,) = self._scan_ax_xz.plot(
+            [], [], "-", color=CLR_MUTED, linewidth=0.8, zorder=1
+        )
+        self._scan_scatter_xz_bad = self._scan_ax_xz.scatter(
+            [], [], color=CLR_DANGER, marker="x", s=28, zorder=2
+        )
+        self._scan_scatter_xz_start = self._scan_ax_xz.scatter(
+            [], [], color=CLR_INFO, marker="o", s=32, zorder=3
+        )
+        self._scan_scatter_xz_best = self._scan_ax_xz.scatter(
+            [], [], color=CLR_WARN, marker="*", s=90, zorder=4
+        )
+        self._scan_scatter_xz_cur = self._scan_ax_xz.scatter(
+            [], [], color=CLR_ACCENT, marker="o", s=40, zorder=5
+        )
+
+        # 功率收斂：即時功率折線 + 累積最佳（逐點 running max）虛線
+        (self._scan_line_pwr_cur,) = self._scan_ax_pwr.plot(
+            [], [], "-", color=CLR_ACCENT, linewidth=1.3, label="即時功率"
+        )
+        (self._scan_line_pwr_best,) = self._scan_ax_pwr.plot(
+            [], [], "--", color=CLR_WARN, linewidth=1.3, label="累積最佳"
+        )
+        self._scan_ax_pwr.legend(
+            fontsize=7, facecolor=CLR_CARD, edgecolor=CLR_BORDER, labelcolor=CLR_TEXT, loc="best"
+        )
+
+        self._scan_canvas = FigureCanvasTkAgg(self._scan_fig, master=chart_card)
+        self._scan_canvas.draw()
+        self._scan_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+        # 圖表下方數值摘要：仿光功率分頁大數字卡片的視覺語言，字級小很多。
+        stat_row = tk.Frame(parent, bg=CLR_BG)
+        stat_row.pack(fill="x", pady=(4, 0))
+        for label, var in (
+            ("目前功率 (dBm)", self._scan_cur_power_var),
+            ("最佳功率 (dBm)", self._scan_best_power_var),
+            ("樣本數", self._scan_n_var),
+            ("目前座標", self._scan_coord_var),
+        ):
+            cell = tk.Frame(
+                stat_row, bg=CLR_CARD, highlightbackground=CLR_BORDER, highlightthickness=1
+            )
+            cell.pack(side="left", fill="both", expand=True, padx=4)
+            tk.Label(
+                cell, text=label, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+            ).pack(anchor="w", padx=8, pady=(6, 0))
+            tk.Label(
+                cell, textvariable=var, bg=CLR_CARD, fg=CLR_TEXT, font=("Consolas", 13, "bold")
+            ).pack(anchor="w", padx=8, pady=(0, 6))
+
+    def _scan_plot_reset(self):
+        """
+        清空尋光圖表資料與數值摘要。在 _do_start_scan 開始新一輪尋光時呼叫
+        （主執行緒／按鈕回呼），避免上一輪殘留的軌跡疊在新一輪上面。
+        """
+        with self._scan_plot_lock:
+            self._scan_plot_pending = []
+        self._scan_samples = []
+        self._scan_best_power = None
+        self._scan_sample_count = 0
+        self._scan_cur_power_var.set("—")
+        self._scan_best_power_var.set("—")
+        self._scan_n_var.set("0")
+        self._scan_coord_var.set("—")
+
+        if not _MATPLOTLIB_AVAILABLE:
+            return
+        empty_xy = np.empty((0, 2))  # set_offsets 內部要求 2D 形狀，空 list 會被當成 1D 陣列而炸掉
+        self._scan_line_xy_path.set_data([], [])
+        self._scan_line_xz_path.set_data([], [])
+        self._scan_line_pwr_cur.set_data([], [])
+        self._scan_line_pwr_best.set_data([], [])
+        for scatter in (
+            self._scan_scatter_xy_bad, self._scan_scatter_xy_start,
+            self._scan_scatter_xy_best, self._scan_scatter_xy_cur,
+            self._scan_scatter_xz_bad, self._scan_scatter_xz_start,
+            self._scan_scatter_xz_best, self._scan_scatter_xz_cur,
+        ):
+            scatter.set_offsets(empty_xy)
+        self._scan_canvas.draw_idle()
+
+    def _on_scan_sample(self, sample):
+        """
+        `FiberAlignmentScanner` 的 sample_cb，跑在 scanner 的背景執行緒。
+
+        🔴 只能做資料寫入，不能碰 matplotlib 或 tkinter widget——實測
+        FigureCanvasTkAgg.draw_idle() 從背景執行緒呼叫會丟
+        RuntimeError: main thread is not in main loop（Python 3.14 的
+        tkinter 強制檢查）。真正的重繪在 _redraw_scan_plot（主執行緒，
+        root.after 固定節奏）進行，這裡只把樣本堆進待處理佇列。
+        """
+        with self._scan_plot_lock:
+            self._scan_plot_pending.append(sample)
+
+    def _redraw_scan_plot(self):
+        """
+        主執行緒、固定節奏（SCAN_PLOT_REDRAW_INTERVAL）把 sample_cb 累積的
+        樣本套進圖表。跟 _start_poller 同一種自我重新排程模式，在
+        _build_tab_scan 建立分頁時啟動一次，之後跑到程式結束為止——不需要
+        尋光開始/結束時另外啟動/停止這條迴圈。
+
+        尋光沒在跑時 _scan_plot_pending 理應是空的（sample_cb 不會被呼叫），
+        這裡仍然檢查 self._scanning 再處理，避免尋光剛結束、佇列裡還有
+        最後幾筆待處理樣本時被跳過而遺漏。
+        """
+        try:
+            with self._scan_plot_lock:
+                pending, self._scan_plot_pending = self._scan_plot_pending, []
+            if pending:
+                self._scan_plot_extend(pending)
+        except tk.TclError:
+            return  # widget 已被銷毀（關閉流程中），安靜收工
+        self.root.after(SCAN_PLOT_REDRAW_INTERVAL, self._redraw_scan_plot)
+
+    def _scan_plot_extend(self, samples):
+        """
+        把一批新樣本併入 self._scan_samples 並更新數值摘要／圖表。
+
+        只在主執行緒（_redraw_scan_plot）呼叫。以整份 self._scan_samples
+        重建圖表資料而非逐筆累加差量——單輪掃描頂多幾百筆，重建成本可忽略，
+        換來的是不必額外維護一堆平行 list 的正確性風險。
+        """
+        self._scan_samples.extend(samples)
+        self._scan_sample_count = len(self._scan_samples)
+        self._scan_n_var.set(str(self._scan_sample_count))
+
+        last = samples[-1]
+        self._scan_coord_var.set(
+            f"X={last.coords.get('X', 0.0):.0f} "
+            f"Y={last.coords.get('Y', 0.0):.0f} "
+            f"Z={last.coords.get('Z', 0.0):.0f}"
+        )
+        for s in samples:
+            if s.ok and s.power is not None:
+                if self._scan_best_power is None or s.power > self._scan_best_power:
+                    self._scan_best_power = s.power
+        if last.ok and last.power is not None:
+            self._scan_cur_power_var.set(f"{last.power:.2f}")
+        else:
+            # 最新樣本無效就照實顯示「—」，不要留著前一筆有效讀值——
+            # 那會讓使用者誤以為目前位置訊號依然良好。
+            self._scan_cur_power_var.set("—")
+        if self._scan_best_power is not None:
+            self._scan_best_power_var.set(f"{self._scan_best_power:.2f}")
+
+        if _MATPLOTLIB_AVAILABLE:
+            self._scan_redraw_figure()
+
+    def _scan_redraw_figure(self):
+        """
+        用 self._scan_samples 的完整歷史重建三張子圖的 artist 資料。
+        呼叫端（_scan_plot_extend）已確保只在主執行緒、matplotlib 可用時呼叫。
+        """
+        samples = self._scan_samples
+        if not samples:
+            return
+
+        valid = [s for s in samples if s.ok]
+        bad = [s for s in samples if not s.ok]
+
+        xs = [s.coords.get("X", 0.0) for s in valid]
+        ys = [s.coords.get("Y", 0.0) for s in valid]
+        zs = [s.coords.get("Z", 0.0) for s in valid]
+        self._scan_line_xy_path.set_data(xs, ys)
+        self._scan_line_xz_path.set_data(xs, zs)
+
+        start, cur = samples[0], samples[-1]
+        self._scan_scatter_xy_start.set_offsets(
+            [[start.coords.get("X", 0.0), start.coords.get("Y", 0.0)]]
+        )
+        self._scan_scatter_xz_start.set_offsets(
+            [[start.coords.get("X", 0.0), start.coords.get("Z", 0.0)]]
+        )
+        self._scan_scatter_xy_cur.set_offsets(
+            [[cur.coords.get("X", 0.0), cur.coords.get("Y", 0.0)]]
+        )
+        self._scan_scatter_xz_cur.set_offsets(
+            [[cur.coords.get("X", 0.0), cur.coords.get("Z", 0.0)]]
+        )
+
+        best_sample = None
+        for s in valid:
+            if s.power is not None and (best_sample is None or s.power > best_sample.power):
+                best_sample = s
+        empty_xy = np.empty((0, 2))  # set_offsets 內部要求 2D 形狀，空 list 會被當成 1D 陣列而炸掉
+        if best_sample is not None:
+            self._scan_scatter_xy_best.set_offsets(
+                [[best_sample.coords.get("X", 0.0), best_sample.coords.get("Y", 0.0)]]
+            )
+            self._scan_scatter_xz_best.set_offsets(
+                [[best_sample.coords.get("X", 0.0), best_sample.coords.get("Z", 0.0)]]
+            )
+        else:
+            self._scan_scatter_xy_best.set_offsets(empty_xy)
+            self._scan_scatter_xz_best.set_offsets(empty_xy)
+
+        if bad:
+            self._scan_scatter_xy_bad.set_offsets(
+                [[s.coords.get("X", 0.0), s.coords.get("Y", 0.0)] for s in bad]
+            )
+            self._scan_scatter_xz_bad.set_offsets(
+                [[s.coords.get("X", 0.0), s.coords.get("Z", 0.0)] for s in bad]
+            )
+        else:
+            self._scan_scatter_xy_bad.set_offsets(empty_xy)
+            self._scan_scatter_xz_bad.set_offsets(empty_xy)
+
+        # 功率收斂：x 軸用樣本在整批歷史裡的序號（1-based），無效樣本沒有
+        # power 可畫，直接跳過——折線會連過那些序號，不畫斷點，這是合理的
+        # 「只連有效讀值」呈現，不是資料遺失。
+        pwr_idx, pwr_val, pwr_best = [], [], []
+        running_best = None
+        for i, s in enumerate(samples, start=1):
+            if s.ok and s.power is not None:
+                if running_best is None or s.power > running_best:
+                    running_best = s.power
+                pwr_idx.append(i)
+                pwr_val.append(s.power)
+                pwr_best.append(running_best)
+        self._scan_line_pwr_cur.set_data(pwr_idx, pwr_val)
+        self._scan_line_pwr_best.set_data(pwr_idx, pwr_best)
+
+        for ax in (self._scan_ax_xy, self._scan_ax_xz, self._scan_ax_pwr):
+            ax.relim()
+            ax.autoscale_view()
+
+        self._scan_canvas.draw_idle()
+
     def _do_start_scan(self):
         if not self.ctrl.connected:
             self._flash_banner("尋光需要先連線 DS102")
@@ -4374,6 +4688,7 @@ class DS102GUI:
         self._scan_stop_btn.config(state="normal")
         self._scan_status_var.set("初始化中…")
         self._scan_start_time = time.time()
+        self._scan_plot_reset()  # 清掉上一輪殘留的軌跡與數值摘要
 
         initial_step = {}
         for ax, var in self._scan_axis_step_vars.items():
@@ -4395,6 +4710,7 @@ class DS102GUI:
         scanner = FiberAlignmentScanner(
             self.ctrl, self._scanner_power_query,
             progress_cb=_progress,
+            sample_cb=self._on_scan_sample,
         )
         self._active_scanner = scanner
 
