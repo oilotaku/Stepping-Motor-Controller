@@ -18,6 +18,7 @@
 # =============================================================================
 
 import json
+import math
 import sys
 import threading
 import time
@@ -50,8 +51,55 @@ DEFAULT_STEP_MIN = 2           # 最小步長（pulse）。需 ≥ 機械重現�
 DEFAULT_SETTLE_SEC = 0.03      # 到位後等機構震動衰減的時間
 DEFAULT_MAX_CYCLES = 5         # 階段一外層座標下降的最多輪數
 DEFAULT_NOISE_SIGMA_MULT = 3.0  # 功率雜訊底限＝重複量測標準差的幾倍
-DEFAULT_NO_SIGNAL_RANGE_MULT = 2.0  # 全域無訊號偵測的雜訊底限倍數，見 _check_signal_detectable
+DEFAULT_NO_SIGNAL_RANGE_MULT = 2.0
+# 全域無訊號偵測的安全倍數。⚠ 2026-08-12 語意變更：舊版直接乘在固定的
+# 3σ 雜訊底限上（等於假設 n 落在某個固定範圍，已被合成資料實測推翻，
+# 見 fiber_scanner 設計文件）。新版乘在「n 相關的期望純雜訊全距
+# d2(n)×σ」上，數值本身沿用 2.0（對實測 n≈150~350 區間仍有數個標準差
+# 的餘裕，見驗算），但若曾假設這是「6σ」等固定倍數，該假設已不成立。
 REOPEN_STEP_MULT = 8           # 階段一第 2 輪起，每輪從 step_min×這個倍數重新收斂
+
+
+def _norm_ppf(p: float) -> float:
+    """
+    標準常態反累積分布函數，僅在本模組內部供 _expected_noise_range_factor
+    使用（呼叫端保證 p 落在 (0, 1) 區間內）。
+
+    A&S 26.2.23 有理近似起跳 + 一次 Newton 修正（用 math.erf，標準庫內建，
+    非 scipy），把近似誤差從 ~4.5e-4 壓到 ~1e-9——安全門檻的計算基礎值得
+    這幾行額外成本。
+    """
+    p = min(max(p, 1e-12), 1 - 1e-12)
+    t = math.sqrt(-2.0 * math.log(1.0 - p))
+    c0, c1, c2 = 2.515517, 0.802853, 0.010328
+    d1, d2_, d3 = 1.432788, 0.189269, 0.001308
+    z = t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2_ * t * t + d3 * t * t * t)
+    for _ in range(2):
+        cdf = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+        pdf = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+        if pdf < 1e-300:
+            break
+        z -= (cdf - p) / pdf
+    return z
+
+
+def _expected_noise_range_factor(n: int) -> float:
+    """
+    純雜訊（iid 常態）下，n 個樣本的期望全距（range）／σ，即統計製程管制
+    文獻中的 d2(n) 係數。用 Blom (1958) 近似：
+
+        E[R_n] = 2 * E[X_(n)] ≈ 2 * Φ^{-1}((n - 0.375) / (n + 0.25))
+
+    與 n 相關，對任意 n≥2 都成立（不需要查表／不需要事先假設 n 的上界）
+    ——這是這次改版要修的病根：舊版「固定 6σ 門檻」隱含假設了一個 n 的
+    合理範圍，一旦實際 n 超出假設就會失守（2026-08-12 合成資料實測踩到，
+    n=206 時舊門檻與實際 range 只差 1.5%）。
+
+    已與已發表 d2 表核對，n=5/10/25/50/100 誤差皆 <2%，見設計文件。
+    """
+    n = max(2, n)
+    p = (n - 0.375) / (n + 0.25)
+    return 2.0 * _norm_ppf(p)
 
 
 @dataclass
@@ -328,9 +376,21 @@ class FiberAlignmentScanner:
                     total_improvement += max(0.0, p_after - p_before)
 
             self._log(f"階段一 第 {cycle} 輪結束，本輪改善 {total_improvement:.4f}")
+
+            # 無訊號偵測：只在第 1 輪跑一次，且刻意不看 total_improvement 是否已
+            # 低於雜訊底限——total_improvement 是「各軸 max(0, 改善) 相加」，
+            # 純雜訊情境下方向探測的 p_plus>p0 比較沒有雜訊門檻（等同挑雜訊讀值
+            # 中較大者的選擇偏誤），多軸加總後有結構性正偏誤，可能意外跳過
+            # 「本該檢查」的時機（2026-08-12 合成資料測試踩到：3 軸純雜訊情境下
+            # total_improvement 意外大於雜訊底限，導致這裡完全沒被觸發）。
+            # range 判準（_check_signal_detectable 內部）不受此偏誤影響——其
+            # 統計期望值只隨樣本數對數成長，目前門檻在合理樣本數下有安全餘裕。
+            # 第 1 輪跑完就直接檢查，不必等 total_improvement 這個有偏誤的
+            # 中介指標開線燈。
+            if cycle == 1 and self.abort_if_no_signal:
+                self._check_signal_detectable(self.samples[stage1_start_idx:])
+
             if total_improvement < self._noise_floor():
-                if cycle == 1 and self.abort_if_no_signal:
-                    self._check_signal_detectable(self.samples[stage1_start_idx:])
                 self._log("階段一收斂（本輪改善低於雜訊底限）")
                 break
 
@@ -829,8 +889,9 @@ class FiberAlignmentScanner:
 
     def _check_signal_detectable(self, cycle_samples: List[Sample]) -> None:
         """
-        階段一第 1 輪結束、且本輪淨改善已低於雜訊底限時呼叫，用來區分兩種
-        外觀相同（total_improvement 都很小）但意義完全不同的情況：
+        階段一第 1 輪座標下降跑完就無條件呼叫一次（與本輪 total_improvement
+        是否低於雜訊底限無關——原因見 run_stage1 呼叫處的註解），用來區分
+        兩種外觀相同（樣本 range 都很小）但意義完全不同的情況：
 
           (a) 起點運氣好，本來就已經站在峰值附近——各方向探測仍會量到
               明顯偏低的谷值，樣本間離散度（range）大。
@@ -839,24 +900,32 @@ class FiberAlignmentScanner:
 
         只有 (b) 中止搜尋；(a) 是正常收斂，讓呼叫端繼續往下跑（不誤殺）。
 
-        ⚠ range 的判斷方向假設 HP 8153A 在固定量程、無光耦合時的讀值是
-        「穩定貼底」而非「因對數壓縮而劇烈跳動」——這是待真機驗證的假設。
-        如果真機量出來的行為相反（無光時讀值反而在 dBm 尺度上劇烈跳動，
-        因為線性功率趨近零時對數會放大雜訊），這個判準的方向需要重新
-        設計，不能沿用「range 小＝無訊號」。這件事必須用真機在「刻意
-        不對準」的位置實測才能確認，不能靠猜測定案。
+        ⚠ 門檻不是固定的「no_signal_range_mult × 3σ 雜訊底限」——純雜訊下
+        range 的期望值本身隨樣本數 n 增加（d2(n) 效應），固定門檻在 n 偏離
+        設計時假設的範圍時會失守，2026-08-12 合成資料實測（n=206）已證實。
+        改為 no_signal_range_mult × d2(n) × σ，見 _expected_noise_range_factor。
+
+        ⚠ range 的判斷方向仍假設 HP 8153A 在固定量程、無光耦合時的讀值是
+        「穩定貼底」而非「因對數壓縮而劇烈跳動」——這是待真機驗證的假設，
+        這次改動沒有動這個方向本身，只重新校準了門檻的計算方式。
         """
         powers = [s.power for s in cycle_samples if s.ok and s.power is not None]
         if len(powers) < 4:
             return  # 樣本太少，無法可靠判斷，留給後續輪次或呼叫端自行判斷
+
+        if self._noise_sigma is None or self._noise_sigma <= 0:
+            return  # 尚未校準雜訊，無法判斷，不誤殺
+
+        n = len(powers)
         rng = max(powers) - min(powers)
-        threshold = self.no_signal_range_mult * self._noise_floor()
-        if threshold <= 0:
-            return  # 尚未校準雜訊（_noise_floor()==0），無法判斷，不誤殺
+        expected_noise_range = _expected_noise_range_factor(n) * self._noise_sigma
+        threshold = self.no_signal_range_mult * expected_noise_range
+
         if rng <= threshold:
             raise ScanAbort(
-                f"第一輪座標下降共 {len(powers)} 個有效讀值，功率變化範圍僅 "
-                f"{rng:.4f}（門檻 {threshold:.4f} = {self.no_signal_range_mult}x 雜訊底限），"
+                f"第一輪座標下降共 {n} 個有效讀值，功率變化範圍僅 "
+                f"{rng:.4f}（門檻 {threshold:.4f} = {self.no_signal_range_mult}x "
+                f"純雜訊下 n={n} 的期望全距 {expected_noise_range:.4f}），"
                 "研判整個探測範圍內沒有偵測到高於雜訊的訊號——請確認光纖已耦合、"
                 "光源已開啟，或起始點/initial_step 是否涵蓋了正確的行程範圍"
             )
