@@ -227,10 +227,20 @@ def _load_meter_config(log=None) -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         (log or _log_level_adapter)("ERROR", f"meter_config.json 讀取失敗: {e}")
         return {}
+    if not isinstance(data, dict):
+        # 合法 JSON 但頂層不是物件（例如被誤存成 [] / 字串 / 數字）不會讓
+        # json.loads() 拋例外，若照樣回傳出去，呼叫端當成 dict 呼叫 .get()
+        # 會直接 AttributeError，在還沒有任何視窗顯示出來之前就讓整個
+        # DS102GUI.__init__ 崩潰（architect 審查抓到的問題）。
+        (log or _log_level_adapter)(
+            "ERROR", f"meter_config.json 格式不符（預期物件，實際 {type(data).__name__}），已忽略"
+        )
+        return {}
+    return data
 
 
 def _save_meter_config(data: dict, log=None) -> None:
@@ -254,10 +264,19 @@ def _load_scanner_config(log=None) -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         (log or _log_level_adapter)("ERROR", f"scanner_config.json 讀取失敗: {e}")
         return {}
+    if not isinstance(data, dict):
+        # 同 _load_meter_config：合法 JSON 但頂層不是物件時，json.loads()
+        # 不會拋例外，若照樣回傳，_build_tab_scan 呼叫 cfg.get(...) 會直接
+        # AttributeError，在任何視窗顯示出來之前讓整個 GUI 崩潰。
+        (log or _log_level_adapter)(
+            "ERROR", f"scanner_config.json 格式不符（預期物件，實際 {type(data).__name__}），已忽略"
+        )
+        return {}
+    return data
 
 
 def _save_scanner_config(data: dict, log=None) -> None:
@@ -1347,7 +1366,7 @@ class DS102Controller:
         回傳 (全部成功?, 摘要訊息)。
         """
         if self.ems_active or self.playback_running or self.scanning_active:
-            return False, "EMS 作用中或重播進行中，已略過"
+            return False, "EMS 作用中／重播進行中／尋光進行中，已略過"
 
         done, skipped, failed = [], [], []
         saved: Dict[str, Tuple[str, str]] = {}
@@ -4848,6 +4867,16 @@ class DS102GUI:
             self._pm_sync_scan_notice()
         except tk.TclError:
             return  # widget 已被銷毀（關閉流程中），安靜收工
+        except Exception:
+            # 🔴 architect 審查抓到的問題：這條迴圈靠自我重新排程
+            # （最下面那行 root.after）延續到程式結束，重新排程那行原本在
+            # try 區塊外——如果 _scan_plot_extend/_scan_redraw_figure
+            # （matplotlib/numpy 重繪邏輯）丟出 tk.TclError 以外的任何例外，
+            # 這條鏈結會永久斷掉：尋光分頁的即時圖表與光功率分頁的常駐
+            # 提示列從此不再更新，且 --windowed 打包後 sys.stderr 是 None，
+            # 連 traceback 都看不到，等同完全靜默失效。記錄但不 return，
+            # 讓下面的重新排程照樣執行，下一輪還有機會恢復正常。
+            logger.exception("尋光即時圖表重繪失敗，本輪跳過")
         self.root.after(SCAN_PLOT_REDRAW_INTERVAL, self._redraw_scan_plot)
 
     def _scan_plot_extend(self, samples):
@@ -5156,25 +5185,31 @@ class DS102GUI:
         def _run():
             try:
                 result = scanner.run(initial_step=initial_step, enable_stage2=enable_stage2, **run_kwargs)
-                self.root.after(0, lambda: self._on_scan_done(kind="completed", result=result, err=None))
+                # 🔴 fiber_scanner.FiberAlignmentScanner.run() 內部把所有中止事件
+                # （使用者停止／EMS／無訊號判定，_check_abort()／
+                # _check_signal_detectable() 拋出的 ScanAbort）都自己接住、
+                # 正常 return——這是刻意設計（中止是正常結束路徑，不該讓
+                # 呼叫端還要包 try/except 分辨語意），但代表這裡的
+                # `except ScanAbort` 分支實際上只會接到 run() 開頭那兩個
+                # 前置檢查（未連線／已有搜尋在跑，而且 _do_start_scan 啟動
+                # 這條執行緒前已經在主執行緒擋過一次，只是防呆）。要分辨
+                # 「真的收斂完成」還是「中途被中止」，必須在 run() 正常返回
+                # 之後讀 scanner.last_abort_reason（architect 審查抓到的
+                # critical bug：原本這裡完全沒讀這個欄位，導致 EMS 觸發／
+                # 使用者按停止／無訊號中止全部被誤報成「✔ 尋光完成」）。
+                if scanner.last_abort_reason is None:
+                    self.root.after(0, lambda: self._on_scan_done(kind="completed", result=result, err=None))
+                else:
+                    err_msg = scanner.last_abort_reason
+                    kind = self._classify_scan_abort(err_msg)
+                    self.root.after(0, lambda: self._on_scan_done(kind=kind, result=None, err=err_msg))
             except ScanAbort as e:
                 # ⚠ `except X as e` 的 e 會在 except 區塊結束時被自動 del，
                 # 而 root.after(0, ...) 是非同步排程、lambda 真正執行時區塊
                 # 早已結束——直接在 lambda 裡引用 e 會是 NameError。
                 # 先把訊息轉成字串存進區域變數，讓 lambda 捕捉的是它而非 e。
                 err_msg = str(e)
-                # 三則字面量核對於 fiber_scanner.py：_check_abort() 的
-                # 「使用者中止搜尋」「EMS 觸發，搜尋中止」逐字相符（完整比對，
-                # 這兩則本身就是完整訊息，不是某段長訊息的子字串）；
-                # 「沒有偵測到高於雜訊的訊號」是 _check_signal_detectable()
-                # 拋出的長訊息「研判整個探測範圍內沒有偵測到高於雜訊的
-                # 訊號——請確認…」裡的子字串，故用 in 判斷而非全等。
-                if err_msg in ("使用者中止搜尋", "EMS 觸發，搜尋中止"):
-                    kind = "user_stopped"
-                elif "沒有偵測到高於雜訊的訊號" in err_msg:
-                    kind = "no_signal"
-                else:
-                    kind = "aborted_other"
+                kind = self._classify_scan_abort(err_msg)
                 self.root.after(0, lambda: self._on_scan_done(kind=kind, result=None, err=err_msg))
             except Exception as e:
                 logger.exception("尋光執行緒發生未預期例外")
@@ -5182,6 +5217,22 @@ class DS102GUI:
                 self.root.after(0, lambda: self._on_scan_done(kind="exception", result=None, err=err_msg))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    @staticmethod
+    def _classify_scan_abort(err_msg: str) -> str:
+        """
+        把 ScanAbort／last_abort_reason 的訊息字串分類成 _on_scan_done 認得的
+        kind。三則字面量核對於 fiber_scanner.py：_check_abort() 的「使用者
+        中止搜尋」「EMS 觸發，搜尋中止」逐字相符（完整比對，這兩則本身就是
+        完整訊息，不是某段長訊息的子字串）；「沒有偵測到高於雜訊的訊號」是
+        _check_signal_detectable() 拋出的長訊息「研判整個探測範圍內沒有
+        偵測到高於雜訊的訊號——請確認…」裡的子字串，故用 in 判斷而非全等。
+        """
+        if err_msg in ("使用者中止搜尋", "EMS 觸發，搜尋中止"):
+            return "user_stopped"
+        if "沒有偵測到高於雜訊的訊號" in err_msg:
+            return "no_signal"
+        return "aborted_other"
 
     def _do_stop_scan(self):
         if self.ctrl.connected:
@@ -6490,6 +6541,14 @@ class DS102GUI:
     def _on_close(self):
         self._shutting_down.set()
         self._stop_playback.set()
+        if self._active_scanner is not None:
+            # 比照 _stop_playback.set() 的既有模式：尋光執行中關窗，要讓
+            # 背景執行緒知道視窗正在關閉才會主動收工。沒有這行，_run()
+            # 仍會繼續跑 scanner.run()，下一步對已經 disconnect() 的序列埠
+            # 操作大機率拋例外，且 _run() 例外處理排的 root.after(0, ...)
+            # 這時 root 可能已經 destroy()，會在背景執行緒炸出未接住的例外
+            # （architect 審查抓到的問題）。
+            self._active_scanner.request_stop()
         if self.ctrl.connected:
             self.ctrl.stop()
             self.ctrl.disconnect()

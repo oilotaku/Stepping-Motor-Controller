@@ -271,6 +271,14 @@ class FiberAlignmentScanner:
         self.samples: List[Sample] = []
         self._stop_event = threading.Event()
         self._noise_sigma: Optional[float] = None  # 校準後才有值，見 calibrate_noise()
+        # run() 內部把所有中止事件（使用者停止／EMS／無訊號判定）都用
+        # ScanAbort 自己接住、正常 return——呼叫端如果只看 run() 的回傳值
+        # 或例外，完全無法分辨「真的收斂完成」跟「中途被中止」。這個屬性
+        # 在 run() 正常返回後仍然可以讀到中止原因（None＝真的完成），供
+        # main_ai.py 這類需要分級呈現結果的呼叫端使用，不需要重新設計
+        # run() 既有的例外吞併行為（那是刻意的：中止是正常結束路徑，不該
+        # 讓呼叫端還要自己包 try/except 分辨語意）。
+        self.last_abort_reason: Optional[str] = None
         # 階段二開始時記下 samples 的長度，_estimate_gradient 只從這個
         # 索引之後取鄰居——見該方法 docstring 說明為什麼不能用階段一的
         # 歷史樣本。
@@ -304,6 +312,7 @@ class FiberAlignmentScanner:
             raise ScanAbort("已有搜尋在進行中")
 
         self.ctrl.scanning_active = True
+        self.last_abort_reason = None  # 重置：這個實例若被重複呼叫 run()，不能沿用上一輪的中止原因
         completed = False
         try:
             self._check_abort()
@@ -318,6 +327,7 @@ class FiberAlignmentScanner:
             self.run_stage3()
             completed = True
         except ScanAbort as e:
+            self.last_abort_reason = str(e)
             self._log(f"搜尋中止：{e}")
         finally:
             self.ctrl.scanning_active = False
