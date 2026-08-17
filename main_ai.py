@@ -38,6 +38,20 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
 from meter_GPIB import HP8153APowerMeter
+from fiber_scanner import FiberAlignmentScanner, ScanAbort
+
+# matplotlib 是尋光分頁的即時軌跡圖用的，非本程式核心相依（序列通訊與其餘
+# 分頁完全不需要它）。優雅降級：裝不到就停用尋光分頁，不影響其他功能。
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    _MATPLOTLIB_AVAILABLE = True
+    _MATPLOTLIB_IMPORT_ERROR = None
+except ImportError as e:
+    _MATPLOTLIB_AVAILABLE = False
+    _MATPLOTLIB_IMPORT_ERROR = str(e)
 
 # =============================================================================
 # 執行期目錄與 LOG 系統
@@ -67,6 +81,9 @@ DATA_DIR = _BASE_DIR / "data"  # 實驗數據 CSV 輸出目錄
 # init_runtime() 在 main() 裡建立——見該函式的說明。
 logger = logging.getLogger("DS102")
 log_filename: Optional[Path] = None
+
+if not _MATPLOTLIB_AVAILABLE:
+    logger.warning(f"matplotlib 不可用，尋光分頁停用: {_MATPLOTLIB_IMPORT_ERROR}")
 
 
 def init_runtime() -> Tuple[bool, str]:
@@ -217,6 +234,25 @@ def _save_meter_config(data: dict, log=None) -> None:
     )
 
 
+def _load_scanner_config(log=None) -> dict:
+    """讀取尋光演算法設定（速度/安全判準等跨次搜尋穩定的參數）。找不到或壞檔都回空字典。"""
+    p = RECORDING_DIR / "scanner_config.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        (log or _log_level_adapter)("ERROR", f"scanner_config.json 讀取失敗: {e}")
+        return {}
+
+
+def _save_scanner_config(data: dict, log=None) -> None:
+    """整份覆寫尋光演算法設定。欄位皆為純量值，不需要 teaching_points 那種拒寫保護。"""
+    _write_json_with_backup(
+        RECORDING_DIR / "scanner_config.json", data, log=log or _log_level_adapter
+    )
+
+
 # =============================================================================
 # 常數定義
 # =============================================================================
@@ -291,7 +327,13 @@ CONFIG_FILE = "controller_config.json"
 # RECORDING_DIR 底下「不是行程檔」的 json——載入錄製清單時要跳過它們。
 # 新增任何設定檔都要記得加進來。
 NON_RECORDING_JSON = frozenset(
-    {"teaching_points.json", "speed_profiles.json", CONFIG_FILE, "meter_config.json"}
+    {
+        "teaching_points.json",
+        "speed_profiles.json",
+        CONFIG_FILE,
+        "meter_config.json",
+        "scanner_config.json",
+    }
 )
 # GUI LOG 文字框保留的最大行數，超過就從頭截掉。
 LOG_TEXT_MAX_LINES = 2000
@@ -2145,6 +2187,15 @@ class DS102GUI:
         self.ctrl.set_alarm_callback(self._on_alarm)
         self.ctrl.set_power_reader(self._get_last_pm_value)
 
+        # ── 尋光（FiberAlignmentScanner，今天稍早完成的訊號有效性判準已驗證過）──
+        self._scanning = threading.Event()  # GUI 層忙碌旗標，比照 self._homing 的既有模式
+        self._active_scanner: Optional["FiberAlignmentScanner"] = None
+        self._scan_axis_step_vars = {}  # {軸名: tk.StringVar}，_build_tab_scan 建立分頁時才會實際填入
+        self._scan_stage2_var = tk.BooleanVar(value=False)
+        self._scan_status_var = tk.StringVar(value="尚未開始")
+        self._scan_elapsed_var = tk.StringVar(value="00:00")
+        self._scan_start_time = 0.0
+
         # ── 光功率計（HP 8153A，獨立於 DS102 連線）──
         self.meter: Optional[HP8153APowerMeter] = None
         self._pm_auto_poll = tk.BooleanVar(value=False)
@@ -2523,6 +2574,7 @@ class DS102GUI:
             ("Teaching", self._build_tab_points),
             ("行程錄製", self._build_tab_recording),
             ("光功率", self._build_tab_power),
+            ("尋光", self._build_tab_scan),
             ("LOG", self._build_tab_log),
         ]:
             f = ttk.Frame(self._nb)
@@ -4259,6 +4311,132 @@ class DS102GUI:
         self._pm_apply_range_btn.pack(side="left")
 
     # =========================================================================
+    # TAB：尋光（FiberAlignmentScanner，第一階段骨架——只求路徑正確，
+    # 版面／即時圖留給下一階段）
+    # =========================================================================
+    def _build_tab_scan(self, parent):
+        if not _MATPLOTLIB_AVAILABLE:
+            tk.Label(
+                parent,
+                text=f"尋光功能需要 matplotlib，目前未安裝，此分頁不可用。\n"
+                     f"（{_MATPLOTLIB_IMPORT_ERROR}）\n"
+                     f"請執行：venv\\Scripts\\python.exe -m pip install matplotlib",
+                fg=CLR_WARN, bg=CLR_BG, justify="left",
+            ).pack(padx=20, pady=20)
+            return
+
+        frame = tk.Frame(parent, bg=CLR_BG)
+        frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+        for ax in ("X", "Y", "Z"):
+            row = tk.Frame(frame, bg=CLR_BG)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=f"起始步長 {ax}:", bg=CLR_BG, fg=CLR_TEXT, width=14, anchor="w").pack(side="left")
+            var = tk.StringVar(value="64")
+            self._scan_axis_step_vars[ax] = var
+            ttk.Entry(row, textvariable=var, width=10).pack(side="left")
+
+        ttk.Checkbutton(frame, text="啟用階段二局部精修", variable=self._scan_stage2_var).pack(anchor="w", pady=(6, 10))
+
+        btn_row = tk.Frame(frame, bg=CLR_BG)
+        btn_row.pack(fill="x", pady=6)
+        self._scan_start_btn = ttk.Button(btn_row, text="▶ 開始尋光", style="Accent.TButton", command=self._do_start_scan)
+        self._scan_start_btn.pack(side="left", padx=4)
+        self._scan_stop_btn = ttk.Button(btn_row, text="■ 停止尋光", style="Danger.TButton", command=self._do_stop_scan, state="disabled")
+        self._scan_stop_btn.pack(side="left", padx=4)
+
+        tk.Label(frame, textvariable=self._scan_status_var, bg=CLR_BG, fg=CLR_TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(10, 2))
+        tk.Label(frame, textvariable=self._scan_elapsed_var, bg=CLR_BG, fg=CLR_MUTED).pack(anchor="w")
+
+    def _do_start_scan(self):
+        if not self.ctrl.connected:
+            self._flash_banner("尋光需要先連線 DS102")
+            return
+        if self.meter is None:
+            self._flash_banner("尋光需要先連線光功率計")
+            return
+        if self.ctrl.scanning_active or self._scanning.is_set():
+            self._flash_banner("已有搜尋在進行中")
+            return
+
+        # 這階段先跳最簡陋的確認視窗，下一階段補完整文案
+        if not messagebox.askyesno(
+            "確認開始尋光",
+            "即將開始自動尋光，滑台會依演算法自主移動並持續量測光功率。\n\n"
+            "⚠ 尋光不保證找到訊號。開始前請確認光纖已初步耦合、光功率計讀值正常。\n\n"
+            "確定要開始嗎？",
+            icon="warning", default="no",
+        ):
+            return
+
+        self._scanning.set()  # 早於執行緒啟動，避免 _update_stat_ui 的窗口期把按鈕解鎖
+        self._scan_start_btn.config(state="disabled")
+        self._scan_stop_btn.config(state="normal")
+        self._scan_status_var.set("初始化中…")
+        self._scan_start_time = time.time()
+
+        initial_step = {}
+        for ax, var in self._scan_axis_step_vars.items():
+            try:
+                initial_step[ax] = int(var.get())
+            except ValueError:
+                initial_step[ax] = 64
+        # 必須在主執行緒讀出來存進區域變數——tkinter Variable.get() 不可從
+        # 背景執行緒呼叫（Python 3.14 的 tkinter 會直接丟
+        # RuntimeError: main thread is not in main loop，2026-08-17 實測
+        # 踩到），下面的 _run() 跑在背景執行緒，不能在裡面呼叫
+        # self._scan_stage2_var.get()。
+        enable_stage2 = self._scan_stage2_var.get()
+
+        def _progress(msg):
+            self.root.after(0, lambda: self._scan_status_var.set(msg))
+            self.ctrl._log("INFO", f"[尋光] {msg}")
+
+        scanner = FiberAlignmentScanner(
+            self.ctrl, self._scanner_power_query,
+            progress_cb=_progress,
+        )
+        self._active_scanner = scanner
+
+        def _run():
+            try:
+                result = scanner.run(initial_step=initial_step, enable_stage2=enable_stage2)
+                self.root.after(0, lambda: self._on_scan_done(ok=True, result=result, err=None))
+            except ScanAbort as e:
+                # ⚠ `except X as e` 的 e 會在 except 區塊結束時被自動 del，
+                # 而 root.after(0, ...) 是非同步排程、lambda 真正執行時區塊
+                # 早已結束——直接在 lambda 裡引用 e 會是 NameError。
+                # 先把訊息轉成字串存進區域變數，讓 lambda 捕捉的是它而非 e。
+                err_msg = str(e)
+                self.root.after(0, lambda: self._on_scan_done(ok=False, result=None, err=err_msg))
+            except Exception as e:
+                logger.exception("尋光執行緒發生未預期例外")
+                err_msg = f"未預期例外: {e}"
+                self.root.after(0, lambda: self._on_scan_done(ok=False, result=None, err=err_msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _do_stop_scan(self):
+        if self.ctrl.connected:
+            self.ctrl.stop()
+        if self._active_scanner is not None:
+            self._active_scanner.request_stop()
+        self._scan_status_var.set("停止中…")
+        self._scan_stop_btn.config(state="disabled")
+
+    def _on_scan_done(self, ok: bool, result, err):
+        self._scanning.clear()
+        self._active_scanner = None
+        self._scan_start_btn.config(state="normal")
+        self._scan_stop_btn.config(state="disabled")
+        if ok:
+            self._scan_status_var.set(f"完成 — 最終座標 {result}")
+            self._flash_banner(f"✔ 尋光完成 — {result}")
+        else:
+            self._scan_status_var.set(f"已結束（{err}）")
+            self._flash_banner(f"■ 尋光已結束：{err}")
+
+    # =========================================================================
     # TAB：LOG
     # =========================================================================
     def _build_tab_log(self, parent):
@@ -4816,6 +4994,23 @@ class DS102GUI:
             return None
         return self._pm_last_value
 
+    def _scanner_power_query(self) -> Tuple[bool, float]:
+        """
+        每次呼叫都重新讀 self.meter（連線後物件可能被整個換掉，不可快取
+        bound method）。這裡的 try/except 防的是 self.meter 在讀取瞬間與
+        呼叫 get_power() 之間被另一執行緒設成 None 的競態（例如尋光進行中
+        使用者手動按了光功率計的「中斷」），以及 get_power() 內部只接住
+        VisaIOError/ValueError、未涵蓋的其他例外類型。
+        """
+        meter = self.meter
+        if meter is None:
+            return False, 0.0
+        try:
+            return meter.get_power()
+        except Exception as e:
+            logger.debug(f"尋光讀取光功率例外: {e}")
+            return False, 0.0
+
     def _pm_update_age_label(self):
         if self.meter is None or self._pm_last_ok_time <= 0:
             self._pm_age_var.set("—")
@@ -5298,7 +5493,7 @@ class DS102GUI:
         # 所以 _do_home_all 剛鎖上的按鈕會在 100ms 後全部復活——包含那顆
         # 文字還停在「🏠 復歸中…」的按鈕，再按一次就疊出第二條復歸執行緒。
         # 任何新增的「作業進行中」狀態都必須同步加進這個判斷。
-        busy = self.ctrl.playback_running or self._homing.is_set()
+        busy = self.ctrl.playback_running or self._homing.is_set() or self._scanning.is_set()
         if busy:
             self._set_drive_buttons_state("disabled")
         elif self.ctrl.connected and not self.ctrl.ems_active:
@@ -5370,6 +5565,9 @@ class DS102GUI:
                 for sb in self._status_bars:
                     sb.update_coords()
                 self._update_stat_ui()
+                if self._scanning.is_set():
+                    elapsed = int(time.time() - self._scan_start_time)
+                    self._scan_elapsed_var.set(f"{elapsed // 60:02d}:{elapsed % 60:02d}")
             except tk.TclError:
                 return  # widget 已被銷毀（關閉流程中），安靜收工
             self.root.after(UI_REDRAW_INTERVAL, _poll)
