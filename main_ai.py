@@ -4439,6 +4439,22 @@ class DS102GUI:
         tk.Label(
             toolbar, textvariable=self._scan_elapsed_var, bg=CLR_CARD, fg=CLR_TEXT, font=("Consolas", 10, "bold")
         ).pack(side="left")
+        self._scan_toolbar = toolbar  # _show_scan_no_signal_notice 定位用（插在頂端操作列之後）
+
+        # ── 無訊號中止的常駐提示列：狀態驅動、需使用者主動關閉，跟
+        # _pm_scan_notice（尋光進行中、跟著 scanning_active 自動收放）不是
+        # 同一種東西——這條顯示後留著，直到按「知道了」才收起，避免使用者
+        # 沒注意到搜尋已經無訊號中止。預設不 pack，見 _show/_hide_scan_no_signal_notice。
+        self._scan_no_signal_notice = tk.Frame(parent, bg=CLR_WARN)
+        self._scan_no_signal_notice_label = tk.Label(
+            self._scan_no_signal_notice, text="", bg=CLR_WARN, fg="white",
+            font=("Segoe UI", 9, "bold"), anchor="w", padx=10, pady=6,
+        )
+        self._scan_no_signal_notice_label.pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            self._scan_no_signal_notice, text="知道了", style="Flat.TButton",
+            command=self._hide_scan_no_signal_notice,
+        ).pack(side="right", padx=10)
 
         # ── 中間主體：左右分欄 ──
         body = tk.Frame(parent, bg=CLR_BG)
@@ -5032,6 +5048,9 @@ class DS102GUI:
         self._scan_status_var.set("初始化中…")
         self._scan_start_time = time.time()
         self._scan_plot_reset()  # 清掉上一輪殘留的軌跡與數值摘要
+        # 上一輪如果是無訊號中止、使用者還沒按「知道了」就直接開始下一輪，
+        # 這條常駐提示不該繼續掛著誤導這一輪的狀態。
+        self._hide_scan_no_signal_notice()
 
         initial_step = {}
         for ax, var in self._scan_axis_step_vars.items():
@@ -5137,18 +5156,30 @@ class DS102GUI:
         def _run():
             try:
                 result = scanner.run(initial_step=initial_step, enable_stage2=enable_stage2, **run_kwargs)
-                self.root.after(0, lambda: self._on_scan_done(ok=True, result=result, err=None))
+                self.root.after(0, lambda: self._on_scan_done(kind="completed", result=result, err=None))
             except ScanAbort as e:
                 # ⚠ `except X as e` 的 e 會在 except 區塊結束時被自動 del，
                 # 而 root.after(0, ...) 是非同步排程、lambda 真正執行時區塊
                 # 早已結束——直接在 lambda 裡引用 e 會是 NameError。
                 # 先把訊息轉成字串存進區域變數，讓 lambda 捕捉的是它而非 e。
                 err_msg = str(e)
-                self.root.after(0, lambda: self._on_scan_done(ok=False, result=None, err=err_msg))
+                # 三則字面量核對於 fiber_scanner.py：_check_abort() 的
+                # 「使用者中止搜尋」「EMS 觸發，搜尋中止」逐字相符（完整比對，
+                # 這兩則本身就是完整訊息，不是某段長訊息的子字串）；
+                # 「沒有偵測到高於雜訊的訊號」是 _check_signal_detectable()
+                # 拋出的長訊息「研判整個探測範圍內沒有偵測到高於雜訊的
+                # 訊號——請確認…」裡的子字串，故用 in 判斷而非全等。
+                if err_msg in ("使用者中止搜尋", "EMS 觸發，搜尋中止"):
+                    kind = "user_stopped"
+                elif "沒有偵測到高於雜訊的訊號" in err_msg:
+                    kind = "no_signal"
+                else:
+                    kind = "aborted_other"
+                self.root.after(0, lambda: self._on_scan_done(kind=kind, result=None, err=err_msg))
             except Exception as e:
                 logger.exception("尋光執行緒發生未預期例外")
                 err_msg = f"未預期例外: {e}"
-                self.root.after(0, lambda: self._on_scan_done(ok=False, result=None, err=err_msg))
+                self.root.after(0, lambda: self._on_scan_done(kind="exception", result=None, err=err_msg))
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -5160,21 +5191,79 @@ class DS102GUI:
         self._scan_status_var.set("停止中…")
         self._scan_stop_btn.config(state="disabled")
 
-    def _on_scan_done(self, ok: bool, result, err):
+    def _on_scan_done(self, kind: str, result, err):
         self._scanning.clear()
         self._active_scanner = None
         self._scan_start_btn.config(state="normal")
         self._scan_stop_btn.config(state="disabled")
-        if ok:
+
+        # scanner.run() 內 sample_cb 是同步呼叫，跑到這裡時所有樣本理論上
+        # 早就已經 append 進 _scan_plot_pending——但 _redraw_scan_plot 把
+        # pending 併入 _scan_samples／更新 _scan_sample_count 是靠 250ms
+        # 節奏的 root.after，而這裡的 root.after(0, ...) 有機會搶在下一輪
+        # 節奏之前先執行，導致讀到的 _scan_sample_count 少算最後一批。
+        # 手動跑一次跟 _redraw_scan_plot 一樣的搬移邏輯，確保訊息裡的樣本數
+        # 是這輪真正的最終值。
+        try:
+            with self._scan_plot_lock:
+                pending, self._scan_plot_pending = self._scan_plot_pending, []
+            if pending:
+                self._scan_plot_extend(pending)
+        except tk.TclError:
+            pass  # widget 已被銷毀（關閉流程中），安靜略過，不影響下方狀態文字
+
+        if kind == "completed":
             self._scan_status_var.set(f"完成 — 最終座標 {result}")
-            self._flash_banner(f"✔ 尋光完成 — {result}")
-        else:
+            self._flash_banner(
+                f"✔ 尋光完成 — 最終座標 {result}（共 {self._scan_sample_count} 筆樣本，"
+                f"耗時 {self._scan_elapsed_var.get()}）"
+            )
+        elif kind == "user_stopped":
+            self._scan_status_var.set("已停止（使用者中止）")
+            self._flash_banner(f"■ 已停止尋光（使用者中止）— 已收集 {self._scan_sample_count} 筆樣本")
+        elif kind == "no_signal":
+            self._scan_status_var.set("已中止（未偵測到訊號）")
+            self._show_scan_no_signal_notice(
+                "未偵測到可用訊號，搜尋已中止 — 請確認光纖已耦合、光功率計連線正常後再重試"
+            )
+            self.ctrl._log("WARN", f"[尋光] {err}")
+        else:  # "aborted_other" 或 "exception"
             self._scan_status_var.set(f"已結束（{err}）")
-            self._flash_banner(f"■ 尋光已結束：{err}")
+            messagebox.showerror(
+                "尋光異常結束",
+                f"{err}\n\n滑台可能停在搜尋過程中的任意位置，請確認目前座標與光纖狀態後再繼續操作。",
+            )
+            self.ctrl._log("ERROR", f"[尋光] {err}")
+
         # ctrl.scanning_active 這時已經是 False，靠下一輪 _redraw_scan_plot
         # （250ms 節奏）也會自然收回提示列，但這裡主動呼叫一次讓收尾更
         # 即時，不必讓使用者多等最多一個節奏週期。
         self._pm_sync_scan_notice()
+
+    def _show_scan_no_signal_notice(self, msg: str):
+        """
+        顯示「無訊號中止」常駐提示列。狀態驅動但不跟著 scanning_active
+        自動收回——刻意留著直到使用者按「知道了」，避免搜尋已經因為
+        無訊號中止而使用者沒注意到（跟 _pm_scan_notice 那種「尋光進行中」
+        的自動收放提示不是同一種語意）。
+        """
+        self._scan_no_signal_notice_label.config(text=f"⚠ {msg}")
+        # ⚠ 用 winfo_manager() 而非 winfo_ismapped() 判斷是否已顯示——
+        # winfo_ismapped() 反映的是「目前實際畫在螢幕上」，而這個提示列
+        # 放在「尋光」分頁裡，只要使用者當下切到別的分頁（例如 LOG），
+        # 即使這個 widget 已經 pack() 過，winfo_ismapped() 也會回傳 False
+        # （notebook 沒被選取的分頁，底下的元件在 Tk 眼中就是「沒有映射」）。
+        # 實測驗證過：若用 winfo_ismapped() 當守衛，_hide_scan_no_signal_notice()
+        # 在使用者切到別的分頁時會誤判「本來就沒顯示」而完全不呼叫
+        # pack_forget()，導致這個提示殘留、切回「尋光」分頁時還在。
+        # winfo_manager() 回傳的是幾何管理員名稱（"pack"/""），只反映
+        # pack()/pack_forget() 呼叫過沒有，不受分頁選取狀態影響。
+        if self._scan_no_signal_notice.winfo_manager() == "":
+            self._scan_no_signal_notice.pack(side="top", fill="x", after=self._scan_toolbar)
+
+    def _hide_scan_no_signal_notice(self):
+        if self._scan_no_signal_notice.winfo_manager() != "":
+            self._scan_no_signal_notice.pack_forget()
 
     # =========================================================================
     # TAB：LOG
@@ -5662,7 +5751,19 @@ class DS102GUI:
         """
         scanning = self.ctrl.scanning_active
         notice = self._pm_scan_notice
-        mapped = notice.winfo_ismapped()
+        # ⚠ 用 winfo_manager() 而非 winfo_ismapped() 判斷是否已顯示——這裡
+        # 的節奏來源是 _redraw_scan_plot（250ms），使用者尋光期間通常會
+        # 留在「尋光」分頁盯著圖表看，這代表「光功率」分頁十之八九不是
+        # 當下選取的分頁。winfo_ismapped() 反映的是「目前實際畫在螢幕
+        # 上」，未選取分頁底下的元件永遠回傳 False，即使早就 pack() 過。
+        # 實測驗證過：若用 winfo_ismapped() 當守衛，尋光結束但使用者當下
+        # 不在「光功率」分頁時，這個 elif 分支整段（pack_forget、按鈕
+        # 還原、狀態文字還原）會被誤判成「本來就沒顯示」而完全跳過，
+        # 使用者事後切回「光功率」分頁會看到畫面永遠卡在「尋光中」，
+        # 直到下一次尋光開始又結束、且那次剛好切在這個分頁上才會被動
+        # 修正。winfo_manager() 只反映 pack()/pack_forget() 呼叫過沒有，
+        # 不受分頁選取狀態影響。
+        mapped = notice.winfo_manager() != ""
         if scanning and not mapped:
             notice.pack(fill="x", padx=8, pady=(4, 0), before=self._pm_num_row)
             # 尋光進行中不能讓使用者手動觸發查詢/量程變更跟尋光搶 GPIB——
