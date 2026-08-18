@@ -2,7 +2,7 @@
 
 Windows 桌面應用，用 Python + tkinter 控制 **駿河精機 SURUGA SEIKI DS102 / DS112 步進馬達控制箱**（RS-232C / USB 虛擬 COM 埠），用於光纖對準與光學自動化量測。
 
-長期目標是把滑台與 **HP 8153A 光波萬用表**（GPIB）串起來做自動掃描尋光，目前光功率計的封裝（[meter_GPIB.py](meter_GPIB.py)）尚未與馬達程式整合。
+滑台已與 **HP 8153A 光波萬用表**（GPIB，封裝於 [meter_GPIB.py](meter_GPIB.py)）整合，GUI 內建「光功率」與「尋光」兩個分頁，可執行自動掃描尋光（[fiber_scanner.py](fiber_scanner.py) 的 `FiberAlignmentScanner`）。⚠ 光功率計尚未接上真實儀器驗證過，本機沒有 GPIB 卡可測。
 
 ---
 
@@ -33,6 +33,8 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 | Python | 3.14.4（venv 內） |
 | pyserial | 3.5 |
 | PyVISA | 1.16.2 |
+| matplotlib | 3.11.1（尋光分頁即時軌跡圖用，選用相依，裝不到就停用該分頁，不影響其餘功能） |
+| numpy | 2.5.2（matplotlib 的必要相依） |
 | tkinter | Python 內建，無需安裝 |
 | 控制器連線 | COM 埠 @ 38400 baud（**埠號會變**，靠 VID/PID `0DFD:0002` 認才可靠） |
 
@@ -49,7 +51,9 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 - **速度 Profile** — 命名儲存四參數（L0/F0/R0/S0）快速切換
 - **軟體行程限制** — Python 端限位攔截（與控制器韌體端限位是兩套，見下方注意事項）
 - **控制器設定持久化** — MEMSW 與韌體軟體限位是 RAM-only，斷電即失；存檔後連線時自動補回
-- **實驗數據記錄** — 時間戳 + 各軸位置匯出 CSV
+- **光功率監看** — HP 8153A GPIB 讀值，獨立分頁與浮動視窗
+- **自動尋光** — 座標下降＋K 近鄰局部精修的對準演算法，內建即時軌跡圖
+- **實驗數據記錄** — 時間戳 + 各軸位置（含光功率 dBm）匯出 CSV
 - **LOG** — 分級記錄與匯出
 
 ---
@@ -60,12 +64,15 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 
 | 檔案 | 定位 |
 |---|---|
-| [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，約 4000 行。功能與修正都加在這裡 |
-| [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照。可作對照，**不要在此新增功能** |
+| [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，約 4850 行。GUI 與各分頁邏輯都加在這裡 |
+| [ds102_ctrl.py](ds102_ctrl.py) | `DS102Controller` 本體（2026-08-17 從 main_ai.py 拆出的獨立模組，約 1945 行，完全不碰 tkinter）。🔴 不要跟下面的 `ds102_controller.py` 搞混 |
+| [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照（跟上面的 `ds102_ctrl.py` 是完全不同的兩個檔案）。可作對照，**不要在此新增功能** |
 | [main.py](main.py) | 廠商官方範例，是**指令格式的權威來源**。修改指令前先回頭比對 |
 | [test.py](test.py) | 無 GUI 的連線／狀態查詢腳本。名稱誤導——不是單元測試 |
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
-| [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝，尚未整合 |
+| [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝，已整合進「光功率」／「尋光」分頁，尚未接上真實儀器驗證 |
+| [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`，光纖對準尋光演算法，已接上「尋光」分頁 |
+| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) | 「尋光」／「光功率」分頁的假物件回歸測試（57／66 項，`python verify_scan_tab.py` 直接執行，不需硬體） |
 | [Gtest.py](Gtest.py) | 外部第三方範例，`import control` 的模組不存在於本 repo，**無法執行** |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖。⚠ 其中 DS112 通訊細節（`\r\n`、9600、`!:` 輪詢）**全部是錯的** |
 
@@ -73,13 +80,13 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 
 ## main_ai.py 架構
 
-單檔，嚴格分成三塊：
+邏輯上仍是三塊，但 `DS102Controller` 現在實際定義在獨立檔案 [ds102_ctrl.py](ds102_ctrl.py)：
 
-1. **`DS102Controller`** — 所有序列通訊集中於此，完全不碰 tkinter
-2. **`StatusBar`** — 各分頁共用的座標／連線狀態列
-3. **`DS102GUI`** — 五個分頁（儀表板 / 移動控制 / Teaching / 行程錄製 / LOG），只呼叫 controller 的公開方法
+1. **`DS102Controller`**（`ds102_ctrl.py`）— 所有序列通訊集中於此，完全不碰 tkinter，main_ai.py 用 `from ds102_ctrl import DS102Controller, ...` 引入
+2. **`StatusBar`**（main_ai.py）— 各分頁共用的座標／連線狀態列
+3. **`DS102GUI`**（main_ai.py）— 七個分頁（儀表板 / 移動控制 / Teaching / 行程錄製 / 光功率 / 尋光 / LOG），只呼叫 controller 的公開方法
 
-四條輪詢迴圈各司其職：
+六條輪詢迴圈各司其職：
 
 | 迴圈 | 執行緒 | 節奏 | 職責 |
 |---|---|---|---|
@@ -87,6 +94,8 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 | `_start_position_worker()` | 背景 | 0.5s | 對各軸送 `POS?` 回寫位置 |
 | `_poll_status()` | 背景 | 100ms | 移動中追蹤選取軸的狀態 |
 | `_watch_jog_limit()` | 背景 | 0.06s | 長按點動時監看軟體限位 |
+| `_start_meter_poll_worker()` | 背景 | 0.5s | 光功率背景輪詢（GPIB，與序列埠通訊無關） |
+| `_redraw_scan_plot()` | Tk 主執行緒 | 250ms | 只重繪尋光即時軌跡圖，不觸發量測或移動 |
 
 ---
 
@@ -107,7 +116,8 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 - 任何**會阻塞的序列操作**必須在背景執行緒；背景執行緒**絕不可直接碰 tkinter widget**，一律 `root.after(0, ...)` 回主執行緒。
 - 序列埠交易受 `_serial_lock` 保護，一次 TX→RX 不可分割。`stop()` 與 `emergency_stop()` 刻意不受此限，避免等鎖延遲停止。
 - `limit_direction()` 比對方向字串時**必須先判斷 `"CCW"`**——`"CCW"` 本身就含有 `"CW"`。
-- 設定檔是整份寫回，沒先 `load_*()` 就 `save` 會清空既有內容（已發生過兩次）。一律走 `_write_json_with_backup()`。
+- 設定檔是整份寫回，沒先 `load_*()` 就 `save` 會清空既有內容（已發生過兩次，現已修正）。一律走 `_write_json_with_backup()`。
+- `app_settings.json`（UI 節奏／色票）與 `safety_settings.json`（`WAIT_TIMEOUT`／`STOP_LOCK_TIMEOUT` 等安全相關時序常數）是另一類設定檔：維護人員手動編輯、程式只讀不寫，不重編就能調參數。兩者刻意分開機制——後者驗證更嚴格（型別+範圍雙重檢查），改壞一律拒絕退回內建預設值，不做 clamp。
 
 ---
 
@@ -118,7 +128,7 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 | 路徑 | 內容 |
 |---|---|
 | `logs/` | 每次啟動一個檔；關閉時另存 `*_history.txt` |
-| `recordings/` | 錄製的行程；同目錄的 `teaching_points.json`、`speed_profiles.json`、`controller_config.json` 是設定檔 |
+| `recordings/` | 錄製的行程；同目錄的 `teaching_points.json`、`speed_profiles.json`、`controller_config.json`、`meter_config.json`、`scanner_config.json`、`app_settings.json`、`safety_settings.json` 是設定檔 |
 | `data/` | 實驗數據 CSV |
 
 ---
@@ -131,10 +141,13 @@ venv 內已裝 `pyinstaller` 與 `auto-py-to-exe`。
 venv/Scripts/pyinstaller.exe --onedir --windowed --name DS102 main_ai.py
 ```
 
+🔴 **2026-08-17 已實際打包驗證過一次**：build 乾淨完成（matplotlib TkAgg backend 自動偵測），產出約 152MB，`DS102.exe` 能正常啟動、存活，在自己目錄下建出 `logs/`/`recordings/`/`data/`。**沒有實測連硬體**（GPIB／序列埠），那部分仍待驗證。
+
 - **用 `--onedir` 而非 `--onefile`** — 未簽章的 onefile exe 會自解壓縮到 temp，行為特徵與 packer 相同，是防毒誤判的典型目標；這台機器的 SentinelOne 有前科（見 [DRIVER_ISSUE_REPORT.md](DRIVER_ISSUE_REPORT.md)）。onedir 也省掉每次啟動的解壓時間。
 - **程式必須放在有寫入權限的位置**（桌面、`D:\` 等），不要放 `Program Files`——它需要在自己的目錄下建 `logs/` `recordings/` `data/`。權限不足時會跳錯誤視窗說明，不會無聲關閉。
 - 不需要把 `ds102 (2).pdf` 或驅動資料夾打包進去，執行期用不到。
 - 沒有單一實例保護：兩個 exe 同時執行會搶同一個 COM 埠。
+- `DS102Controller` 拆到獨立檔案 `ds102_ctrl.py` 後仍是靜態 `from ds102_ctrl import ...`（同目錄 sibling import，跟 `fiber_scanner.py`／`meter_GPIB.py` 的匯入方式一樣），PyInstaller 能自動收進去，不需要額外的 hidden-import 宣告。
 
 ---
 
