@@ -106,6 +106,99 @@ def _write_json_with_backup(path: Path, data: dict, log=None) -> None:
 
 
 # =============================================================================
+# JSON 設定檔讀取骨架（共用）
+#
+# app_settings / safety_settings（本檔）與 meter_config / scanner_config
+# （main_ai.py）四份讀取函式原本逐字重複同一套骨架：exists 檢查 →
+# read_text → json.loads → except (OSError, JSONDecodeError) →
+# isinstance(dict) 檢查 → 回傳 data。2026-08-18 依 architect 評估抽成
+# 這支共用函式（純函式抽取、四個呼叫點都只在啟動時各跑一次，風險低）。
+#
+# 四者的差異——訊息文字、log 等級（ERROR vs INFO）、「不存在」與「成功」
+# 兩種情況要不要記錄、用 log 回呼還是模組 logger——全部靠參數重現，
+# 刻意不「平均化」：這是純粹的行為保留重構，不能改變任何一個呼叫點的
+# 可觀察行為（log 文字、log 等級、回傳值都要與重構前逐字相同）。
+# =============================================================================
+def _log_level_adapter(level: str, msg: str) -> None:
+    """
+    `_load_json_settings()` 在呼叫端沒提供 `log` 回呼時使用的預設轉接。
+
+    與 main_ai.py 的同名函式邏輯一致（那邊給 `_load_meter_config`／
+    `_load_scanner_config` 用），這裡單獨放一份是因為 ds102_ctrl.py
+    不能反過來 import main_ai.py（會造成循環相依）。
+    `_load_app_settings`／`_load_safety_settings` 一律是 INFO 等級，
+    實務上只會走到 `logger.info` 這一支，但保留完整對應表是為了讓
+    `_load_json_settings` 作為通用骨架時行為一致、不必依賴呼叫端。
+    """
+    getattr(
+        logger,
+        {"ERROR": "error", "WARN": "warning", "DEBUG": "debug"}.get(level, "info"),
+    )(msg)
+
+
+def _load_json_settings(
+    path: Path,
+    label: str,
+    log=None,
+    error_level: str = "INFO",
+    not_found_msg: Optional[str] = None,
+    fail_msg: str = "{label} 讀取失敗: {error}",
+    invalid_type_msg: str = "{label} 格式不符（預期物件，實際 {type}），已忽略",
+    success_msg: Optional[str] = None,
+) -> dict:
+    """
+    共用的 JSON 設定檔讀取骨架。找不到檔案、壞檔、頂層非 dict 一律回傳
+    空字典，不中止呼叫端載入流程（呼叫端自行決定退回哪個預設值）。
+
+    參數（預設值對齊 meter_config／scanner_config 現有「安靜」行為，
+    app_settings／safety_settings 呼叫時逐一覆寫成各自的「詳細」行為）：
+      - path / label：設定檔路徑，以及訊息裡要嵌入的檔名標籤
+        （樣板字串用 `{label}` 佔位）。
+      - log：`(level, msg) -> None` 回呼。未提供時用上面的
+        `_log_level_adapter` 轉呼模組層級 `logger`。
+      - error_level：讀取失敗／型別不符時的 log 等級。
+        app_settings／safety_settings 固定 INFO（沿用此預設值不覆寫），
+        meter_config／scanner_config 呼叫時覆寫成 ERROR。
+      - not_found_msg：檔案不存在時要記錄的訊息樣板（可用 `{label}`
+        佔位）；預設 `None` 表示不記錄——這是 meter_config／
+        scanner_config 的既有行為。app_settings／safety_settings
+        呼叫時傳入各自的樣板字串。
+      - fail_msg：讀取失敗（OSError/JSONDecodeError）時的訊息樣板
+        （可用 `{label}`／`{error}` 佔位），預設值對齊 meter_config／
+        scanner_config 現有文字。
+      - invalid_type_msg：頂層非 dict 時的訊息樣板（可用 `{label}`／
+        `{type}` 佔位），預設值同上對齊 meter_config／scanner_config。
+      - success_msg：成功讀到內容時要記錄的訊息樣板（可用 `{label}`／
+        `{n}` 佔位）；預設 `None` 表示不記錄——同樣是 meter_config／
+        scanner_config 的既有行為。
+    """
+    emit = log or _log_level_adapter
+
+    if not path.exists():
+        if not_found_msg is not None:
+            emit("INFO", not_found_msg.format(label=label))
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        emit(error_level, fail_msg.format(label=label, error=e))
+        return {}
+    if not isinstance(data, dict):
+        # 合法 JSON 但頂層不是物件（例如被誤存成 [] / 字串 / 數字）不會讓
+        # json.loads() 拋例外，若照樣回傳出去，呼叫端當成 dict 呼叫 .get()
+        # 會直接 AttributeError，在還沒有任何視窗顯示出來之前就讓程式崩潰
+        # （architect 審查抓到的問題，四份原始函式都各自有這段防護）。
+        emit(
+            error_level,
+            invalid_type_msg.format(label=label, type=type(data).__name__),
+        )
+        return {}
+    if success_msg is not None:
+        emit("INFO", success_msg.format(label=label, n=len(data)))
+    return data
+
+
+# =============================================================================
 # UI 節奏／顯示上限與色票設定（app_settings.json）
 #
 # 邏輯上是「給維護人員手動編輯的 UI 靜態設定」（main_ai.py 的 CLR_* 色票、
@@ -134,26 +227,14 @@ def _load_app_settings() -> dict:
     預設值——不是整份退回、也不是報錯中止。這些值沒有安全含意，
     只記 INFO 不需要 WARN。
     """
-    p = RECORDING_DIR / "app_settings.json"
-    if not p.exists():
-        logger.info("app_settings.json 不存在，UI 節奏／色票全部使用內建預設值")
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.info(f"app_settings.json 讀取失敗，改用內建預設值: {e}")
-        return {}
-    if not isinstance(data, dict):
-        # 同 _load_meter_config／_load_scanner_config：合法 JSON 但頂層
-        # 不是物件（例如被誤存成 [] / 字串 / 數字）時 json.loads() 不會
-        # 拋例外，若照樣回傳出去，下面逐欄 `.get()` 的呼叫會直接
-        # AttributeError，在任何視窗顯示出來之前就讓整個模組載入失敗。
-        logger.info(
-            f"app_settings.json 格式不符（預期物件，實際 {type(data).__name__}），改用內建預設值"
-        )
-        return {}
-    logger.info(f"app_settings.json 已載入，{len(data)} 個欄位可能覆寫內建預設值")
-    return data
+    return _load_json_settings(
+        RECORDING_DIR / "app_settings.json",
+        "app_settings.json",
+        not_found_msg="{label} 不存在，UI 節奏／色票全部使用內建預設值",
+        fail_msg="{label} 讀取失敗，改用內建預設值: {error}",
+        invalid_type_msg="{label} 格式不符（預期物件，實際 {type}），改用內建預設值",
+        success_msg="{label} 已載入，{n} 個欄位可能覆寫內建預設值",
+    )
 
 
 def _app_setting_num(settings: dict, key: str, default, cast):
@@ -201,25 +282,14 @@ def _load_safety_settings() -> dict:
     非 dict 都回傳空字典、不中止載入），但這是獨立的檔案與獨立的函式，
     理由見上方區塊註解：安全常數不與 UI 節奏／色票共用同一份檔案。
     """
-    p = RECORDING_DIR / "safety_settings.json"
-    if not p.exists():
-        logger.info("safety_settings.json 不存在，安全相關常數全部使用內建預設值")
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.info(f"safety_settings.json 讀取失敗，改用內建預設值: {e}")
-        return {}
-    if not isinstance(data, dict):
-        # 合法 JSON 但頂層不是物件（例如被誤存成 [] / 字串 / 數字）時
-        # json.loads() 不會拋例外，若照樣回傳出去，下面逐欄檢查會直接
-        # 出錯，在任何視窗顯示出來之前就讓整個模組載入失敗。
-        logger.info(
-            f"safety_settings.json 格式不符（預期物件，實際 {type(data).__name__}），改用內建預設值"
-        )
-        return {}
-    logger.info(f"safety_settings.json 已載入，{len(data)} 個欄位可能覆寫內建預設值")
-    return data
+    return _load_json_settings(
+        RECORDING_DIR / "safety_settings.json",
+        "safety_settings.json",
+        not_found_msg="{label} 不存在，安全相關常數全部使用內建預設值",
+        fail_msg="{label} 讀取失敗，改用內建預設值: {error}",
+        invalid_type_msg="{label} 格式不符（預期物件，實際 {type}），改用內建預設值",
+        success_msg="{label} 已載入，{n} 個欄位可能覆寫內建預設值",
+    )
 
 
 def _safety_setting_num(settings: dict, key: str, default, cast, min_val, max_val):

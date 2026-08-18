@@ -29,7 +29,6 @@ import serial.tools.list_ports
 import sys
 import threading
 import time
-import json
 import logging
 import math
 import re
@@ -68,6 +67,7 @@ from ds102_ctrl import (
     NON_RECORDING_JSON,
     logger,
     _write_json_with_backup,
+    _load_json_settings,
     _app_settings,
     _app_setting_num,
     _safety_setting_rejections,
@@ -188,24 +188,12 @@ def _load_meter_config(log=None) -> dict:
     讀取失敗才會同時進 GUI 的 LOG 分頁與匯出的歷程檔，而不只是寫進 log 檔。
     不傳則退回只寫模組 logger（例如測試腳本直接呼叫，沒有 GUI 可用）。
     """
-    p = RECORDING_DIR / "meter_config.json"
-    if not p.exists():
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        (log or _log_level_adapter)("ERROR", f"meter_config.json 讀取失敗: {e}")
-        return {}
-    if not isinstance(data, dict):
-        # 合法 JSON 但頂層不是物件（例如被誤存成 [] / 字串 / 數字）不會讓
-        # json.loads() 拋例外，若照樣回傳出去，呼叫端當成 dict 呼叫 .get()
-        # 會直接 AttributeError，在還沒有任何視窗顯示出來之前就讓整個
-        # DS102GUI.__init__ 崩潰（architect 審查抓到的問題）。
-        (log or _log_level_adapter)(
-            "ERROR", f"meter_config.json 格式不符（預期物件，實際 {type(data).__name__}），已忽略"
-        )
-        return {}
-    return data
+    return _load_json_settings(
+        RECORDING_DIR / "meter_config.json",
+        "meter_config.json",
+        log=log or _log_level_adapter,
+        error_level="ERROR",
+    )
 
 
 def _save_meter_config(data: dict, log=None) -> None:
@@ -225,23 +213,12 @@ def _save_meter_config(data: dict, log=None) -> None:
 
 def _load_scanner_config(log=None) -> dict:
     """讀取尋光演算法設定（速度/安全判準等跨次搜尋穩定的參數）。找不到或壞檔都回空字典。"""
-    p = RECORDING_DIR / "scanner_config.json"
-    if not p.exists():
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        (log or _log_level_adapter)("ERROR", f"scanner_config.json 讀取失敗: {e}")
-        return {}
-    if not isinstance(data, dict):
-        # 同 _load_meter_config：合法 JSON 但頂層不是物件時，json.loads()
-        # 不會拋例外，若照樣回傳，_build_tab_scan 呼叫 cfg.get(...) 會直接
-        # AttributeError，在任何視窗顯示出來之前讓整個 GUI 崩潰。
-        (log or _log_level_adapter)(
-            "ERROR", f"scanner_config.json 格式不符（預期物件，實際 {type(data).__name__}），已忽略"
-        )
-        return {}
-    return data
+    return _load_json_settings(
+        RECORDING_DIR / "scanner_config.json",
+        "scanner_config.json",
+        log=log or _log_level_adapter,
+        error_level="ERROR",
+    )
 
 
 def _save_scanner_config(data: dict, log=None) -> None:
