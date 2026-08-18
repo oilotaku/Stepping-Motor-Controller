@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Windows 桌面應用，用 Python + tkinter 控制 **駿河精機 SURUGA SEIKI DS102 / DS112 步進馬達控制箱**（RS-232C / USB 虛擬 COM 埠），用於光纖對準與光學自動化量測。長期目標（見 [step-motor.txt](step-motor.txt)）是把滑台與 **HP 8153A 光波萬用表**（GPIB）串起來做自動掃描尋光。
 
-沒有測試套件、沒有 CI、沒有套件化結構——全部是可直接執行的頂層腳本。
+沒有 pytest／CI、沒有套件化結構——全部是可直接執行的頂層腳本。有兩支非正式的回歸測試腳本（`verify_scan_tab.py`、`verify_meter_panel.py`，見下方〈常用指令〉），用假物件跑 GUI 邏輯，不是標準測試框架。
 
 ## 常用指令
 
@@ -21,6 +21,8 @@ venv/Scripts/python.exe probe_ds102.py --list            # 只列埠，不送任
 venv/Scripts/python.exe -m serial.tools.list_ports -v    # 原始序列埠清單
 venv/Scripts/python.exe -m pip install -r requirements.txt
 venv/Scripts/python.exe -m ruff check .                  # ruff 未列於 requirements.txt，需另行安裝
+venv/Scripts/python.exe verify_scan_tab.py                # 「尋光」分頁假物件回歸測試（57 項，不需硬體）
+venv/Scripts/python.exe verify_meter_panel.py              # 「光功率」分頁假物件回歸測試（66 項，不需硬體）
 ```
 
 VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch 設定，見 [.vscode/](.vscode/)。
@@ -38,23 +40,29 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | 檔案 | 定位 |
 |---|---|
 | [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，功能與修正都加在這裡 |
-| [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照（約 1970 行）。已進版控，可作為對照，但**不要在此新增功能** |
+| [ds102_ctrl.py](ds102_ctrl.py) | 🔴 **不要跟下面的 `ds102_controller.py` 搞混**——這是 2026-08-17 從 main_ai.py 拆出來的 `DS102Controller` 本體（現役程式碼，約 1945 行），main_ai.py 用 `from ds102_ctrl import DS102Controller, ...` 引入。細節見下方〈main_ai.py 架構〉 |
+| [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照（約 1970 行，跟上面的 `ds102_ctrl.py` 是完全不同的兩個檔案）。已進版控，可作為對照，但**不要在此新增功能** |
 | [main.py](main.py) | 廠商 SURUGA SEIKI 官方範例（模組層級全域變數風格），是**指令格式的權威來源**。main_ai.py 的每個指令組法都對應此檔某段程式。修改指令時先回頭比對 |
 | [test.py](test.py) | 無 GUI 的連線 / 狀態查詢腳本（含 `find_ds_port()` 自動搜埠）。名稱誤導——不是單元測試 |
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
-| [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝（PyVISA）。已補上節流與例外處理，但**尚未接上真實儀器驗證過**，也還沒被任何地方 import——見下方尋光演算法段落 |
-| [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`：光纖對準尋光演算法（座標下降＋K近鄰精修＋收尾微擾），**尚未接上 GUI**。刻意不 import main_ai.py（避免循環相依），軸命名自成一份 |
+| [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝（PyVISA）。**已於 2026-08-12 整合進 GUI**（main_ai.py 直接 `from meter_GPIB import HP8153APowerMeter`），供「光功率」與「尋光」分頁使用；仍**未接上真實儀器驗證過**，本機沒有 GPIB 卡可測 |
+| [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`：光纖對準尋光演算法（座標下降＋K近鄰精修＋收尾微擾）。**已於 2026-08-13～17 分六階段接上 GUI**（main_ai.py 的「尋光」分頁），並補上 57 項假物件回歸測試（見下方〈光功率／尋光分頁〉）。本檔自己**仍刻意不 import main_ai.py**（避免循環相依），軸命名自成一份，main_ai.py 改軸命名時要同步 |
+| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) | 「尋光」／「光功率」分頁的假物件回歸測試（合計約 1700 行，非 pytest，直接 `python verify_scan_tab.py` 執行）。用假的 `ctrl` / `meter` 物件驅動 GUI 邏輯，不需要真實硬體 |
 | [Gtest.py](Gtest.py) | 外部第三方範例（NTT-Mabuchi），`import control` 的模組不存在於本 repo，**無法執行**，僅作參考 |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖與 GPIB 側注意事項。⚠ 但其中的 **DS112 通訊細節全部是錯的**（宣稱結束符 `\r\n`、鮑率 9600、用 `!:` 輪詢 B/R 狀態）——實機是 `\r`、38400、查 `SB1?`。此檔只採信 HP 8153A 與「馬達動則不讀光」那幾段 |
 | [FIBER_ALIGNMENT_SCAN_DESIGN.md](FIBER_ALIGNMENT_SCAN_DESIGN.md) | 尋光演算法的完整設計文件：mathematician 兩輪演算法討論、architect 落地評估、無硬體驗證方式、待實測參數清單 |
 
 ## main_ai.py 架構
 
-單檔約 3100 行，嚴格分成三塊：
+main_ai.py 約 4839 行（2026-08-06 時約 3100 行，2026-08-12～17 加入光功率／尋光兩分頁後一度衝到 6601 行，2026-08-17 把 `DS102Controller` 拆出去後降回目前規模），邏輯上仍是三塊，但**`DS102Controller` 現在實際定義在 [ds102_ctrl.py](ds102_ctrl.py)**：
 
-1. **`DS102Controller`** — 所有序列通訊集中於此，完全不碰 tkinter。對外只暴露 `connect()` / `move_step()` / `query_status()` / `goto_point()` 等高階方法。
-2. **`StatusBar`** — 各分頁共用的座標 / 連線狀態列（同時存在多個實例，統一收在 `self._status_bars`）。
-3. **`DS102GUI`** — 五個分頁（分頁標題字串為「儀表板 / 移動控制 / Teaching / 行程錄製 / LOG」，grep 時用這些字），只呼叫 controller 的公開方法。
+1. **`DS102Controller`**（[ds102_ctrl.py](ds102_ctrl.py)，約 1945 行）— 所有序列通訊集中於此，完全不碰 tkinter。對外只暴露 `connect()` / `move_step()` / `query_status()` / `goto_point()` 等高階方法。main_ai.py 開頭用 `from ds102_ctrl import DS102Controller, AXES, AXIS_NO, NO_AXIS, MODE_CONTINUE, MODE_STEP, MODE_ORIGIN, COMM_FAIL_THRESHOLD, _BASE_DIR, LOG_DIR, RECORDING_DIR, DATA_DIR, NON_RECORDING_JSON, logger, _write_json_with_backup, _app_settings, _app_setting_num` 整批重新引入——這份清單就是 `DS102Controller` 的完整依賴閉包，改動任一邊的模組層級常數前先確認它有沒有在這份清單裡。
+2. **`StatusBar`**（仍在 main_ai.py）— 各分頁共用的座標 / 連線狀態列（同時存在多個實例，統一收在 `self._status_bars`）。**刻意沒有跟著搬去 `ds102_ctrl.py`**：它用到的 `CLR_*` 色票（含 `app_settings.json` 覆寫邏輯）留在 main_ai.py，若把 `StatusBar` 也搬走，`ds102_ctrl.py` 會反過來需要 import main_ai.py 的色票，形成循環相依；`StatusBar` 本身只有約 120 行、且與 `DS102GUI` 的 `self._status_bars` 集中管理耦合更緊，留給下次拆 `DS102GUI` 時一併考慮較合適。
+3. **`DS102GUI`**（main_ai.py）— 七個分頁（分頁標題字串為「儀表板 / 移動控制 / Teaching / 行程錄製 / 光功率 / 尋光 / LOG」，grep 時用這些字），只呼叫 controller 的公開方法。「光功率」封裝 `HP8153APowerMeter`（[meter_GPIB.py](meter_GPIB.py)）、「尋光」封裝 `FiberAlignmentScanner`（[fiber_scanner.py](fiber_scanner.py)），細節見下方〈光功率／尋光分頁〉。
+
+⚠ `fiber_scanner.py` 的 `TYPE_CHECKING` 型別提示已同步改成 `from ds102_ctrl import DS102Controller`（原本指向 main_ai.py，`DS102Controller` 搬家後這裡也要跟著改，否則型別提示會指向錯誤的定義位置——雖然不影響執行期，但下次有人依賴它做型別檢查會查錯地方）。`fiber_scanner.py` 本身仍然不 import 任何一個 main_ai 系列模組，「避免循環相依」的方向沒變。
+
+🔴 **main_ai.py 開頭那個 `from ds102_ctrl import (...)` 區塊裡的 `NON_RECORDING_JSON`，IDE／靜態分析會標成「unused import」，但不能因此移除。** [verify_meter_panel.py](verify_meter_panel.py) 直接讀 `main_ai.NON_RECORDING_JSON` 這個模組屬性做斷言，main_ai.py 程式邏輯本身確實沒用到它，但拿掉這個 import 會讓 `main_ai` 模組上不再有這個屬性，那支回歸測試整支炸掉（`AttributeError`）。2026-08-17 拆分 `ds102_ctrl.py` 時實際發生過兩次：coder 第一次搬移時就發現這個依賴、刻意加回重新引入清單；後續一輪「清理架構審查發現的死 import」又想拿掉，靠重跑 `verify_meter_panel.py` 才抓到。**靜態分析工具看不到外部測試腳本這種跨模組屬性依賴**——main_ai.py:275-280 附近有對應註解，改動這個 import 區塊前務必先跑 `verify_meter_panel.py`，不要只憑 grep 或 IDE 診斷判斷「看起來沒用到」。
 
 ### 執行緒規則（違反會凍結 UI 或炸掉 tkinter）
 
@@ -71,7 +79,9 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 - ⚠ 因此「關窗不會卡住」**只對 position worker 成立**。`_on_close()` set 完旗標就直接 `disconnect()` + `root.destroy()`，此刻若有 `_wait_origin_done` 在跑（最長 180s），它會繼續對已關閉的 port 打 `SB1?`。
 - 依 [step-motor.txt](step-motor.txt) 的硬體限制：**不要**用多執行緒同時對 GPIB 與序列埠通訊，量測流程全程單執行緒依序執行。
 
-#### 四條輪詢迴圈（各司其職，別互相取代）
+#### 輪詢迴圈（各司其職，別互相取代）
+
+原本四條，2026-08-12 光功率整合後加了第五條（獨立於 DS102 序列通訊，走 GPIB）、2026-08-13 尋光整合後加了第六條（純重繪，不做任何 I/O）：
 
 | 迴圈 | 在哪 | 節奏 | 做什麼 |
 |---|---|---|---|
@@ -79,6 +89,8 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | `_start_position_worker()` | 背景執行緒 | `POSITION_POLL_INTERVAL` 0.5s | 呼叫 `refresh_positions()`，對每個已啟用軸送一筆 `POS?` 寫回 `_positions_pulse` |
 | `_poll_status()` | 背景執行緒 `while` + `time.sleep(0.1)` | 100ms | 移動中追蹤選取軸的狀態，`status != "Driving"` 就收工 |
 | `_watch_jog_limit()` | 背景執行緒 | `JOG_WATCH_INTERVAL` 0.06s | 長按點動時監看軟體限位 |
+| `_start_meter_poll_worker()` | 背景執行緒 | `METER_POLL_INTERVAL` 0.5s | 光功率背景輪詢（GPIB，與上述四條的序列埠通訊完全無關，不受 `_serial_lock` 影響） |
+| `_redraw_scan_plot()`（經 `root.after`） | Tk 主執行緒 | `SCAN_PLOT_REDRAW_INTERVAL` 250ms | 只消化 `_scan_plot_pending` 佇列重繪 matplotlib 圖表，不觸發任何量測或移動 |
 
 前兩者的分工是關鍵：`_start_poller` 之所以能跑 10ms 是因為它不做 I/O；`query_status()` 一次**只更新它被傳入的那一軸**，沒有 position worker 的話未選取的軸會永遠停在舊值。要加「畫面上某個數字沒在更新」的修正時，先確認該值是靠哪一條迴圈供應。
 
@@ -110,6 +122,17 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 🔴 **`move_step` 因此不能被 scanner 自己呼叫**——它的守衛會把演算法自己的移動也一併擋下（這是實作時真的踩到的 bug：第一版直接讓 `scanning_active` 進 `move_step`，結果所有收斂測試都卡住不動，因為演算法呼叫自己的移動時被自己設的旗標擋住）。移動邏輯拆成 `_do_move_step()`（實作，無守衛）+ `move_step()`（GUI 用，含 `scanning_active` 守衛）+ `scan_move_step()`（scanner 專用，只受 `ems_active` 攔截）三層。**新增任何呼叫移動的程式碼前，先想清楚是 GUI 操作還是 scanner 內部邏輯，選對入口。**
 
 `check_sw_limits_batch()` 與 `wait_axis_stop()`（`_wait_axis_stop` 的公開版本）是專門給 scanner 多軸批次移動流程用的公開方法。`positions_machine` 屬性回傳機械座標，供 scanner 全程在同一個座標系下運作（不透過 offset）。
+
+#### 光功率／尋光分頁（2026-08-12～17，分六階段＋一輪 architect 審查落地）
+
+「光功率」分頁（`_build_tab_power`）與「尋光」分頁（`_build_tab_scan`）是兩個獨立但互相協調的分頁：
+
+- **matplotlib 是尋光分頁專屬的選用相依**（`requirements.txt` 已列 `matplotlib`/`numpy`），main_ai.py 頂部用 `try/except ImportError` 判斷，裝不到就設 `_MATPLOTLIB_AVAILABLE = False`，「尋光」分頁改顯示安裝提示文字並停用，**不影響其餘六個分頁**。新增任何 matplotlib 呼叫前先確認在這個 guard 之內。
+- **兩個分頁共用同一份 GPIB 連線與讀值**，由「尋光」進行中時接手：`ctrl.scanning_active` 為真時，「光功率」分頁的自動輪詢會暫停、改顯示「尋光中（讀值由尋光分頁提供）」，讀值改由尋光分頁的 sample callback 回寫。這個協調狀態**沒有獨立輪詢**，搭 `_redraw_scan_plot()` 既有的 250ms 節奏一併同步（實測用 `winfo_ismapped()` 當守衛會漏更新——使用者尋光結束時人不在「光功率」分頁，畫面會卡在「尋光中」直到下次尋光開始又結束且剛好切在該分頁——已改為不依賴分頁是否可見）。
+- **`sample_cb` 跑在 scanner 的背景執行緒**，🔴 只能做資料寫入（丟進 `_scan_plot_pending` 佇列），不能碰 matplotlib 或 tkinter widget——實際重繪固定在 Tk 主執行緒的 `_redraw_scan_plot()` 做。
+- **設定持久化**：`meter_config.json`（GPIB 位址／channel／波長）與 `scanner_config.json`（速度、安全判準、是否啟用階段二 K 近鄰精修等跨次搜尋穩定的參數）都在 `RECORDING_DIR`，走 `_load_meter_config()` / `_save_meter_config()` / `_load_scanner_config()` / `_save_scanner_config()`。兩者都是純量欄位的整份覆寫，**不需要**比照 teaching points 的 `_points_loaded` 拒寫保護（沒有「累積型集合被空狀態蓋掉」的風險）。兩個檔名都已加進 `NON_RECORDING_JSON`。
+- ⚠ **階段二相關的 `tk.BooleanVar`（`_scan_stage2_var`）不能用寫死的初始值建立**——它要在讀到 `scanner_config.json` 的 `enable_stage2` 欄位後才建立變數，順序反了會讓存檔值永遠讀不回來（2026-08-17 由假物件回歸測試抓到並修正）。
+- **回歸測試**：[verify_scan_tab.py](verify_scan_tab.py)（尋光分頁，57 項）與 [verify_meter_panel.py](verify_meter_panel.py)（光功率分頁，66 項）用假的 `ctrl` / `meter` 物件跑 GUI 邏輯，不需要真實硬體或 GPIB 卡，改動這兩個分頁後應該先跑這兩支腳本。2026-08-17 `DS102Controller` 拆到 `ds102_ctrl.py` 後兩支腳本仍全數通過，可作為「模組拆分沒有破壞既有行為」的既有驗證手段之一。
 
 ### 單位與座標（容易改錯的地方）
 
@@ -248,11 +271,36 @@ DS102 的 **MEMSW（復歸樣式）與韌體軟體限位都是 RAM-only**，控�
 - `_write_json_with_backup()`：寫入前留 `.bak`（且不拿空內容蓋掉有內容的備份），再「先寫 `.tmp` 後 `replace`」避免寫到一半壞檔。
 - `_points_loaded` 旗標：沒 load 過就要寫回時，比對磁碟上是否有記憶體裡沒有的鍵，有就**拒絕寫入並記 ERROR**。
 
-⚠ **這兩層不對稱**：`_points_loaded` 的拒寫保護**只有 teaching points 有**。`_persist_profiles()` 是裸呼叫 `_write_json_with_backup`，沒有 `_profiles_loaded` 這個東西（全檔 grep 無此名）。所以「沒 load 就 save 會清空」這個實際發生過兩次的事故，在 `speed_profiles.json` 上**至今仍可重現**，只有 `.bak` 可救。
+**這兩層原本不對稱**（`_points_loaded` 曾經只有 teaching points 有），2026-08-05 已補上 `_profiles_loaded` 讓 `_persist_profiles()` 比照同一套邏輯（見下方〈已修〉）。`meter_config.json` / `scanner_config.json` 刻意**不**走這層保護——那兩份是純量欄位，整份覆寫本來就是正確行為，不是「累積型集合被空狀態蓋掉」的風險場景（見上方〈光功率／尋光分頁〉）。
 
 ⚠ `_write_json_with_backup()` 的 `write_text` / `replace` **沒有 try/except**。磁碟滿或檔案被防毒鎖住時例外會往上拋進 Tk callback 變成 traceback，`.tmp` 殘留在 `recordings/`。它防的是「寫到一半壞檔」，不是「萬無一失」。
 
 新增任何設定檔一律走 `_write_json_with_backup()`，別自己 `json.dump` 到目標路徑。
+
+### UI 節奏／色票外部化（`app_settings.json`，2026-08-17）
+
+跟前面幾份設定檔性質不同：`recordings/app_settings.json` 是**給維護人員手動編輯的靜態設定，程式只讀不寫**，沒有對應的 `_save_app_settings()`——沒有任何執行路徑會把值寫回檔案，所以不需要 `_points_loaded` 那類拒寫保護。
+
+⚠ **2026-08-17 拆分 `ds102_ctrl.py` 後，`_load_app_settings()`／`_app_setting_num()`／模組層級的 `_app_settings` 實際定義都搬到了 `ds102_ctrl.py`**（原因：`HISTORY_MAX` 是 `DS102Controller` 用到的常數，依賴這三者才能算出值，為了不讓 `ds102_ctrl.py` 反過來 import main_ai.py，整組一起搬）。main_ai.py 用 `from ds102_ctrl import _app_settings, _app_setting_num` 重新引入，所以下面提到的 `CLR_*`／`POSITION_POLL_INTERVAL`／`UI_REDRAW_INTERVAL` 等 A 類常數在 main_ai.py 端呼叫 `_app_setting_num(...)`/`_app_settings.get(...)` 時行為不變，只是這兩個函式本體不在同一個檔案裡了。
+
+- 涵蓋範圍**只有 A 類（UI 節奏／顯示上限／色票）**：`POSITION_POLL_INTERVAL`／`UI_REDRAW_INTERVAL`／`LOG_TEXT_MAX_LINES`／`HISTORY_MAX`／`SCAN_PLOT_REDRAW_INTERVAL`／`METER_POLL_INTERVAL`／`BANNER_COALESCE_SEC`，以及十個 `CLR_*` 色票。這些改壞最多是介面變慢/變醜，不會讓滑台做出危險動作。
+- 🔴 **`WAIT_TIMEOUT`／`STOP_LOCK_TIMEOUT`／`COMM_FAIL_THRESHOLD`／`JOG_WATCH_INTERVAL`／`MAX_RETRY`／`WAIT_INTERVAL` 這類有安全含意的時序常數，以及 `AXES`／`AXIS_NO`／`ORG_MODES`／`_POLL_QUERIES` 這類綁定韌體指令協定的常數，刻意不外部化**，仍然寫死在程式碼裡。前者要改（未來的規劃）必須先做範圍夾限＋不合法退回內建預設值；後者改壞的後果是指令送到錯的軸，不該讓維護人員能繞過「改指令要回頭比對 main.py」這道審查關卡。
+- `_load_app_settings()` 在**模組載入時**（任何 class 定義之前）就執行，此時 `logger` 還沒被 `init_runtime()` 掛上 `FileHandler`（那要等 `main()` 呼叫 `init_runtime()`），所以載入這一刻的 log 不一定落地到 `logs/*.log`；但它只做 `p.exists()`/`read_text()`，不建立任何目錄或檔案，不違反「import main_ai 不會建立任何目錄或 log 檔」這條既有保證。
+- 數值欄位透過 `_app_setting_num(settings, key, default, cast)` 讀取：型別不對（例如維護人員把數字打成字串）就個別退回預設值並記 INFO，不影響其餘欄位、不中止載入。色票欄位是字串，直接 `.get(key, 預設色碼)`，不做色碼格式驗證——格式錯的後果跟硬編碼時期手誤打錯字一樣，會在 tkinter 建元件時才報錯。
+- 已加進 `NON_RECORDING_JSON`，不會被 `load_recordings_from_disk()` 誤當成行程檔。
+
+### B 類安全常數外部化（`safety_settings.json`，2026-08-18）
+
+跟 A 類**刻意分成獨立檔案、獨立機制**，不共用 `app_settings.json`／`_load_app_settings`／`_app_setting_num`。理由：`recordings/` 整個目錄不進版控、沒有 PR review 這道關卡，把安全常數跟色票放同一份檔案會讓人誤以為兩者風險等級相同——這六顆常數牽涉「撞限位要多久才停下來」這類安全行為，不是「介面變慢變醜」等級。
+
+- **涵蓋範圍**：`MAX_RETRY`（1–5）／`WAIT_TIMEOUT`（10.0–120.0s）／`WAIT_INTERVAL`（0.1–2.0s）／`JOG_WATCH_INTERVAL`（0.03–1.0s，範圍刻意收得比其他顆窄——它雖然有 `_watch_jog_limit()` 的自我修正機制，但那**只保護前瞻量計算**，不保護首輪猜測與通訊負載，見 CLAUDE.md〈長按點動的限位保護〉）／`STOP_LOCK_TIMEOUT`（0.0–0.5s，負值自然落在範圍外被拒絕，不需要特判——**不能** clamp 到 0，因為 `RLock.acquire(timeout=負值)` 語意是無限等待，clamp 會把一個危險輸入悄悄轉成看似合理的值）／`COMM_FAIL_THRESHOLD`（1–10）。全部定義在 [ds102_ctrl.py](ds102_ctrl.py)。
+- **驗證比 A 類嚴格**：型別對了還要落在合法範圍內，`_safety_setting_num(settings, key, default, cast, min_val, max_val)`。**兩種拒絕情況（型別錯誤／範圍超出）一律退回內建預設值，不做 clamp 到邊界**——貼著邊界的值本身也未必是維護人員的本意。記 **`logger.warning(...)`**（比 A 類的 INFO 高一級），並把可讀訊息 append 進模組層級 `_safety_setting_rejections: list[str]`（型別錯誤與範圍超出的訊息文字刻意不同，方便分辨）。欄位缺漏是正常情況，靜默使用預設值，不記錄。
+- 🔴 **`_safety_setting_rejections` 裡的訊息只進了 Python 內建 `logging`，不會進到 GUI 的 LOG 分頁**——驗證發生在模組載入時，比任何 `DS102Controller` 實例、比 `init_runtime()` 的 `FileHandler` 都早，跟 GUI LOG 分頁靠的 `ctrl._log()`/`action_history` 是兩條獨立路徑。`DS102GUI.__init__` 在 `self.ctrl = DS102Controller()` 之後、任何 widget 建立之前，會逐則呼叫 `self.ctrl._log("WARN", f"[安全設定] {msg}")` 補寫一次，讓「LOG 篩 WARN 能看到明細」這條路徑成立。**新增任何依賴 `_safety_setting_rejections` 的功能，記得它預設不在 GUI LOG 裡，需要類似的橋接。**
+- **GUI 呈現（2026-08-18，ui-designer 設計）**：
+  - 橫幅：程式啟動、視窗建好後立刻顯示一次，**不等連線**（這是本地設定檔驗證結果，跟有沒有連硬體無關；`check_homing_config()` 那類既有橫幅綁在連線流程是因為內容必須跟控制器對話才查得到，這裡不是同一種情境）。0 則不顯示；1 則直接顯示完整訊息；≥2 則彙整成一則摘要（`⚠ 安全設定檔有 N 項欄位超出合法範圍...`），不逐則排隊——避免六顆全錯時開機瞬間連續跳出六則橫幅。
+  - 儀表板「系統狀態」列新增第 6 格「安全設定」：`內建預設` 或 `⚠ N 項已回退`。**這是靜態值，建立當下讀一次就好，刻意不掛進 `_update_stat_ui` 的 100ms 週期性重繪**（`_safety_setting_rejections` 程式生命週期內不會再變，掛進輪詢是純浪費）。
+- **實測驗證**（三種情境，皆用假 `ctrl.ser=None` 建完整 GUI）：無設定檔（橫幅不顯示／儀表板「內建預設」／LOG 0 筆）、一項被拒絕（單則橫幅／「⚠ 1 項已回退」／LOG 1 筆）、三項被拒絕（彙整橫幅／「⚠ 3 項已回退」／LOG 3 筆且明細齊全）——三種情境橫幅文字、儀表板文字、LOG 筆數皆與規格逐字相符。
+- 已加進 `NON_RECORDING_JSON`。`verify_scan_tab.py`／`verify_meter_panel.py` 兩支回歸測試在這輪改動後重跑仍全數通過。
 
 ## DS102 通訊協定重點
 
@@ -302,19 +350,22 @@ DS102 的 **MEMSW（復歸樣式）與韌體軟體限位都是 RAM-only**，控�
 - **`StreamHandler` 只在 `sys.stderr is not None` 時才加。** PyInstaller `--windowed` 會把 stdout/stderr 設成 `None`，而 `StreamHandler()` 預設綁 stderr——少了這道檢查，每一筆 log 的 `emit()` 都會踩 `AttributeError` 再被 logging 內部吞掉。
 - `log_filename` 在 `init_runtime()` 失敗或未呼叫時是 `None`，`_on_close()` 會據此跳過歷程匯出。
 
-打包時另外要注意（尚未實際打包過）：
+🔴 **2026-08-17 已實際打包驗證過一次**（`venv/Scripts/pyinstaller.exe --onedir --windowed --name DS102 main_ai.py`）：build 乾淨完成（含 matplotlib TkAgg backend 自動偵測），產出約 152MB；雙擊產生的 `DS102.exe` 能正常啟動、存活、於自己目錄下建出 `logs/`/`recordings/`/`data/`（驗證了 `_app_dir()` 的 `sys.frozen` 分支），matplotlib 中文字型（Microsoft JhengHei）在打包環境下也能正確解析。**沒有實測連硬體**（GPIB／序列埠），那部分仍待驗證。
+
+打包時另外要注意：
 - 用 `--onedir` 而非 `--onefile`。這台機器的 SentinelOne 有前科（見 [DRIVER_ISSUE_REPORT.md](DRIVER_ISSUE_REPORT.md)），而未簽章的 onefile exe 自解壓縮到 temp 的行為特徵跟 packer 一樣，是典型的誤判目標；onedir 也省掉每次啟動的解壓時間。
 - 別把 `ds102 (2).pdf`（4.4MB）與兩個驅動資料夾（6MB）`--add-data` 進去，執行期完全用不到。
-- 全檔沒有動態 import（無 `importlib` / `__import__` / `exec`），hidden-import 風險低。
+- 全檔沒有動態 import（無 `importlib` / `__import__` / `exec`），hidden-import 風險低——若之後把 `DS102Controller` 拆成獨立模組（見上方〈main_ai.py 架構〉），只要新模組也維持靜態 `from x import y`（同目錄 sibling import，跟現有 `fiber_scanner.py`／`meter_GPIB.py` 的匯入方式一樣），PyInstaller 的預設分析會自動收進去，不需要額外宣告 hidden-import；真正該留意的是「有沒有新增動態 import」，不是模組數量變多本身。
 - 沒有單一實例保護：兩個 exe 同時跑會搶同一個 COM 埠。
+- ⚠ **打包會把 DEBUG 等級的 log 全寫進檔案**（含 matplotlib 首次建圖時的 `findfont` 字型掃描，單次啟動就能灌出數十萬行、逾 700KB），不是打包引入的問題（開發模式跑 `.py` 也一樣），但在只看 `logs/` 目錄大小時容易誤判成「這支程式在跑迴圈」。
 
 ## 執行期產出（皆已 gitignore）
 
 - `logs/ds102_YYYYMMDD_HHMMSS.log` — 每次啟動一個檔（DEBUG 進檔案，INFO 以上進終端機）；關閉時另存 `*_history.txt`
-- `recordings/*.json` — 錄製的行程；同目錄的 `teaching_points.json`、`speed_profiles.json`、`controller_config.json` 是設定檔，載入錄製清單時由 `NON_RECORDING_JSON` 明確排除（另有自動產生的 `*.json.bak`）
+- `recordings/*.json` — 錄製的行程；同目錄的 `teaching_points.json`、`speed_profiles.json`、`controller_config.json`、`meter_config.json`、`scanner_config.json` 是設定檔，載入錄製清單時由 `NON_RECORDING_JSON` 明確排除（另有自動產生的 `*.json.bak`）
 - `data/data_*.csv` — 實驗數據（時間戳 + 各軸位置）
 - 根目錄殘留的 `ds102_log_YYYYMMDD.log` 來自舊版 main.py / test.py 的 logging 設定
-- ⚠ 根目錄的 `output/`（PyInstaller / auto-py-to-exe 的產出目錄，venv 內裝了這兩個工具）**不在 `.gitignore` 裡**。目前是空的，但一旦打包就會有大量二進位檔進版控——打包前先補上這條規則。
+- 根目錄的 `output/`（auto-py-to-exe 的產出目錄）與 PyInstaller 的 `build/`/`dist/`/`*.spec` 皆已列入 `.gitignore`。
 
 ## 硬體連不上時
 
@@ -343,6 +394,28 @@ DS102 的 **MEMSW（復歸樣式）與韌體軟體限位都是 RAM-only**，控�
 曾經卡了很久的 **SentinelOne Device Control 封鎖已於 2026-07-31 解除**（見 [DRIVER_ISSUE_REPORT.md](DRIVER_ISSUE_REPORT.md)）。若同樣症狀再現——裝置管理員 Problem Code 10 / `STATUS_DRIVER_BLOCKED`，看起來像簽章問題但不是——該文件已逐條排除驅動、簽章、WDAC、HVCI、Secure Boot，**不要重複排查這些**，直接請 IT 在 Device Control 政策核可 `VID_0DFD&PID_0002`。USB-RS232 轉接線會被同一政策攔下，不是可行替代方案。
 
 搜埠邏輯（`probe_ds102.py` / `test.py`）：USB 直連時靠 VID/PID `0x0DFD/0x0002` 認；走 RS-232C 轉接線時 VID/PID 屬於轉接線，只能靠 `*IDN?` 回應 `SURUGA,DS1` 判定。主機板的 Intel AMT SOL 與 Bluetooth 虛擬埠會被 `SKIP_KEYWORDS` 跳過——它們開得起來但永遠不回應。
+
+## 視覺設計原則
+
+### tkinter 桌面介面（main_ai.py，ui-designer 職責範圍）
+
+現有色彩／字型系統已成形，**新增或調整介面時延用既有 token，不要另立一套**：
+
+- 色彩定義在 `CLR_BG` / `CLR_CARD` / `CLR_BORDER` / `CLR_ACCENT` / `CLR_DANGER` / `CLR_INFO` / `CLR_WARN` / `CLR_TEXT` / `CLR_MUTED` / `CLR_LOG_BG`（main_ai.py:257-266）。這些不是隨意選的色票，而是**語意化**的：`CLR_DANGER` 綁定撞限位／警報、`CLR_WARN` 綁定通訊失聯／待確認、`CLR_ACCENT` 綁定「目前選取軸」（見上方〈第四批修正〉）。新增任何狀態顯示前先檢查有沒有對應的語意色，不要因為好看而混用。
+- 按鈕走 `ttk.Style` 的語意化角色（`Accent` / `Danger` / `Info` / `Warn` / `Flat`，main_ai.py:2256-2260），而不是逐一設色。新增按鈕先判斷屬於哪個語意角色，用既有的 `.TButton` style name，不要手動 `configure(bg=...)`。
+- 字型統一 `("Segoe UI", 10)`（main_ai.py:2245）——這是 Windows 系統預設字型，**刻意**不是什麼「有特色」的排版選擇，而是為了跟作業系統其餘 UI 元素視覺一致、且不需要額外綁定字型檔。這支程式是驅動實體滑台的工業控制面板，**易讀性與跨機器一致性優先於視覺獨特性**：不要為了風格新增自訂字型或加大字重層級，除非能確認目標機器都有安裝。
+- 這套系統本身就是多輪安全修正（2026-08-05～08-06）逐步收斂出來的——像「未連線一律顯示 `—` 不顯示 `0`」「橫幅常駐 pack 避免版面跳動」都是介面決策同時也是安全機制，改視覺樣式時連帶會動到這些行為，**先讀上方〈第三批／第四批修正〉再動手**。
+- 新增／調整 GUI 元件一律先派 `ui-designer` 提案（見下方〈子代理分工〉），不要自行決定版面。
+
+### HTML / Artifact 報告（fiber_scan_charts.html 這類產出）
+
+這類報告目前是 scratchpad 產出（不進版控），但當作對外可分享的正式交付物看待，**視覺水準要對得起裡面的真機驗證數據**：
+
+- **避免「AI slop」美學**：不要預設用 Inter / Roboto / Arial / system-ui 這類無特色字型，不要落入「白底紫色漸層」這種樣板配色，版面不要是無差異的置中卡片堆疊。挑選字型與配色時要對應內容特性——這批報告是精密量測數據，可以往「儀器儀表／科學圖表」的方向找識別度（例如等寬字型呈現數字、細線條分隔、資料本身作為視覺焦點），而不是為了花俏而花俏。
+- **色彩要有主從**：延續 `fiber_scan_charts.html` 已建立的做法——完整的淺色 token 定義在 `:root`，深色模式在 `@media (prefers-color-scheme: dark)` 與 `:root[data-theme="dark"]` 兩處同步覆寫（見 Artifact 發布規範）。不要每次重新發明一套 token 命名，沿用既有的 `--series-*`、`--accent-*` 系列。
+- **動態效果要服務理解，不是裝飾**：`fiber_scan_charts.html` 的 `buildReplayDemo()` 逐筆重播是先例——用動畫呈現「演算法怎麼一步步收斂」這種本來要盯著一堆數字才能理解的過程，是值得投入的地方；不要在不需要的地方加微互動。
+- **自包含限制不可違反**：不能連外部字型 CDN（Google Fonts 等）——嚴格 CSP 會擋。要用有特色的字型，選擇系統常見的 serif/mono 字型堆疊，或把字型檔案內嵌成 data URI（注意檔案大小，Artifact 上限 16MB）。
+- 這類報告的資料**必須先查證再寫入**（見〈子代理分工〉裡 `mathematician` 與 `reporter` 的分工），視覺設計服務的是「把已經查證過的數據講清楚」，不能為了美觀而簡化或誤導數據本身的意義。
 
 ## 子代理分工（常設規則，不需逐次指派）
 

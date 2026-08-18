@@ -28,7 +28,10 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from main_ai import DS102Controller
+    # DS102Controller 定義於 ds102_ctrl.py（2026-08-17 從 main_ai.py 抽出）。
+    # 純型別提示、不影響執行期，方向仍是「不 import main_ai.py」——
+    # ds102_ctrl.py 本身也不 import main_ai.py，不構成循環相依。
+    from ds102_ctrl import DS102Controller
 
 # 與 main_ai.py 一致的軸命名（見上方模組說明：刻意不 import，避免循環相依）
 AXES = ["X", "Y", "Z", "U", "V", "W"]
