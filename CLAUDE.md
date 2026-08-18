@@ -82,7 +82,9 @@ main_ai.py 約 5106 行（2026-08-06 時約 3100 行，2026-08-12～17 加入光
 
 ⚠ **`__init__`（main_ai.py:475-916 附近）存在只靠註解提醒、沒有機制強制的初始化順序相依**：例如 `ctrl.load_axis_calib()` 必須在 `_build_notebook()` 之前執行，卡片建構時才讀得到值；`_scanner_cfg_pending` 要等 `_build_tab_scan` 才會被消費。將來若真的把 `__init__` 拆成各 mixin 自己的 `_init_xxx_state()`，這些順序相依必須顯式化（例如一份有序的 init 步驟清單），否則會在特定操作路徑上悄悄讀到空值、且不會立刻炸出來。
 
-**技術債更新：設定檔讀取骨架重複的不是 2 份，是 4 份。** 除了先前記錄的 `_load_app_settings`（ds102_ctrl.py）與 `_load_safety_settings`（ds102_ctrl.py），main_ai.py 裡的 `_load_meter_config`／`_load_scanner_config` 也是逐字同一套骨架（`exists 檢查 → read_text → json.loads → except (OSError, JSONDecodeError) → isinstance(dict) 檢查`），只有錯誤要記 INFO 還是 ERROR、有沒有 `log` callback 參數這兩點不同，都能參數化。architect 判斷**這已經超過任何「等第三份出現再抽」的合理門檻，值得現在就抽成共用的 `_load_json_settings(path, label, log=None, error_level="INFO")`**，放進 `ds102_ctrl.py`（`app_settings`/`safety_settings` 已經在那裡，main_ai.py 本來就 import 它，不會製造新的循環相依）。這是純函式抽取、四個呼叫點都只在啟動時各跑一次，風險低，可以獨立排給 coder，不必等方向1b。至於「`_app_settings`/`_app_setting_num`/`CLR_*` 獨立成第三個檔案」這項更早的技術債——**維持先前結論仍不急**，觸發時機該跟方向1b綁在一起（真的做 mixin 化時勢必要重新梳理 import 邊界，那時候順手做是同一批工），現在單獨做只是提前付 import 調整成本卻拿不到額外好處。
+✅ **技術債已解決（2026-08-18）：四份設定檔讀取骨架抽成共用函式。** `_load_app_settings`／`_load_safety_settings`（ds102_ctrl.py）與 `_load_meter_config`／`_load_scanner_config`（main_ai.py）原本逐字同一套骨架，現在統一呼叫 `ds102_ctrl._load_json_settings(path, label, log=None, error_level="INFO", not_found_msg=None, fail_msg=..., invalid_type_msg=..., success_msg=None)`，用參數精確重現原本兩種行為模式：app/safety 是「詳細」模式（不傳 `log`、走模組 `logger`、INFO 等級、「不存在」與「成功」都記錄）；meter/scanner 是「安靜」模式（可選 `log` callback、ERROR 等級、「不存在」與「成功」都不記錄）。四個原函式對外的名稱／參數／回傳型別完全沒變，純內部實作重構。連帶讓 main_ai.py 的 `import json` 變成真正未使用，已移除。**新增任何第五份設定檔讀取函式，一律呼叫這個共用函式，不要再複製骨架。**
+
+至於「`_app_settings`/`_app_setting_num`/`CLR_*` 獨立成第三個檔案」這項更早的技術債——**維持先前結論仍不急**，觸發時機該跟方向1b綁在一起（真的做 mixin 化時勢必要重新梳理 import 邊界，那時候順手做是同一批工），現在單獨做只是提前付 import 調整成本卻拿不到額外好處。
 
 ### 執行緒規則（違反會凍結 UI 或炸掉 tkinter）
 
