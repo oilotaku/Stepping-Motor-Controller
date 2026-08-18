@@ -396,6 +396,12 @@ class DS102Controller:
 
         self.firmware = ""
         self.axis_count = 0
+        # 各軸驅動器分割設定（AXI{n}:DRDIV? 原始回應字串，0=full step…15=1/250）。
+        # 連線時查一次、之後不會變（除非有人重新設定驅動器），純資訊性顯示，
+        # 目前不做任何 pulse→um 換算——RESOLUT? 在這台機器上實測回傳 1，
+        # 代表控制器裡沒有配置真實尺度，貿然拿 DRDIV 去乘除會是未經驗證的
+        # 假設（同一個理由，2026-08-05 拿掉了 um/mm 單位切換，見 CLAUDE.md）。
+        self.axis_drdiv: Dict[str, str] = {}
         # 通訊健康度：連續讀不到位置的次數，與上次成功的時間戳。
         # 用來讓畫面能區分「這是即時值」與「這是停住的舊值」。
         self.comm_failures = 0
@@ -664,6 +670,22 @@ class DS102Controller:
         for i in range(self.axis_count):
             self._serial_write(f"AXI{i+1}:UNIT {UNIT_PULSE}:SELSP 0")
             time.sleep(0.1)
+
+        # 各軸驅動器分割設定，純資訊性查詢，不影響任何既有邏輯。查一次、
+        # 存起來，不放進背景輪詢——這是驅動器的靜態設定，不會像 POS? 那樣
+        # 隨時間變化。個別軸查詢失敗不影響連線本身（保留舊值或空字串）。
+        self.axis_drdiv = {}
+        for i in range(self.axis_count):
+            axis_no = str(i + 1)
+            ax = NO_AXIS.get(axis_no)
+            if not ax:
+                continue
+            drdiv = self._serial_write_read(f"AXI{axis_no}:DRDIV?")
+            if drdiv:
+                self.axis_drdiv[ax] = drdiv
+        if self.axis_drdiv:
+            summary = "、".join(f"{ax}={v}" for ax, v in self.axis_drdiv.items())
+            self._log("INFO", f"驅動器分割 DRDIV: {summary}")
 
         self.port = port
         self.baudrate = baudrate

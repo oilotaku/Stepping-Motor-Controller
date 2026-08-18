@@ -3834,7 +3834,11 @@ class DS102GUI:
             self._conn_dot.itemconfig(self._conn_dot_id, fill=CLR_ACCENT)
             self._conn_lbl.config(text=f"{self.ctrl.port} @ {self.ctrl.baudrate}")
             self._conn_btn.config(text="中斷", bg=CLR_DANGER)
-            self._fw_var.set(f"韌體: {self.ctrl.firmware} | {self.ctrl.axis_count} 軸")
+            _drdiv_txt = "、".join(f"{ax}={v}" for ax, v in self.ctrl.axis_drdiv.items())
+            self._fw_var.set(
+                f"韌體: {self.ctrl.firmware} | {self.ctrl.axis_count} 軸"
+                + (f" | DRDIV {_drdiv_txt}" if _drdiv_txt else "")
+            )
             self._set_drive_buttons_state("normal")
             for grp in self._all_axis_btn_groups:
                 for ax, b in grp.items():

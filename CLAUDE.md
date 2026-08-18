@@ -313,7 +313,7 @@ DS102 的 **MEMSW（復歸樣式）與韌體軟體限位都是 RAM-only**，控�
 | `AXI{n}:CWSLP?` / `CCWSLP?` | 軟體限位**座標** |
 | `AXI{n}:CWSLE?` / `CCWSLE?` | 軟體限位啟用(0=停用) |
 | `AXI{n}:RESOLUT?` | 1 pulse 的距離 = `STANDARD?` ÷ 分割數 |
-| `AXI{n}:DRDIV?` | 驅動器分割(0=full step…15=1/250) |
+| `AXI{n}:DRDIV?` | 驅動器分割(0=full step…15=1/250)。2026-08-18 起 `connect()` 會查一次存進 `ctrl.axis_drdiv: Dict[str, str]`，GUI 頂部與 LOG 顯示原始值。🔴 **純資訊性顯示，沒有拿它做任何 pulse→um 換算**——換算需要螺桿導程等機械參數，而且同樣受 `RESOLUT?`=1（未配置真實尺度）這個既有問題影響，貿然換算等於重蹈 2026-08-05 拿掉 um/mm 單位切換的覆轍。要做換算前**先跟使用者確認機械參數或用實測位移反推**，不要只憑 DRDIV 自己算 |
 | `AXI{n}:PULSA?` / `HOMEP?` | 絕對驅動座標 / Home 座標 |
 | `TCH00?`～`TCH63?` | 控制器**內建 64 組 teaching point** |
 
