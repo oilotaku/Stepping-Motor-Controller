@@ -1,37 +1,42 @@
 # -*- coding: utf-8 -*-
 """
 尋光分頁（main_ai.DS102GUI 的「尋光」分頁 + fiber_scanner.FiberAlignmentScanner
-整合）驗證腳本（假物件，不碰真實硬體）。
+整合）回歸測試（pytest，假物件，不碰真實硬體）。
 
-比照專案既有的 verify_meter_panel.py／scratchpad verify_fiber_scanner_signal.py
-慣例：獨立可執行、用 record()/check() helper 收集案例結果、失敗時清楚印出
-案例編號與 expected/actual、結尾印總結並在有失敗時 sys.exit(1)。不是
-pytest 測試檔，不需要安裝任何額外套件。
+原本是獨立可執行、用 record()/check() 收集結果的腳本，2026-08 轉換為
+pytest 測試檔以便 VS Code Test Explorer 個別發現、個別重跑單一案例。
+案例編號沿用原腳本的分組（見下方各 class 開頭註解對應「案例 N」），總計
+57 項斷言、一項不少——每個原本的 check() 呼叫都對應一個獨立的
+`def test_xxx():`，沒有把多個案例合併進同一個測試函式，確保
+`pytest -v` 的項目數與原腳本的「共 57 項」一一對應，方便核對沒有案例被
+意外合併或漏掉。
 
-執行方式：
-    PYTHONUTF8=1 venv/Scripts/python.exe verify_scan_tab.py
+原腳本裡許多案例共用同一個 gui、依賴彼此執行順序留下的狀態（例如案例
+21 原本讀取的是案例 1~5 執行 _do_start_scan() 時寫出的 scanner_config.json）。
+為了讓每個測試函式都能在 VS Code 裡被單獨選取、單獨重跑而不必依賴其他
+測試先跑過，這裡把「多個案例共用同一次昂貴前置動作（例如跑一輪尋光）」
+的情境改寫成 fixture：該 fixture 只在同一輪測試之間快取，但單獨選取
+其中一個測試時，pytest 一樣會重新完整建立這個 fixture——不需要仰賴
+其他測試先跑過。少數案例（8、12、13、21）因此在前置動作上做了小幅
+調整（詳見各自的 docstring），但驗證的斷言邏輯與涵蓋範圍未改變。
 
-涵蓋範圍（見案例編號 1~26）：
-  一、_do_start_scan() 前置檢查與確認視窗（1~5）
-  二、正常收斂完成（6~8）
-  三、使用者中止（9）
-  四、EMS 觸發（10）
-  五、無訊號中止（11~13）
-  六、非預期例外（14）
-  七、_scanner_power_query() 例外邊界（15~16）
-  八、_pm_sync_scan_notice() 光功率分頁協調（17~20）
-  九、scanner_config.json 持久化（21~24）
-  十、_redraw_scan_plot() 例外容錯（25）
-  十一、_on_close() 通知背景尋光執行緒（26）
+⚠ 整份檔案（除了少數必須各自建構的案例）共用同一個 (root, gui)
+（見下方 `gui` fixture，scope="module"）：實測在同一個 process 內快速
+連續建構超過 10 個 tk.Tk() 執行個體會偶發
+`_tkinter.TclError: couldn't read file ...treeview.tcl`（檔案其實存在，
+屬於快速連續建立/銷毀 Tcl 直譯器時的環境層級競爭，不是程式邏輯錯誤，
+但每個 class 各自一個 root 會把總數推到十幾個，明顯提高中獎機率）。
+共用同一個 Tk 視窗，不影響「每個測試各自 setup_fake_ctrl()／指定
+gui.meter」帶來的獨立性——共用的只是視窗本身。
 
-安全規則（絕對遵守）：
+安全規則（見 conftest.py 開頭，兩支測試檔案共同適用）：
   - 不連真實硬體：ctrl 一律用真的 DS102Controller() 實例（DS102GUI.__init__
     內部會建立，不整個替換掉），但 self.ser 全程維持 None（從未真正
     connect() 過），逐一 monkeypatch scan_move_step/wait_axis_stop/
     query_status 等個別方法/屬性。gui.meter 直接用簡單假物件替換
     （這個屬性本身設計成可替換）。
-  - 不寫入真實 recordings/：main_ai.RECORDING_DIR 全程 monkeypatch 到
-    tempfile.mkdtemp() 產生的暫存目錄。
+  - 不寫入真實 recordings/：main_ai.RECORDING_DIR 全程透過 conftest 的
+    make_gui() 導向暫存目錄。
   - fiber_scanner.persist_samples() 預設輸出目錄
     `Path(fiber_scanner.__file__).parent / "recordings" / "scans"`
     是獨立算出來的、不受 main_ai.RECORDING_DIR 影響——同樣 monkeypatch
@@ -39,67 +44,29 @@ pytest 測試檔，不需要安裝任何額外套件。
     時把樣本寫進專案的 recordings/scans/。
   - 全程不使用 winfo_ismapped()（root.withdraw() 之後恆為 False，會
     產生假陽性）；一律用 widget.winfo_manager() != "" 判斷是否已 pack。
+
+執行方式（VS Code Test Explorer 或指令列皆可）：
+    venv/Scripts/python.exe -m pytest verify_scan_tab.py -v
+    venv/Scripts/python.exe -m pytest verify_scan_tab.py::TestStartScanPreflight -v
 """
 
+import json
 import math
-import os
 import random
-import shutil
-import sys
-import tempfile
 import time
-import tkinter as tk
 from pathlib import Path
 from unittest.mock import patch
 
-os.environ.setdefault("PYTHONUTF8", "1")
-os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+import pytest
 
 import main_ai
 from fiber_scanner import Sample
 
-# ── 案例結果收集 ──
-_results = []  # list[(name, passed, detail)]
-
-
-def record(name: str, passed: bool, detail: str = ""):
-    _results.append((name, passed, detail))
-    tag = "PASS" if passed else "FAIL"
-    print(f"[{tag}] {name}" + (f" — {detail}" if detail and not passed else ""))
-
-
-def check(name: str, condition: bool, expected="", actual=""):
-    if condition:
-        record(name, True)
-    else:
-        detail = f"expected={expected!r} actual={actual!r}" if (expected or actual) else ""
-        record(name, False, detail)
-
-
-def pump_until(root, condition_fn, timeout=15.0):
-    """
-    真正把 Tk 事件迴圈跑起來，直到 condition_fn() 為真或逾時。
-
-    root.after(0, ...) 排的 callback（main_ai.py 背景執行緒回主執行緒的
-    既有寫法）必須讓 mainloop() 真的轉起來才會被執行——Python 3.14 的
-    tkinter 要求背景執行緒呼叫 after()／存取 widget 前，本執行緒必須
-    正在跑 mainloop，光是 root.update() 迴圈不算數（實測仍會拋
-    RuntimeError: main thread is not in main loop）。
-    """
-    deadline = time.time() + timeout
-
-    def poll():
-        if condition_fn() or time.time() > deadline:
-            root.quit()
-        else:
-            root.after(20, poll)
-
-    root.after(20, poll)
-    root.mainloop()
+from conftest import close_gui, make_gui, pump_until
 
 
 # =============================================================================
-# 假物件與 fake ctrl 建置
+# 假物件與 fake ctrl 建置（沿用原腳本，供各測試建構假 ctrl / 假光功率計）
 # =============================================================================
 class FakeMeter:
     """簡單假光功率計：固定值（可選帶雜訊），沒有依賴 pyvisa。"""
@@ -231,486 +198,597 @@ def setup_fake_ctrl(gui, axis_count=3, move_delay=0.0, always_fail_move=False):
     return ctrl
 
 
-def make_gui(tmp_recording_dir, tmp_scan_dir):
+@pytest.fixture(scope="module")
+def gui(tmp_path_factory):
     """
-    建立一個新的 (root, gui)，並把 main_ai.RECORDING_DIR /
-    fiber_scanner._default_scan_dir 都導向暫存目錄。呼叫端負責在使用完後
-    呼叫 gui._on_close() 或至少 gui._shutting_down.set() + root.destroy()。
-
-    回傳的兩個 patcher 由呼叫端持有，等 gui 生命週期結束再 stop()——
-    這樣才能涵蓋 gui 存活期間任何時間點觸發的 _save_scanner_config() /
-    scanner.persist_samples()。
+    整份檔案共用的單一 (root, gui)。除了下面明確標註「必須各自建構」的
+    案例外，其餘所有測試都透過這個 fixture 取用同一個視窗（見檔案開頭
+    docstring 說明為什麼共用、以及為什麼不影響各案例的獨立性）。
     """
-    p1 = patch.object(main_ai, "RECORDING_DIR", new=Path(tmp_recording_dir))
-    p2 = patch("fiber_scanner._default_scan_dir", return_value=Path(tmp_scan_dir))
-    p1.start()
-    p2.start()
-    root = tk.Tk()
-    root.withdraw()
-    gui = main_ai.DS102GUI(root)
-    return root, gui, (p1, p2)
-
-
-def teardown_gui(root, gui, patchers, use_on_close=False):
-    if use_on_close:
-        try:
-            gui._on_close()  # 內部會呼叫 root.destroy()
-        except tk.TclError:
-            pass
-    else:
-        gui._shutting_down.set()
-        try:
-            root.destroy()
-        except tk.TclError:
-            pass
-    for p in patchers:
-        p.stop()
+    recording_dir = tmp_path_factory.mktemp("scan_shared_rec")
+    scan_dir = tmp_path_factory.mktemp("scan_shared_scan")
+    root, g, patchers = make_gui(
+        recording_dir,
+        extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+    )
+    yield root, g
+    close_gui(root, g, patchers)
 
 
 # =============================================================================
-# 一、前置檢查與確認視窗（案例 1~5）
+# 一、_do_start_scan() 前置檢查與確認視窗（案例 1~5）
 # =============================================================================
-def test_section1_preconditions(root, gui):
-    print("\n=== 一、_do_start_scan() 前置檢查與確認視窗（案例 1~5）===")
-    setup_fake_ctrl(gui)
-    gui.meter = FakeMeter(value=-10.0, ok=True)
+class TestStartScanPreflight:
+    @pytest.fixture(autouse=True)
+    def _arrange(self, gui):
+        root, g = gui
+        setup_fake_ctrl(g)
+        g.meter = FakeMeter(value=-10.0, ok=True)
 
-    # --- 案例 1：未連線 ---
-    gui.ctrl.connected = False
-    banner_calls = []
-    with patch.object(gui, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
-        gui._do_start_scan()
-    check(
-        "1. ctrl.connected=False -> 不啟動、_scanning 不會被 set",
-        (not gui._scanning.is_set()) and any("先連線 DS102" in str(a) for a in banner_calls),
-        expected="_scanning 不 set 且橫幅含「先連線 DS102」",
-        actual=(gui._scanning.is_set(), banner_calls),
-    )
-    gui.ctrl.connected = True
+    def test_not_connected_blocks_start(self, gui):
+        """案例 1：ctrl.connected=False -> 不啟動、_scanning 不會被 set。"""
+        root, g = gui
+        g.ctrl.connected = False
+        banner_calls = []
+        try:
+            with patch.object(g, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
+                g._do_start_scan()
+            assert not g._scanning.is_set()
+            assert any("先連線 DS102" in str(a) for a in banner_calls)
+        finally:
+            g.ctrl.connected = True
 
-    # --- 案例 2：已連線但未連光功率計 ---
-    saved_meter = gui.meter
-    gui.meter = None
-    banner_calls = []
-    with patch.object(gui, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
-        gui._do_start_scan()
-    check(
-        "2. gui.meter is None -> 不啟動、橫幅含「先連線光功率計」",
-        (not gui._scanning.is_set()) and any("先連線光功率計" in str(a) for a in banner_calls),
-        expected="不啟動且橫幅含「先連線光功率計」",
-        actual=(gui._scanning.is_set(), banner_calls),
-    )
-    gui.meter = saved_meter
+    def test_meter_missing_blocks_start(self, gui):
+        """案例 2：gui.meter is None -> 不啟動、橫幅含「先連線光功率計」。"""
+        root, g = gui
+        saved_meter = g.meter
+        g.meter = None
+        banner_calls = []
+        try:
+            with patch.object(g, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
+                g._do_start_scan()
+            assert not g._scanning.is_set()
+            assert any("先連線光功率計" in str(a) for a in banner_calls)
+        finally:
+            g.meter = saved_meter
 
-    # --- 案例 3：已有搜尋在進行中 ---
-    gui.ctrl.scanning_active = True
-    banner_calls = []
-    with patch.object(gui, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
-        gui._do_start_scan()
-    check(
-        "3. ctrl.scanning_active=True -> 不啟動、橫幅含「已有搜尋在進行中」",
-        (not gui._scanning.is_set()) and any("已有搜尋在進行中" in str(a) for a in banner_calls),
-        expected="不啟動且橫幅含「已有搜尋在進行中」",
-        actual=(gui._scanning.is_set(), banner_calls),
-    )
-    gui.ctrl.scanning_active = False
+    def test_scan_already_active_blocks_start(self, gui):
+        """案例 3：ctrl.scanning_active=True -> 不啟動、橫幅含「已有搜尋在進行中」。"""
+        root, g = gui
+        g.ctrl.scanning_active = True
+        banner_calls = []
+        try:
+            with patch.object(g, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
+                g._do_start_scan()
+            assert not g._scanning.is_set()
+            assert any("已有搜尋在進行中" in str(a) for a in banner_calls)
+        finally:
+            g.ctrl.scanning_active = False
 
-    # --- 案例 4：確認視窗按「否」 ---
-    with patch("main_ai.messagebox.askyesno", return_value=False) as mock_ask:
-        gui._do_start_scan()
-    check(
-        "4. 確認視窗按「否」-> 不啟動",
-        mock_ask.called and not gui._scanning.is_set(),
-        expected="askyesno 被呼叫且 _scanning 不 set",
-        actual=(mock_ask.called, gui._scanning.is_set()),
-    )
+    def test_confirm_dialog_declined_blocks_start(self, gui):
+        """案例 4：確認視窗按「否」-> 不啟動。"""
+        root, g = gui
+        with patch("main_ai.messagebox.askyesno", return_value=False) as mock_ask:
+            g._do_start_scan()
+        assert mock_ask.called
+        assert not g._scanning.is_set()
 
-    # --- 案例 5：全部通過、確認視窗按「是」---
-    with patch("main_ai.messagebox.askyesno", return_value=True):
-        gui._do_start_scan()
-    check("5a. 按「是」後 _scanning.is_set()", gui._scanning.is_set() is True)
-    check(
-        "5b. 開始鍵 disabled",
-        str(gui._scan_start_btn.cget("state")) == "disabled",
-        expected="disabled", actual=str(gui._scan_start_btn.cget("state")),
-    )
-    check(
-        "5c. 停止鍵 normal",
-        str(gui._scan_stop_btn.cget("state")) == "normal",
-        expected="normal", actual=str(gui._scan_stop_btn.cget("state")),
-    )
+    @pytest.fixture
+    def started_scan(self, gui):
+        """
+        案例 5 前半：確認視窗按「是」，實際啟動一次尋光。scope="function"
+        （預設）+ _arrange autouse fixture 確保每次都是全新的假 ctrl，
+        5a/5b/5c 共用同一個 pytest 測試「呼叫」時的結果快取（fixture
+        在同一個測試函式內只執行一次），單獨執行其中任一測試時 pytest
+        一樣會重新完整建立這個 fixture，不依賴其他測試先跑過。
+        """
+        root, g = gui
+        with patch("main_ai.messagebox.askyesno", return_value=True):
+            g._do_start_scan()
+        yield root, g
+        # 收尾：確保任何殘留的尋光都被停止，避免影響後續測試。
+        if g._scanning.is_set():
+            g._do_stop_scan()
+            pump_until(root, lambda: not g._scanning.is_set(), timeout=15.0)
 
-    # 收尾：停止這一輪，避免殘留背景執行緒干擾後續案例。
-    gui._do_stop_scan()
-    pump_until(root, lambda: not gui._scanning.is_set(), timeout=15.0)
-    check("5d. 停止後 _scanning 清除（收尾）", not gui._scanning.is_set())
+    def test_confirm_accepted_sets_scanning_flag(self, started_scan):
+        """案例 5a：按「是」後 _scanning.is_set()。"""
+        root, g = started_scan
+        assert g._scanning.is_set() is True
+
+    def test_confirm_accepted_disables_start_button(self, started_scan):
+        """案例 5b：開始鍵 disabled。"""
+        root, g = started_scan
+        assert str(g._scan_start_btn.cget("state")) == "disabled"
+
+    def test_confirm_accepted_enables_stop_button(self, started_scan):
+        """案例 5c：停止鍵 normal。"""
+        root, g = started_scan
+        assert str(g._scan_stop_btn.cget("state")) == "normal"
+
+    def test_stop_after_confirm_clears_scanning_flag(self, started_scan):
+        """案例 5d：停止後 _scanning 清除（收尾）。"""
+        root, g = started_scan
+        g._do_stop_scan()
+        pump_until(root, lambda: not g._scanning.is_set(), timeout=15.0)
+        assert not g._scanning.is_set()
 
 
 # =============================================================================
 # 二、正常收斂完成（案例 6~8）
 # =============================================================================
-def test_section2_completed(root, gui):
-    print("\n=== 二、正常收斂完成（案例 6~8）===")
-    setup_fake_ctrl(gui, move_delay=0.0)
-    peak = {"X": 120.0, "Y": -80.0, "Z": 50.0}
-    gui.meter = GaussianMeter(gui.ctrl, peak)
-    gui._scan_settle_sec_var.set("0.01")  # 加速測試，不影響邏輯
+class TestScanCompletesNormally:
+    PEAK = {"X": 120.0, "Y": -80.0, "Z": 50.0}
 
-    with patch("main_ai.messagebox.askyesno", return_value=True):
-        gui._do_start_scan()
-    pump_until(root, lambda: not gui._scanning.is_set(), timeout=60.0)
+    @pytest.fixture
+    def completed_scan(self, gui):
+        """
+        案例 6/7 共用前置：跑完一輪正常收斂的尋光（GaussianMeter 提供真正
+        有結構的峰值，純隨機雜訊無法保證 _check_signal_detectable 不會
+        誤判為無訊號）。同一個測試函式內只執行一次，多個測試各自獨立
+        重新執行一次（見 fixture docstring 慣例說明）。
+        """
+        root, g = gui
+        setup_fake_ctrl(g, move_delay=0.0)
+        g.meter = GaussianMeter(g.ctrl, self.PEAK)
+        g._scan_settle_sec_var.set("0.01")  # 加速測試，不影響邏輯
+        with patch("main_ai.messagebox.askyesno", return_value=True):
+            g._do_start_scan()
+        pump_until(root, lambda: not g._scanning.is_set(), timeout=60.0)
+        return root, g
 
-    status = gui._scan_status_var.get()
-    check(
-        "6a. 跑完一輪 -> _scan_status_var 含「完成」",
-        "完成" in status, expected="含 完成", actual=status,
-    )
-    check(
-        "6b. _scan_no_signal_notice 未顯示",
-        gui._scan_no_signal_notice.winfo_manager() == "",
-        expected="", actual=gui._scan_no_signal_notice.winfo_manager(),
-    )
+    def test_completed_scan_status_shows_done(self, completed_scan):
+        """案例 6a：跑完一輪 -> _scan_status_var 含「完成」。"""
+        root, g = completed_scan
+        assert "完成" in g._scan_status_var.get()
 
-    check(
-        "7a. _scan_n_var 不是初始值 0",
-        gui._scan_n_var.get() != "0", expected="!=0", actual=gui._scan_n_var.get(),
-    )
-    check(
-        "7b. _scan_cur_power_var 不是初始值 —",
-        gui._scan_cur_power_var.get() != "—",
-        expected="!=—", actual=gui._scan_cur_power_var.get(),
-    )
-    check(
-        "7c. _scan_best_power_var 不是初始值 —",
-        gui._scan_best_power_var.get() != "—",
-        expected="!=—", actual=gui._scan_best_power_var.get(),
-    )
-    check(
-        "7d. _scan_coord_var 不是初始值 —",
-        gui._scan_coord_var.get() != "—",
-        expected="!=—", actual=gui._scan_coord_var.get(),
-    )
+    def test_completed_scan_hides_no_signal_notice(self, completed_scan):
+        """案例 6b：_scan_no_signal_notice 未顯示。"""
+        root, g = completed_scan
+        assert g._scan_no_signal_notice.winfo_manager() == ""
 
-    # --- 案例 8：第二輪開始時 _scan_plot_reset() 清掉殘留 ---
-    with patch("main_ai.messagebox.askyesno", return_value=True):
-        gui._do_start_scan()
-    # _scan_plot_reset() 在 _do_start_scan() 內是同步呼叫（早於背景執行緒
-    # 啟動），呼叫一結束就該已經清空，不必等這一輪真的跑完再驗證。
-    check(
-        "8. 第二輪開始後 _scan_samples 立即清空（不是累加上一輪）",
-        len(gui._scan_samples) == 0 and gui._scan_sample_count == 0,
-        expected=(0, 0), actual=(len(gui._scan_samples), gui._scan_sample_count),
-    )
-    pump_until(root, lambda: not gui._scanning.is_set(), timeout=60.0)
+    def test_completed_scan_updates_sample_count(self, completed_scan):
+        """案例 7a：_scan_n_var 不是初始值 0。"""
+        root, g = completed_scan
+        assert g._scan_n_var.get() != "0"
+
+    def test_completed_scan_updates_current_power(self, completed_scan):
+        """案例 7b：_scan_cur_power_var 不是初始值 —。"""
+        root, g = completed_scan
+        assert g._scan_cur_power_var.get() != "—"
+
+    def test_completed_scan_updates_best_power(self, completed_scan):
+        """案例 7c：_scan_best_power_var 不是初始值 —。"""
+        root, g = completed_scan
+        assert g._scan_best_power_var.get() != "—"
+
+    def test_completed_scan_updates_coord(self, completed_scan):
+        """案例 7d：_scan_coord_var 不是初始值 —。"""
+        root, g = completed_scan
+        assert g._scan_coord_var.get() != "—"
+
+    def test_second_scan_clears_previous_samples(self, completed_scan):
+        """
+        案例 8：第二輪開始後 _scan_samples 立即清空（不是累加上一輪）。
+
+        沿用 completed_scan（第一輪已完成、_scan_samples 有殘留資料），
+        立刻開始第二輪。_scan_plot_reset() 在 _do_start_scan() 內是同步
+        呼叫（早於背景執行緒啟動），呼叫一結束就該已經清空，不必等這一輪
+        真的跑完再驗證。
+        """
+        root, g = completed_scan
+        assert len(g._scan_samples) > 0, "前置條件不成立：第一輪應留下殘留樣本才能驗證『第二輪清空』"
+        with patch("main_ai.messagebox.askyesno", return_value=True):
+            g._do_start_scan()
+        try:
+            assert len(g._scan_samples) == 0
+            assert g._scan_sample_count == 0
+        finally:
+            # 收尾：讓這一輪跑完，避免殘留背景執行緒影響後續測試。
+            pump_until(root, lambda: not g._scanning.is_set(), timeout=60.0)
 
 
 # =============================================================================
 # 三、使用者中止（案例 9）
 # =============================================================================
-def test_section3_user_stopped(root, gui):
-    print("\n=== 三、使用者中止（案例 9）===")
-    setup_fake_ctrl(gui, move_delay=0.15)  # 讓移動有明顯延遲，確保有時間介入按下停止
-    gui.meter = FakeMeter(value=-10.0, ok=True, noise=0.0)  # 恆定值：sigma<=0，_check_signal_detectable 直接放行
+class TestUserStop:
+    @pytest.fixture
+    def user_stopped_scan(self, gui):
+        root, g = gui
+        setup_fake_ctrl(g, move_delay=0.15)  # 讓移動有明顯延遲，確保有時間介入按下停止
+        g.meter = FakeMeter(value=-10.0, ok=True, noise=0.0)  # 恆定值：sigma<=0，_check_signal_detectable 直接放行
+        banner_calls = []
+        with patch("main_ai.messagebox.askyesno", return_value=True), \
+             patch.object(g, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
+            g._do_start_scan()
+            pump_until(root, lambda: g._scan_sample_count >= 1, timeout=15.0)
+            g._do_stop_scan()
+            pump_until(root, lambda: not g._scanning.is_set(), timeout=20.0)
+        return g._scan_status_var.get(), banner_calls
 
-    banner_calls = []
-    with patch("main_ai.messagebox.askyesno", return_value=True), \
-         patch.object(gui, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
-        gui._do_start_scan()
-        pump_until(root, lambda: gui._scan_sample_count >= 1, timeout=15.0)
-        gui._do_stop_scan()
-        pump_until(root, lambda: not gui._scanning.is_set(), timeout=20.0)
+    def test_user_stop_status_shows_aborted_not_done(self, user_stopped_scan):
+        """案例 9a：最終狀態含「中止」且不含「完成」。"""
+        status, _ = user_stopped_scan
+        assert "中止" in status
+        assert "完成" not in status
 
-    status = gui._scan_status_var.get()
-    check(
-        "9a. 最終狀態含「中止」且不含「完成」",
-        ("中止" in status) and ("完成" not in status),
-        expected="含 中止、不含 完成", actual=status,
-    )
-    check(
-        "9b. _flash_banner 有被呼叫且訊息含「使用者中止」",
-        any("使用者中止" in str(a) for a in banner_calls),
-        expected="含 使用者中止", actual=banner_calls,
-    )
-    check(
-        "9c. _flash_banner 訊息不含「完成」",
-        not any("完成" in str(a) for a in banner_calls),
-        expected="不含 完成", actual=banner_calls,
-    )
+    def test_user_stop_banner_mentions_user_abort(self, user_stopped_scan):
+        """案例 9b：_flash_banner 有被呼叫且訊息含「使用者中止」。"""
+        _, banner_calls = user_stopped_scan
+        assert any("使用者中止" in str(a) for a in banner_calls)
+
+    def test_user_stop_banner_excludes_done(self, user_stopped_scan):
+        """案例 9c：_flash_banner 訊息不含「完成」。"""
+        _, banner_calls = user_stopped_scan
+        assert not any("完成" in str(a) for a in banner_calls)
 
 
 # =============================================================================
 # 四、EMS 觸發（案例 10）
 # =============================================================================
-def test_section4_ems(root, gui):
-    print("\n=== 四、EMS 觸發（案例 10）===")
-    setup_fake_ctrl(gui, move_delay=0.15)
-    gui.meter = FakeMeter(value=-10.0, ok=True, noise=0.0)
+class TestEmsTrigger:
+    @pytest.fixture
+    def ems_triggered_scan(self, gui):
+        root, g = gui
+        setup_fake_ctrl(g, move_delay=0.15)
+        g.meter = FakeMeter(value=-10.0, ok=True, noise=0.0)
+        banner_calls = []
+        with patch("main_ai.messagebox.askyesno", return_value=True), \
+             patch.object(g, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
+            g._do_start_scan()
+            pump_until(root, lambda: g._scan_sample_count >= 1, timeout=15.0)
+            g.ctrl.ems_active = True
+            pump_until(root, lambda: not g._scanning.is_set(), timeout=20.0)
+        status = g._scan_status_var.get()
+        g.ctrl.ems_active = False  # 收尾，避免影響後續測試
+        return status, banner_calls
 
-    banner_calls = []
-    with patch("main_ai.messagebox.askyesno", return_value=True), \
-         patch.object(gui, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
-        gui._do_start_scan()
-        pump_until(root, lambda: gui._scan_sample_count >= 1, timeout=15.0)
-        gui.ctrl.ems_active = True
-        pump_until(root, lambda: not gui._scanning.is_set(), timeout=20.0)
+    def test_ems_trigger_status_not_done(self, ems_triggered_scan):
+        """案例 10a：EMS 觸發 -> 最終狀態不含「完成」。"""
+        status, _ = ems_triggered_scan
+        assert "完成" not in status
 
-    status = gui._scan_status_var.get()
-    check(
-        "10a. EMS 觸發 -> 最終狀態不含「完成」",
-        "完成" not in status, expected="不含 完成", actual=status,
-    )
-    check(
-        "10b. EMS 觸發 -> _flash_banner 訊息不含「完成」",
-        not any("完成" in str(a) for a in banner_calls),
-        expected="不含 完成", actual=banner_calls,
-    )
-    gui.ctrl.ems_active = False  # 收尾，避免影響後續案例
+    def test_ems_trigger_banner_not_done(self, ems_triggered_scan):
+        """案例 10b：EMS 觸發 -> _flash_banner 訊息不含「完成」。"""
+        _, banner_calls = ems_triggered_scan
+        assert not any("完成" in str(a) for a in banner_calls)
 
 
 # =============================================================================
 # 五、無訊號中止（案例 11~13）
 # =============================================================================
-def test_section5_no_signal(root, gui):
-    print("\n=== 五、無訊號中止（案例 11~13）===")
-    setup_fake_ctrl(gui, move_delay=0.0)
-    gui._scan_settle_sec_var.set("0.01")
+class TestNoSignalAbort:
+    MAX_ATTEMPTS = 12
 
-    max_attempts = 12
-    triggered = False
-    for attempt in range(1, max_attempts + 1):
-        gui.ctrl.scanning_active = False
-        gui.ctrl.ems_active = False
-        gui.meter = FakeMeter(value=0.02, ok=True, noise=0.005)  # 固定值+極小雜訊
+    @pytest.fixture
+    def no_signal_scan(self, gui):
+        """
+        案例 11 前置：重試最多 12 次直到觸發「無訊號中止」。FakeMeter 給
+        固定極小值+極小雜訊，是否觸發取決於演算法內部的統計判斷，並非
+        每次必然發生，故沿用原腳本的重試迴圈（統計性案例）。
+        """
+        root, g = gui
+        triggered = False
+        attempt = 0
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            setup_fake_ctrl(g, move_delay=0.0)
+            g._scan_settle_sec_var.set("0.01")
+            g.ctrl.scanning_active = False
+            g.ctrl.ems_active = False
+            g.meter = FakeMeter(value=0.02, ok=True, noise=0.005)  # 固定值+極小雜訊
+            with patch("main_ai.messagebox.askyesno", return_value=True):
+                g._do_start_scan()
+            pump_until(root, lambda: not g._scanning.is_set(), timeout=30.0)
+            if "未偵測到訊號" in g._scan_status_var.get():
+                triggered = True
+                break
+        return root, g, triggered, attempt
+
+    def test_no_signal_triggered_within_retry_budget(self, no_signal_scan):
+        """案例 11-setup：重試 N 次內觸發無訊號中止。"""
+        _, _, triggered, attempt = no_signal_scan
+        assert triggered, f"重試 {self.MAX_ATTEMPTS} 次仍未觸發無訊號中止"
+
+    def test_no_signal_notice_visible(self, no_signal_scan):
+        """案例 11a：_scan_no_signal_notice 顯示。"""
+        root, g, triggered, attempt = no_signal_scan
+        if not triggered:
+            pytest.skip("前置條件（觸發無訊號中止）未成立，見 test_no_signal_triggered_within_retry_budget")
+        assert g._scan_no_signal_notice.winfo_manager() != ""
+
+    def test_no_signal_notice_text(self, no_signal_scan):
+        """案例 11b：提示文字含「未偵測到可用訊號」。"""
+        root, g, triggered, attempt = no_signal_scan
+        if not triggered:
+            pytest.skip("前置條件（觸發無訊號中止）未成立，見 test_no_signal_triggered_within_retry_budget")
+        assert "未偵測到可用訊號" in g._scan_no_signal_notice_label.cget("text")
+
+    def test_no_signal_status_text(self, no_signal_scan):
+        """案例 11c：_scan_status_var 含「未偵測到訊號」。"""
+        root, g, triggered, attempt = no_signal_scan
+        if not triggered:
+            pytest.skip("前置條件（觸發無訊號中止）未成立，見 test_no_signal_triggered_within_retry_budget")
+        assert "未偵測到訊號" in g._scan_status_var.get()
+
+    def test_hide_no_signal_notice_via_ack(self, gui):
+        """
+        案例 12：按「知道了」後提示收起。
+
+        與原腳本的差異：原腳本沿用案例 11 觸發的真實提示狀態；這裡改成
+        自行呼叫 _show_scan_no_signal_notice() 先顯示一次再驗證隱藏行為，
+        讓這個案例不依賴案例 11 的統計性觸發是否成功，也能單獨重跑。
+        驗證的仍是同一個函式 _hide_scan_no_signal_notice() 的行為，斷言
+        邏輯未變。
+        """
+        root, g = gui
+        g._show_scan_no_signal_notice("測試用：手動顯示以驗證按「知道了」的收起行為")
+        g._hide_scan_no_signal_notice()
+        assert g._scan_no_signal_notice.winfo_manager() == ""
+
+    @pytest.fixture
+    def stale_notice_then_new_scan(self, gui):
+        """
+        案例 13 前置：手動重新顯示一則「上一輪殘留」的提示，再開始新一輪
+        尋光，驗證是否自動隱藏。與原腳本相同，這裡本來就不依賴案例 11/12
+        的統計性觸發（原腳本也是手動重新顯示），只是額外自帶
+        setup_fake_ctrl 讓這個 fixture 不必依賴其他測試先跑過。
+        """
+        root, g = gui
+        setup_fake_ctrl(g, move_delay=0.0)
+        g._scan_settle_sec_var.set("0.01")
+        g.meter = FakeMeter(value=0.02, ok=True, noise=0.005)
+        g._show_scan_no_signal_notice("模擬上一輪殘留、使用者還沒按知道了")
+        shown = g._scan_no_signal_notice.winfo_manager() != ""
         with patch("main_ai.messagebox.askyesno", return_value=True):
-            gui._do_start_scan()
-        pump_until(root, lambda: not gui._scanning.is_set(), timeout=30.0)
-        if "未偵測到訊號" in gui._scan_status_var.get():
-            triggered = True
-            break
+            g._do_start_scan()
+        yield root, g, shown
+        # 收尾：讓這一輪跑完，避免殘留背景執行緒影響後續測試。
+        pump_until(root, lambda: not g._scanning.is_set(), timeout=30.0)
 
-    check(
-        f"11-setup. 重試 {attempt} 次內觸發無訊號中止",
-        triggered,
-        expected="觸發", actual=f"重試 {max_attempts} 次仍未觸發",
-    )
-    if not triggered:
-        return  # 統計性案例：無法觸發就不繼續往下驗證，避免對不存在的狀態斷言
+    def test_stale_notice_manually_shown(self, stale_notice_then_new_scan):
+        """案例 13-setup：手動重新顯示提示成功。"""
+        _, _, shown = stale_notice_then_new_scan
+        assert shown
 
-    check(
-        "11a. _scan_no_signal_notice 顯示",
-        gui._scan_no_signal_notice.winfo_manager() != "",
-        expected="!=''", actual=gui._scan_no_signal_notice.winfo_manager(),
-    )
-    check(
-        "11b. 提示文字含「未偵測到可用訊號」",
-        "未偵測到可用訊號" in gui._scan_no_signal_notice_label.cget("text"),
-        expected="含 未偵測到可用訊號", actual=gui._scan_no_signal_notice_label.cget("text"),
-    )
-    check(
-        "11c. _scan_status_var 含「未偵測到訊號」",
-        "未偵測到訊號" in gui._scan_status_var.get(),
-        expected="含 未偵測到訊號", actual=gui._scan_status_var.get(),
-    )
-
-    # --- 案例 12：按「知道了」---
-    gui._hide_scan_no_signal_notice()
-    check(
-        "12. 按「知道了」後提示收起",
-        gui._scan_no_signal_notice.winfo_manager() == "",
-        expected="", actual=gui._scan_no_signal_notice.winfo_manager(),
-    )
-
-    # --- 案例 13：下一輪開始尋光時自動隱藏殘留的無訊號提示 ---
-    gui._show_scan_no_signal_notice("模擬上一輪殘留、使用者還沒按知道了")
-    check(
-        "13-setup. 手動重新顯示提示成功",
-        gui._scan_no_signal_notice.winfo_manager() != "",
-    )
-    with patch("main_ai.messagebox.askyesno", return_value=True):
-        gui._do_start_scan()
-    check(
-        "13. 下一輪開始尋光時自動隱藏上一輪殘留的無訊號提示",
-        gui._scan_no_signal_notice.winfo_manager() == "",
-        expected="", actual=gui._scan_no_signal_notice.winfo_manager(),
-    )
-    # 讓這一輪跑完收尾，避免殘留背景執行緒影響後續案例。
-    pump_until(root, lambda: not gui._scanning.is_set(), timeout=30.0)
+    def test_new_scan_hides_stale_notice(self, stale_notice_then_new_scan):
+        """案例 13：下一輪開始尋光時自動隱藏上一輪殘留的無訊號提示。"""
+        root, g, shown = stale_notice_then_new_scan
+        assert g._scan_no_signal_notice.winfo_manager() == ""
 
 
 # =============================================================================
 # 六、非預期例外（案例 14）
 # =============================================================================
-def test_section6_exception(root, gui):
-    print("\n=== 六、非預期例外（案例 14）===")
-    setup_fake_ctrl(gui, move_delay=0.0)
-    gui.meter = FakeMeter(value=-10.0, ok=True, noise=0.0)
-    gui.ctrl.scan_move_step = make_raising_scan_move_step(RuntimeError("模擬 scan_move_step 非預期例外"))
+class TestUnexpectedException:
+    @pytest.fixture
+    def exception_scan_result(self, gui):
+        root, g = gui
+        setup_fake_ctrl(g, move_delay=0.0)
+        g.meter = FakeMeter(value=-10.0, ok=True, noise=0.0)
+        g.ctrl.scan_move_step = make_raising_scan_move_step(
+            RuntimeError("模擬 scan_move_step 非預期例外")
+        )
+        with patch("main_ai.messagebox.askyesno", return_value=True), \
+             patch("main_ai.messagebox.showerror") as mock_err:
+            g._do_start_scan()
+            pump_until(root, lambda: not g._scanning.is_set(), timeout=20.0)
+        title = ""
+        if mock_err.call_args is not None and mock_err.call_args.args:
+            title = mock_err.call_args.args[0]
+        result = {
+            "showerror_called": mock_err.called,
+            "showerror_title": title,
+            "start_btn_state": str(g._scan_start_btn.cget("state")),
+        }
+        # 收尾，還原成正常可用的 scan_move_step，供後續測試使用。
+        setup_fake_ctrl(g, move_delay=0.0)
+        return result
 
-    with patch("main_ai.messagebox.askyesno", return_value=True), \
-         patch("main_ai.messagebox.showerror") as mock_err:
-        gui._do_start_scan()
-        pump_until(root, lambda: not gui._scanning.is_set(), timeout=20.0)
+    def test_exception_triggers_showerror(self, exception_scan_result):
+        """案例 14a：kind=exception -> messagebox.showerror 被呼叫。"""
+        assert exception_scan_result["showerror_called"]
 
-    check("14a. kind=exception -> messagebox.showerror 被呼叫", mock_err.called)
-    title = ""
-    if mock_err.call_args is not None and mock_err.call_args.args:
-        title = mock_err.call_args.args[0]
-    check(
-        "14b. showerror 標題含「尋光異常結束」",
-        "尋光異常結束" in str(title), expected="含 尋光異常結束", actual=title,
-    )
-    check(
-        "14c. 收尾後開始鍵恢復 normal",
-        str(gui._scan_start_btn.cget("state")) == "normal",
-        expected="normal", actual=str(gui._scan_start_btn.cget("state")),
-    )
+    def test_exception_showerror_title(self, exception_scan_result):
+        """案例 14b：showerror 標題含「尋光異常結束」。"""
+        assert "尋光異常結束" in str(exception_scan_result["showerror_title"])
 
-    # 收尾，還原成正常可用的 scan_move_step，供後續案例使用。
-    setup_fake_ctrl(gui, move_delay=0.0)
+    def test_exception_recovery_reenables_start_button(self, exception_scan_result):
+        """案例 14c：收尾後開始鍵恢復 normal。"""
+        assert exception_scan_result["start_btn_state"] == "normal"
 
 
 # =============================================================================
 # 七、_scanner_power_query() 例外邊界（案例 15~16）
 # =============================================================================
-def test_section7_power_query(gui):
-    print("\n=== 七、_scanner_power_query() 例外邊界（案例 15~16）===")
-    saved_meter = gui.meter
+class TestScannerPowerQueryBoundary:
+    def test_meter_none_returns_false_zero(self, gui):
+        """案例 15：gui.meter is None -> 回傳 (False, 0.0)，不拋例外。"""
+        root, g = gui
+        saved_meter = g.meter
+        g.meter = None
+        try:
+            ok, val = g._scanner_power_query()
+            assert ok is False
+            assert val == 0.0
+        finally:
+            g.meter = saved_meter
 
-    gui.meter = None
-    ok, val = gui._scanner_power_query()
-    check(
-        "15. gui.meter is None -> 回傳 (False, 0.0)，不拋例外",
-        ok is False and val == 0.0, expected=(False, 0.0), actual=(ok, val),
-    )
-
-    gui.meter = RaisingMeter()
-    try:
-        ok, val = gui._scanner_power_query()
-        raised = False
-    except Exception:
-        ok, val = None, None
-        raised = True
-    check(
-        "16. gui.meter.get_power() 拋例外 -> 仍回傳 (False, 0.0)，不往上傳",
-        (not raised) and ok is False and val == 0.0,
-        expected=(False, 0.0), actual=(ok, val, f"raised={raised}"),
-    )
-
-    gui.meter = saved_meter
+    def test_meter_raises_returns_false_zero(self, gui):
+        """案例 16：gui.meter.get_power() 拋例外 -> 仍回傳 (False, 0.0)，不往上傳。"""
+        root, g = gui
+        saved_meter = g.meter
+        g.meter = RaisingMeter()
+        try:
+            ok, val = g._scanner_power_query()  # 不應拋例外
+            assert ok is False
+            assert val == 0.0
+        finally:
+            g.meter = saved_meter
 
 
 # =============================================================================
 # 八、_pm_sync_scan_notice() 光功率分頁協調（案例 17~20）
 # =============================================================================
-def test_section8_pm_sync(gui):
-    print("\n=== 八、_pm_sync_scan_notice() 光功率分頁協調（案例 17~20）===")
-    setup_fake_ctrl(gui)
-    saved_meter = gui.meter
+class TestPmSyncScanNotice:
+    @pytest.fixture(autouse=True)
+    def _arrange(self, gui):
+        root, g = gui
+        setup_fake_ctrl(g)
 
-    # --- 案例 17：尋光進行中（scanning_active=True）---
-    gui.meter = FakeMeter()
-    gui.ctrl.scanning_active = True
-    gui._pm_sync_scan_notice()
-    check(
-        "17a. scanning_active=True -> _pm_scan_notice 顯示",
-        gui._pm_scan_notice.winfo_manager() != "",
-        expected="!=''", actual=gui._pm_scan_notice.winfo_manager(),
-    )
-    check(
-        "17b. 三顆按鈕皆 disabled",
-        all(
-            str(w.cget("state")) == "disabled"
-            for w in (gui._pm_query_btn, gui._pm_auto_poll_cb, gui._pm_apply_range_btn)
-        ),
-        expected="全部 disabled",
-        actual=[str(w.cget("state")) for w in (gui._pm_query_btn, gui._pm_auto_poll_cb, gui._pm_apply_range_btn)],
-    )
+    def test_scanning_active_shows_pm_notice(self, gui):
+        """案例 17a：scanning_active=True -> _pm_scan_notice 顯示。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g.ctrl.scanning_active = True
+        try:
+            g._pm_sync_scan_notice()
+            assert g._pm_scan_notice.winfo_manager() != ""
+        finally:
+            g.ctrl.scanning_active = False
+            g._pm_sync_scan_notice()
 
-    # --- 案例 18：尋光結束、已連線 ---
-    gui.ctrl.scanning_active = False
-    gui._pm_sync_scan_notice()
-    check(
-        "18a. scanning_active=False 且已連線 -> 提示收起",
-        gui._pm_scan_notice.winfo_manager() == "",
-        expected="", actual=gui._pm_scan_notice.winfo_manager(),
-    )
-    check(
-        "18b. 三顆按鈕恢復 normal",
-        all(
-            str(w.cget("state")) == "normal"
-            for w in (gui._pm_query_btn, gui._pm_auto_poll_cb, gui._pm_apply_range_btn)
-        ),
-        expected="全部 normal",
-        actual=[str(w.cget("state")) for w in (gui._pm_query_btn, gui._pm_auto_poll_cb, gui._pm_apply_range_btn)],
-    )
-    check(
-        "18c. _pm_status_var == 已連線",
-        gui._pm_status_var.get() == "已連線",
-        expected="已連線", actual=gui._pm_status_var.get(),
-    )
+    def test_scanning_active_disables_pm_buttons(self, gui):
+        """案例 17b：三顆按鈕皆 disabled。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g.ctrl.scanning_active = True
+        try:
+            g._pm_sync_scan_notice()
+            for w in (g._pm_query_btn, g._pm_auto_poll_cb, g._pm_apply_range_btn):
+                assert str(w.cget("state")) == "disabled"
+        finally:
+            g.ctrl.scanning_active = False
+            g._pm_sync_scan_notice()
 
-    # --- 案例 19：尋光結束、未連線光功率計 ---
-    gui.ctrl.scanning_active = True
-    gui._pm_sync_scan_notice()  # 先顯示，才有「收回」這個轉變可觀察
-    gui.meter = None
-    gui.ctrl.scanning_active = False
-    gui._pm_sync_scan_notice()
-    check(
-        "19. scanning_active=False 且 meter=None -> _pm_status_var == 未連線（非無條件變已連線）",
-        gui._pm_status_var.get() == "未連線",
-        expected="未連線", actual=gui._pm_status_var.get(),
-    )
+    def test_scan_finished_connected_hides_notice(self, gui):
+        """案例 18a：scanning_active=False 且已連線 -> 提示收起。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g.ctrl.scanning_active = False
+        g._pm_sync_scan_notice()
+        assert g._pm_scan_notice.winfo_manager() == ""
 
-    gui.meter = saved_meter
-    gui.ctrl.scanning_active = False
-    gui._pm_sync_scan_notice()
+    def test_scan_finished_connected_restores_buttons(self, gui):
+        """案例 18b：三顆按鈕恢復 normal。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g.ctrl.scanning_active = False
+        g._pm_sync_scan_notice()
+        for w in (g._pm_query_btn, g._pm_auto_poll_cb, g._pm_apply_range_btn):
+            assert str(w.cget("state")) == "normal"
 
-    # --- 案例 20：_scan_plot_extend 同步光功率分頁變數 ---
-    gui.meter = FakeMeter()
-    gui._scan_plot_reset()
-    sample = Sample(coords={"X": 10.0, "Y": 20.0, "Z": 30.0}, ok=True, power=-5.0)
-    gui._scan_plot_extend([sample])
-    check(
-        "20a. _pm_power_var 隨樣本同步更新",
-        gui._pm_power_var.get() == "-5.00",
-        expected="-5.00", actual=gui._pm_power_var.get(),
-    )
-    check(
-        "20b. _pm_last_value 隨樣本同步更新",
-        gui._pm_last_value == -5.0,
-        expected=-5.0, actual=gui._pm_last_value,
-    )
-    gui._scan_plot_reset()
-    gui.meter = saved_meter
+    def test_scan_finished_connected_status_var(self, gui):
+        """案例 18c：_pm_status_var == 已連線。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g.ctrl.scanning_active = False
+        g._pm_sync_scan_notice()
+        assert g._pm_status_var.get() == "已連線"
+
+    def test_scan_finished_meter_disconnected_status(self, gui):
+        """案例 19：scanning_active=False 且 meter=None -> _pm_status_var == 未連線（非無條件變已連線）。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g.ctrl.scanning_active = True
+        g._pm_sync_scan_notice()  # 先顯示，才有「收回」這個轉變可觀察
+        g.meter = None
+        g.ctrl.scanning_active = False
+        g._pm_sync_scan_notice()
+        try:
+            assert g._pm_status_var.get() == "未連線"
+        finally:
+            g.meter = FakeMeter()
+            g.ctrl.scanning_active = False
+            g._pm_sync_scan_notice()
+
+    def test_scan_plot_extend_syncs_pm_power_var(self, gui):
+        """案例 20a：_pm_power_var 隨樣本同步更新。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g._scan_plot_reset()
+        sample = Sample(coords={"X": 10.0, "Y": 20.0, "Z": 30.0}, ok=True, power=-5.0)
+        g._scan_plot_extend([sample])
+        try:
+            assert g._pm_power_var.get() == "-5.00"
+        finally:
+            g._scan_plot_reset()
+
+    def test_scan_plot_extend_syncs_pm_last_value(self, gui):
+        """案例 20b：_pm_last_value 隨樣本同步更新。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g._scan_plot_reset()
+        sample = Sample(coords={"X": 10.0, "Y": 20.0, "Z": 30.0}, ok=True, power=-5.0)
+        g._scan_plot_extend([sample])
+        try:
+            assert g._pm_last_value == -5.0
+        finally:
+            g._scan_plot_reset()
 
 
 # =============================================================================
 # 九、scanner_config.json 持久化（案例 21~24）
 # =============================================================================
-def test_section9_config_persistence(root, gui, primary_recording_dir):
-    print("\n=== 九、scanner_config.json 持久化（案例 21~24）===")
+class TestScannerConfigPersistence:
+    """
+    這個 class 的每個 fixture 都刻意「不」使用共用的 `gui`：每個案例驗證
+    的都是「用某種特定的 scanner_config.json 內容開機建構 DS102GUI()」
+    這個行為本身，天生就需要各自獨立、全新建構的 GUI 執行個體，無法
+    沿用共用視窗。
+    """
 
-    # --- 案例 21：存檔內容排除 initial_step ---
-    cfg_path = Path(primary_recording_dir) / "scanner_config.json"
-    check("21-setup. scanner_config.json 已由先前案例的 _do_start_scan() 寫出", cfg_path.exists())
-    if cfg_path.exists():
-        import json as _json
-        data = _json.loads(cfg_path.read_text(encoding="utf-8"))
-        check(
-            "21. 存檔內容不含 initial_step 欄位",
-            "initial_step" not in data,
-            expected="不含 initial_step", actual=list(data.keys()),
-        )
-        check(
-            "21b. 存檔內容也不含 stage2_local_radius / axis_scale（同一批刻意不存欄位）",
-            "stage2_local_radius" not in data and "axis_scale" not in data,
-            expected="都不含", actual=list(data.keys()),
-        )
+    @pytest.fixture(scope="class")
+    @classmethod
+    def written_config(cls, tmp_path_factory):
+        """
+        案例 21 前置：自行觸發一次 _do_start_scan()，確保 scanner_config.json
+        確實被寫出。
 
-    # --- 案例 22：開機時讀取既有設定檔正確預填輸入框 ---
-    dir22 = tempfile.mkdtemp(prefix="verify_scan_tab_cfg22_")
-    scan22 = tempfile.mkdtemp(prefix="verify_scan_tab_scan22_")
-    try:
+        與原腳本的差異：原腳本依賴案例 1~5（TestStartScanPreflight）先
+        執行過 _do_start_scan() 才會寫出這個檔案；這裡改為自給自足，在
+        本 fixture 內自己觸發一次，讓這個案例不必依賴其他測試先跑過就能
+        單獨重跑。_save_scanner_config() 在 _do_start_scan() 內是同步
+        呼叫（確認視窗按「是」之後、背景執行緒啟動之前），呼叫一結束就
+        已經寫檔，因此啟動後立刻停止即可，不需要等這一輪跑完。驗證的
+        斷言（存檔內容應排除哪些欄位）與原腳本完全相同。
+        """
+        recording_dir = tmp_path_factory.mktemp("scan_cfg21_rec")
+        scan_dir = tmp_path_factory.mktemp("scan_cfg21_scan")
+        root, g, patchers = make_gui(
+            recording_dir,
+            extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+        )
+        setup_fake_ctrl(g)
+        g.meter = FakeMeter(value=-10.0, ok=True)
+        with patch("main_ai.messagebox.askyesno", return_value=True):
+            g._do_start_scan()
+        g._do_stop_scan()
+        pump_until(root, lambda: not g._scanning.is_set(), timeout=30.0)
+        cfg_path = Path(recording_dir) / "scanner_config.json"
+        yield cfg_path
+        close_gui(root, g, patchers)
+
+    def test_config_file_written(self, written_config):
+        """案例 21-setup：scanner_config.json 確實由 _do_start_scan() 寫出。"""
+        assert written_config.exists()
+
+    def test_config_excludes_initial_step(self, written_config):
+        """案例 21：存檔內容不含 initial_step 欄位。"""
+        data = json.loads(written_config.read_text(encoding="utf-8"))
+        assert "initial_step" not in data
+
+    def test_config_excludes_stage2_runtime_fields(self, written_config):
+        """案例 21b：存檔內容也不含 stage2_local_radius / axis_scale（同一批刻意不存欄位）。"""
+        data = json.loads(written_config.read_text(encoding="utf-8"))
+        assert "stage2_local_radius" not in data
+        assert "axis_scale" not in data
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def gui_with_seeded_config(cls, tmp_path_factory):
+        """案例 22 前置：開機前先在暫存目錄放一份既有 scanner_config.json。"""
+        recording_dir = tmp_path_factory.mktemp("scan_cfg22_rec")
+        scan_dir = tmp_path_factory.mktemp("scan_cfg22_scan")
         seed_cfg = {
             "l_speed": "7",
             "f_speed": "1234",
@@ -725,234 +803,201 @@ def test_section9_config_persistence(root, gui, primary_recording_dir):
             "min_valid_power_dbm": "-33.5",
             "enable_stage2": True,
         }
-        import json as _json
-        (Path(dir22) / "scanner_config.json").write_text(
-            _json.dumps(seed_cfg, ensure_ascii=False), encoding="utf-8"
+        (Path(recording_dir) / "scanner_config.json").write_text(
+            json.dumps(seed_cfg, ensure_ascii=False), encoding="utf-8"
         )
-        root22, gui22, patchers22 = make_gui(dir22, scan22)
-        try:
-            check(
-                "22a. l_speed 預填正確",
-                gui22._scan_l_speed_var.get() == "7",
-                expected="7", actual=gui22._scan_l_speed_var.get(),
-            )
-            check(
-                "22b. f_speed 預填正確",
-                gui22._scan_f_speed_var.get() == "1234",
-                expected="1234", actual=gui22._scan_f_speed_var.get(),
-            )
-            check(
-                "22c. step_min 預填正確",
-                gui22._scan_step_min_var.get() == "9",
-                expected="9", actual=gui22._scan_step_min_var.get(),
-            )
-            check(
-                "22d. min_valid_power_dbm 預填正確",
-                gui22._scan_min_valid_power_var.get() == "-33.5",
-                expected="-33.5", actual=gui22._scan_min_valid_power_var.get(),
-            )
-            check(
-                "22e. enable_stage2 (BooleanVar) 預填正確",
-                gui22._scan_stage2_var.get() is True,
-                expected=True, actual=gui22._scan_stage2_var.get(),
-            )
-            check(
-                "22f. abort_if_no_signal (BooleanVar) 預填正確",
-                gui22._scan_abort_no_signal_var.get() is False,
-                expected=False, actual=gui22._scan_abort_no_signal_var.get(),
-            )
-        finally:
-            teardown_gui(root22, gui22, patchers22)
-    finally:
-        shutil.rmtree(dir22, ignore_errors=True)
-        shutil.rmtree(scan22, ignore_errors=True)
-
-    # --- 案例 23：頂層是 list 時 _load_scanner_config() 回空字典、不拋例外 ---
-    dir23 = tempfile.mkdtemp(prefix="verify_scan_tab_cfg23_")
-    try:
-        (Path(dir23) / "scanner_config.json").write_text("[1, 2, 3]", encoding="utf-8")
-        with patch.object(main_ai, "RECORDING_DIR", new=Path(dir23)):
-            try:
-                result = main_ai._load_scanner_config()
-                raised = False
-            except Exception:
-                result = None
-                raised = True
-        check(
-            "23. 頂層是 list -> _load_scanner_config() 回傳空字典、不拋例外",
-            (not raised) and result == {},
-            expected="{} 且不拋例外", actual=(result, f"raised={raised}"),
+        root, g, patchers = make_gui(
+            recording_dir,
+            extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
         )
+        yield root, g
+        close_gui(root, g, patchers)
 
-        # --- 案例 24：DS102GUI() 在讀到格式不符的設定檔時不會 crash ---
-        scan24 = tempfile.mkdtemp(prefix="verify_scan_tab_scan24_")
-        try:
-            try:
-                root24, gui24, patchers24 = make_gui(dir23, scan24)
-                constructed_ok = True
-            except Exception as e:
-                root24 = gui24 = patchers24 = None
-                constructed_ok = False
-                construct_err = e
-            check(
-                "24. 設定檔頂層是 list 時 DS102GUI() 仍能正常建構完成",
-                constructed_ok,
-                expected="不 crash",
-                actual="正常" if constructed_ok else f"例外: {construct_err!r}",
-            )
-            if constructed_ok:
-                teardown_gui(root24, gui24, patchers24)
-        finally:
-            shutil.rmtree(scan24, ignore_errors=True)
-    finally:
-        shutil.rmtree(dir23, ignore_errors=True)
+    def test_seeded_config_prefills_l_speed(self, gui_with_seeded_config):
+        """案例 22a：l_speed 預填正確。"""
+        _, g = gui_with_seeded_config
+        assert g._scan_l_speed_var.get() == "7"
+
+    def test_seeded_config_prefills_f_speed(self, gui_with_seeded_config):
+        """案例 22b：f_speed 預填正確。"""
+        _, g = gui_with_seeded_config
+        assert g._scan_f_speed_var.get() == "1234"
+
+    def test_seeded_config_prefills_step_min(self, gui_with_seeded_config):
+        """案例 22c：step_min 預填正確。"""
+        _, g = gui_with_seeded_config
+        assert g._scan_step_min_var.get() == "9"
+
+    def test_seeded_config_prefills_min_valid_power(self, gui_with_seeded_config):
+        """案例 22d：min_valid_power_dbm 預填正確。"""
+        _, g = gui_with_seeded_config
+        assert g._scan_min_valid_power_var.get() == "-33.5"
+
+    def test_seeded_config_prefills_enable_stage2(self, gui_with_seeded_config):
+        """案例 22e：enable_stage2（BooleanVar）預填正確。"""
+        _, g = gui_with_seeded_config
+        assert g._scan_stage2_var.get() is True
+
+    def test_seeded_config_prefills_abort_if_no_signal(self, gui_with_seeded_config):
+        """案例 22f：abort_if_no_signal（BooleanVar）預填正確。"""
+        _, g = gui_with_seeded_config
+        assert g._scan_abort_no_signal_var.get() is False
+
+    def test_load_scanner_config_tolerates_list_top_level(self, tmp_path):
+        """案例 23：頂層是 list 時 _load_scanner_config() 回傳空字典、不拋例外。"""
+        (tmp_path / "scanner_config.json").write_text("[1, 2, 3]", encoding="utf-8")
+        with patch.object(main_ai, "RECORDING_DIR", new=Path(tmp_path)):
+            result = main_ai._load_scanner_config()  # 不應拋例外
+        assert result == {}
+
+    def test_gui_construction_tolerates_malformed_config(self, tmp_path):
+        """
+        案例 24：設定檔頂層是 list 時 DS102GUI() 仍能正常建構完成。
+
+        make_gui() 內部若拋出例外，pytest 會直接把這個測試標記為
+        failed／error（帶完整 traceback），效果等同原腳本手動包
+        try/except 後再斷言 constructed_ok，不需要額外包一層。
+        """
+        (tmp_path / "scanner_config.json").write_text("[1, 2, 3]", encoding="utf-8")
+        scan_dir = tmp_path / "scans"
+        scan_dir.mkdir()
+        root, g, patchers = make_gui(
+            tmp_path,
+            extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+        )
+        close_gui(root, g, patchers)
 
 
 # =============================================================================
 # 十、_redraw_scan_plot() 例外容錯（案例 25）
 # =============================================================================
-def test_section10_redraw_tolerance(gui):
-    print("\n=== 十、_redraw_scan_plot() 例外容錯（案例 25）===")
+class TestRedrawScanPlotTolerance:
+    @pytest.fixture
+    def redraw_tolerance_result(self, gui):
+        """
+        案例 25 前置：連續三次讓 _scan_plot_extend 拋出例外，觀察
+        _redraw_scan_plot() 是否吞下例外、是否持續運作、是否仍重新排程。
+        三個步驟彼此依序相依（第二次呼叫要證明第一次的例外沒讓迴圈死掉），
+        只執行一次，供 25a~25d 四個獨立斷言案例共用。
+        """
+        root, g = gui
+        call_count = [0]
 
-    call_count = [0]
+        def _raising_extend(samples):
+            call_count[0] += 1
+            raise ValueError("模擬 _scan_plot_extend 非預期例外")
 
-    def _raising_extend(samples):
-        call_count[0] += 1
-        raise ValueError("模擬 _scan_plot_extend 非預期例外")
+        result = {}
+        with patch.object(g, "_scan_plot_extend", side_effect=_raising_extend):
+            with g._scan_plot_lock:
+                g._scan_plot_pending.append(
+                    Sample(coords={"X": 0.0, "Y": 0.0, "Z": 0.0}, ok=True, power=-1.0)
+                )
+            raised = False
+            try:
+                g._redraw_scan_plot()
+            except Exception:
+                raised = True
+            result["raised_after_first_call"] = raised
+            result["call_count_after_first"] = call_count[0]
 
-    with patch.object(gui, "_scan_plot_extend", side_effect=_raising_extend):
-        # 塞一筆待處理樣本，確保 _redraw_scan_plot 真的會呼叫 _scan_plot_extend。
-        with gui._scan_plot_lock:
-            gui._scan_plot_pending.append(
-                Sample(coords={"X": 0.0, "Y": 0.0, "Z": 0.0}, ok=True, power=-1.0)
+            # 第二次呼叫：證明第一次的例外沒有讓這條迴圈「死掉」。
+            with g._scan_plot_lock:
+                g._scan_plot_pending.append(
+                    Sample(coords={"X": 1.0, "Y": 1.0, "Z": 1.0}, ok=True, power=-2.0)
+                )
+            g._redraw_scan_plot()
+            result["call_count_after_second"] = call_count[0]
+
+            # 間接驗證有嘗試重新排程下一輪：暫時把 root.after 換成
+            # MagicMock，呼叫一次確認有排程呼叫（引數含 SCAN_PLOT_REDRAW_INTERVAL）。
+            with g._scan_plot_lock:
+                g._scan_plot_pending.append(
+                    Sample(coords={"X": 2.0, "Y": 2.0, "Z": 2.0}, ok=True, power=-3.0)
+                )
+            with patch.object(g.root, "after") as mock_after:
+                g._redraw_scan_plot()
+            result["rescheduled"] = any(
+                call.args and call.args[0] == main_ai.SCAN_PLOT_REDRAW_INTERVAL
+                for call in mock_after.call_args_list
             )
-        raised = False
-        try:
-            gui._redraw_scan_plot()
-        except Exception:
-            raised = True
-        check(
-            "25a. _scan_plot_extend 丟出非 TclError 例外時，_redraw_scan_plot() 不往外拋",
-            not raised, expected="不拋例外", actual=f"raised={raised}",
-        )
-        check("25b. _scan_plot_extend 確實被呼叫過一次", call_count[0] == 1, expected=1, actual=call_count[0])
 
-        # 第二次呼叫：證明第一次的例外沒有讓這條迴圈「死掉」。
-        with gui._scan_plot_lock:
-            gui._scan_plot_pending.append(
-                Sample(coords={"X": 1.0, "Y": 1.0, "Z": 1.0}, ok=True, power=-2.0)
-            )
-        gui._redraw_scan_plot()
-        check(
-            "25c. 第二次呼叫 _scan_plot_extend 又被呼叫一次（沒有因例外而停擺）",
-            call_count[0] == 2, expected=2, actual=call_count[0],
-        )
+        # 收尾：清空可能殘留的 pending，避免真的 _scan_plot_extend 在下一輪
+        # 自然重新排程時對殘留的假樣本重繪。
+        with g._scan_plot_lock:
+            g._scan_plot_pending.clear()
+        g._scan_plot_reset()
+        return result
 
-        # 間接驗證有嘗試重新排程下一輪：暫時把 root.after 換成 MagicMock，
-        # 呼叫一次確認有排程呼叫（引數含 SCAN_PLOT_REDRAW_INTERVAL）。
-        with gui._scan_plot_lock:
-            gui._scan_plot_pending.append(
-                Sample(coords={"X": 2.0, "Y": 2.0, "Z": 2.0}, ok=True, power=-3.0)
-            )
-        with patch.object(gui.root, "after") as mock_after:
-            gui._redraw_scan_plot()
-        rescheduled = any(
-            call.args and call.args[0] == main_ai.SCAN_PLOT_REDRAW_INTERVAL
-            for call in mock_after.call_args_list
-        )
-        check(
-            "25d. 例外發生後仍呼叫 root.after(SCAN_PLOT_REDRAW_INTERVAL, ...) 重新排程",
-            rescheduled, expected=True, actual=mock_after.call_args_list,
-        )
+    def test_exception_does_not_propagate(self, redraw_tolerance_result):
+        """案例 25a：_scan_plot_extend 丟出非 TclError 例外時，_redraw_scan_plot() 不往外拋。"""
+        assert redraw_tolerance_result["raised_after_first_call"] is False
 
-    # 收尾：清空可能殘留的 pending，避免真的 _scan_plot_extend 在下一輪自然
-    # 重新排程時對殘留的假樣本重繪。
-    with gui._scan_plot_lock:
-        gui._scan_plot_pending.clear()
-    gui._scan_plot_reset()
+    def test_extend_called_once_after_first_exception(self, redraw_tolerance_result):
+        """案例 25b：_scan_plot_extend 確實被呼叫過一次。"""
+        assert redraw_tolerance_result["call_count_after_first"] == 1
+
+    def test_extend_called_again_after_exception(self, redraw_tolerance_result):
+        """案例 25c：第二次呼叫 _scan_plot_extend 又被呼叫一次（沒有因例外而停擺）。"""
+        assert redraw_tolerance_result["call_count_after_second"] == 2
+
+    def test_reschedules_after_exception(self, redraw_tolerance_result):
+        """案例 25d：例外發生後仍呼叫 root.after(SCAN_PLOT_REDRAW_INTERVAL, ...) 重新排程。"""
+        assert redraw_tolerance_result["rescheduled"] is True
 
 
 # =============================================================================
 # 十一、_on_close() 通知背景尋光執行緒（案例 26）
 # =============================================================================
-def test_section11_on_close(root, gui):
-    print("\n=== 十一、_on_close() 通知背景尋光執行緒（案例 26）===")
+class TestOnCloseNotifiesScanner:
+    @pytest.fixture(scope="class")
+    @classmethod
+    def closed_gui(cls, tmp_path_factory):
+        """
+        案例 26：_on_close() 需要真的呼叫（它結尾會 root.destroy()），所以
+        這個 fixture 必須用自己專屬的 root，不能沿用共用的 `gui`——共用的
+        那個視窗還要留給同一輪測試裡其他 class 使用，不能被這裡銷毀。
 
-    class FakeScanner:
-        def __init__(self):
-            self.stop_requested = False
+        _on_close() 內部依序：set 收工旗標 -> _active_scanner.request_stop()
+        -> （ctrl.connected 時）stop()+disconnect() -> （meter 存在時）
+        close() -> root.destroy()。ctrl.ser 全程是 None，stop()/
+        disconnect() 對它安全（皆有守衛），meter 未設定，整段可以放心
+        直接呼叫真正的 _on_close()，不需要另外 monkeypatch 掉它。
+        """
+        recording_dir = tmp_path_factory.mktemp("scan_onclose_rec")
+        scan_dir = tmp_path_factory.mktemp("scan_onclose_scan")
+        root, g, patchers = make_gui(
+            recording_dir,
+            extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+        )
 
-        def request_stop(self):
-            self.stop_requested = True
+        class FakeScanner:
+            def __init__(self):
+                self.stop_requested = False
 
-    fake_scanner = FakeScanner()
-    gui._active_scanner = fake_scanner
-    gui.ctrl.ems_active = False
-    check("26-setup. _active_scanner 已設為假物件", gui._active_scanner is fake_scanner)
+            def request_stop(self):
+                self.stop_requested = True
 
-    # _on_close() 內部依序：set 收工旗標 -> _active_scanner.request_stop()
-    # -> （ctrl.connected 時）stop()+disconnect() -> （meter 存在時）close()
-    # -> root.destroy()。ctrl.ser 全程是 None，stop()/disconnect() 對它
-    # 安全（皆有 `if not (self.ser and self.ser.is_open): return` 這類
-    # 守衛），meter 是假物件也有 close()，整段可以放心直接呼叫真正的
-    # _on_close()，不需要另外 monkeypatch 掉它。這也是本腳本主要
-    # gui/root 的最終清理步驟。
-    gui._on_close()
+        fake_scanner = FakeScanner()
+        g._active_scanner = fake_scanner
+        g.ctrl.ems_active = False
+        was_set = g._active_scanner is fake_scanner
 
-    check(
-        "26. _on_close() 呼叫了 _active_scanner.request_stop()",
-        fake_scanner.stop_requested is True,
-        expected=True, actual=fake_scanner.stop_requested,
-    )
+        g._on_close()
 
-
-# =============================================================================
-# 主流程
-# =============================================================================
-def main():
-    primary_recording_dir = tempfile.mkdtemp(prefix="verify_scan_tab_rec_")
-    primary_scan_dir = tempfile.mkdtemp(prefix="verify_scan_tab_scan_")
-
-    root, gui, patchers = make_gui(primary_recording_dir, primary_scan_dir)
-
-    try:
-        test_section1_preconditions(root, gui)
-        test_section2_completed(root, gui)
-        test_section3_user_stopped(root, gui)
-        test_section4_ems(root, gui)
-        test_section5_no_signal(root, gui)
-        test_section6_exception(root, gui)
-        test_section7_power_query(gui)
-        test_section8_pm_sync(gui)
-        test_section9_config_persistence(root, gui, primary_recording_dir)
-        test_section10_redraw_tolerance(gui)
-        # 案例 26 放最後：_on_close() 會呼叫 root.destroy()，是這個
-        # gui/root 生命週期的自然終點，不需要額外的 teardown_gui()。
-        test_section11_on_close(root, gui)
-    finally:
         for p in patchers:
             try:
                 p.stop()
             except RuntimeError:
-                pass  # 已經 stop 過（例如例外路徑中途已 stop）
-        shutil.rmtree(primary_recording_dir, ignore_errors=True)
-        shutil.rmtree(primary_scan_dir, ignore_errors=True)
+                pass
+        return fake_scanner, was_set
 
-    print("\n=== 總結 ===")
-    total = len(_results)
-    passed = sum(1 for _, ok, _ in _results if ok)
-    failed = total - passed
-    print(f"共 {total} 項：PASS {passed}、FAIL {failed}")
-    if failed:
-        print("\n失敗案例：")
-        for name, ok, detail in _results:
-            if not ok:
-                print(f"  - {name}" + (f"（{detail}）" if detail else ""))
-        sys.exit(1)
-    else:
-        print("全部通過。")
-        sys.exit(0)
+    def test_active_scanner_assigned_before_close(self, closed_gui):
+        """案例 26-setup：_active_scanner 已設為假物件。"""
+        _, was_set = closed_gui
+        assert was_set
 
-
-if __name__ == "__main__":
-    main()
+    def test_on_close_requests_scanner_stop(self, closed_gui):
+        """案例 26：_on_close() 呼叫了 _active_scanner.request_stop()。"""
+        fake_scanner, _ = closed_gui
+        assert fake_scanner.stop_requested is True

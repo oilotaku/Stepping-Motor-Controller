@@ -7,3 +7,6 @@ PyVISA==1.16.2      # GPIB 量測儀器控制，meter_GPIB.py
 requests==2.34.2    # HTTP 用戶端（間接/選用）
 matplotlib==3.11.1  # 尋光即時軌跡圖，main_ai.py 尋光分頁（fiber_scanner 整合）
 numpy==2.5.2         # matplotlib 的必要相依，main_ai.py 也直接用來組空陣列（set_offsets 需要）
+
+# --- 開發/測試用相依（不影響 GUI 執行期）---
+pytest==9.1.1        # verify_scan_tab.py / verify_meter_panel.py 的測試框架，VS Code Test Explorer 也靠它發現測試

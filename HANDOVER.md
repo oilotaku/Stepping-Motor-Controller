@@ -52,6 +52,6 @@
 ## 交接注意事項
 
 - 這個專案高度仰賴子代理分工（`architect`／`coder`／`tester`／`ui-designer`／`mathematician`／`reporter`），規則寫在 CLAUDE.md〈子代理分工〉一節，**動到執行緒／序列通訊／持久化的改動要先過 architect，新增 GUI 元件要先過 ui-designer**，不是隨意的建議，是這個專案吃過虧之後定下的流程。
-- 沒有 CI，沒有 pytest。`verify_scan_tab.py`／`verify_meter_panel.py` 是目前僅有的永久回歸測試（假物件，不需硬體），改動相關分頁後應該先跑這兩支。
+- 沒有 CI。`verify_scan_tab.py`／`verify_meter_panel.py` 是目前僅有的永久回歸測試（假物件，不需硬體，2026-08-18 已轉成 pytest 測試檔，共 123 項），改動相關分頁後應該先跑 `venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py -v`，或直接用 VS Code 的 Testing 面板逐一重跑。
 - git commit 習慣寫得比較長，說明「為什麼」不只「做了什麼」，且都會附驗證結果（回歸測試通過與否、手算驗證數字等）——看 `git log` 找同類型改動的前例，照同樣的詳細程度寫，別只寫一行摘要。
 - **沒有模擬模式，這是刻意的、不要加回來**——這支程式驅動真實滑台，任何會影響移動/限位/安全邏輯的改動，最終都要有人在真機上驗證過才算數，光靠假物件測試通過不夠。

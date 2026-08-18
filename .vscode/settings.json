@@ -13,6 +13,24 @@
   },
 
   // ===========================================================================
+  // 測試（pytest）：verify_scan_tab.py / verify_meter_panel.py
+  // ===========================================================================
+  // VS Code 的測試執行不一定會套用 terminal.integrated.env.windows（那只對
+  // 「整合終端機」生效，Test Explorer 是另一條執行路徑），所以中文輸出的
+  // PYTHONUTF8/PYTHONIOENCODING 改由 conftest.py 開頭的 os.environ.setdefault()
+  // 補上，不依賴這裡的環境變數設定也能正確顯示。
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  // 明確指到專案 venv 的 pytest.exe，而非依賴當時選取的直譯器——
+  // CLAUDE.md 反覆強調全域 Python 沒裝 pyserial/PyVISA 等相依套件，
+  // 用錯直譯器執行測試會在 import main_ai 階段就失敗。
+  "python.testing.pytestPath": "${workspaceFolder}/venv/Scripts/pytest.exe",
+  "python.testing.pytestArgs": [
+    "${workspaceFolder}"
+  ],
+  "python.testing.cwd": "${workspaceFolder}",
+
+  // ===========================================================================
   // Pylance 分析：只分析自己的程式碼，避開 venv 與驅動程式資料夾
   // ===========================================================================
   "python.analysis.typeCheckingMode": "basic",
@@ -124,5 +142,6 @@
   "files.readonlyInclude": {
     "logs/**": true,
     "**/ds102_log_*.log": true
-  }
+  },
+  "claudeCode.useTerminal": false
 }

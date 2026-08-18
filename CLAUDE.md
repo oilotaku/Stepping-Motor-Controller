@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Windows 桌面應用，用 Python + tkinter 控制 **駿河精機 SURUGA SEIKI DS102 / DS112 步進馬達控制箱**（RS-232C / USB 虛擬 COM 埠），用於光纖對準與光學自動化量測。長期目標（見 [step-motor.txt](step-motor.txt)）是把滑台與 **HP 8153A 光波萬用表**（GPIB）串起來做自動掃描尋光。
 
-沒有 pytest／CI、沒有套件化結構——全部是可直接執行的頂層腳本。有兩支非正式的回歸測試腳本（`verify_scan_tab.py`、`verify_meter_panel.py`，見下方〈常用指令〉），用假物件跑 GUI 邏輯，不是標準測試框架。
+沒有 CI、沒有套件化結構——全部是可直接執行的頂層腳本。有兩支回歸測試腳本（`verify_scan_tab.py` 57 項、`verify_meter_panel.py` 66 項，見下方〈常用指令〉），用假物件跑 GUI 邏輯。2026-08-18 起改寫成 **pytest 測試檔**（檔名不變，透過 `pytest.ini` 的 `python_files` 設定讓 pytest 認得這兩個既有檔名），VS Code 的 Testing 面板可以個別發現、個別重跑每一項；`conftest.py` 放共用的 fixture（建 GUI、跑 Tk mainloop、monkeypatch `RECORDING_DIR`）。
 
 ## 常用指令
 
@@ -21,8 +21,8 @@ venv/Scripts/python.exe probe_ds102.py --list            # 只列埠，不送任
 venv/Scripts/python.exe -m serial.tools.list_ports -v    # 原始序列埠清單
 venv/Scripts/python.exe -m pip install -r requirements.txt
 venv/Scripts/python.exe -m ruff check .                  # ruff 未列於 requirements.txt，需另行安裝
-venv/Scripts/python.exe verify_scan_tab.py                # 「尋光」分頁假物件回歸測試（57 項，不需硬體）
-venv/Scripts/python.exe verify_meter_panel.py              # 「光功率」分頁假物件回歸測試（66 項，不需硬體）
+venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py -v  # 兩支合計 123 項，不需硬體
+venv/Scripts/python.exe -m pytest verify_scan_tab.py::TestUserStop -v          # 只跑某個 class／單一測試（VS Code Test Explorer 用同一套機制）
 ```
 
 VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch 設定，見 [.vscode/](.vscode/)。
@@ -47,7 +47,8 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
 | [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝（PyVISA）。**已於 2026-08-12 整合進 GUI**（main_ai.py 直接 `from meter_GPIB import HP8153APowerMeter`），供「光功率」與「尋光」分頁使用；仍**未接上真實儀器驗證過**，本機沒有 GPIB 卡可測 |
 | [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`：光纖對準尋光演算法（座標下降＋K近鄰精修＋收尾微擾）。**已於 2026-08-13～17 分六階段接上 GUI**（main_ai.py 的「尋光」分頁），並補上 57 項假物件回歸測試（見下方〈光功率／尋光分頁〉）。本檔自己**仍刻意不 import main_ai.py**（避免循環相依），軸命名自成一份，main_ai.py 改軸命名時要同步 |
-| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) | 「尋光」／「光功率」分頁的假物件回歸測試（合計約 1700 行，非 pytest，直接 `python verify_scan_tab.py` 執行）。用假的 `ctrl` / `meter` 物件驅動 GUI 邏輯，不需要真實硬體 |
+| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) | 「尋光」／「光功率」分頁的假物件回歸測試（合計 123 項 pytest 測試函式，`python -m pytest verify_scan_tab.py verify_meter_panel.py -v` 執行，VS Code Testing 面板也認得）。用假的 `ctrl` / `meter` 物件驅動 GUI 邏輯，不需要真實硬體 |
+| [conftest.py](conftest.py) / [pytest.ini](pytest.ini) | pytest 共用設定：`conftest.py` 放建 GUI／跑 Tk mainloop／monkeypatch `RECORDING_DIR` 這類共用 fixture；`pytest.ini` 把 `python_files` 放寬成同時認得 `verify_*.py` 與標準 `test_*.py`，並排除 `venv`／驅動資料夾等不相關目錄 |
 | [Gtest.py](Gtest.py) | 外部第三方範例（NTT-Mabuchi），`import control` 的模組不存在於本 repo，**無法執行**，僅作參考 |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖與 GPIB 側注意事項。⚠ 但其中的 **DS112 通訊細節全部是錯的**（宣稱結束符 `\r\n`、鮑率 9600、用 `!:` 輪詢 B/R 狀態）——實機是 `\r`、38400、查 `SB1?`。此檔只採信 HP 8153A 與「馬達動則不讀光」那幾段 |
 | [FIBER_ALIGNMENT_SCAN_DESIGN.md](FIBER_ALIGNMENT_SCAN_DESIGN.md) | 尋光演算法的完整設計文件：mathematician 兩輪演算法討論、architect 落地評估、無硬體驗證方式、待實測參數清單 |

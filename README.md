@@ -72,7 +72,7 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
 | [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝，已整合進「光功率」／「尋光」分頁，尚未接上真實儀器驗證 |
 | [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`，光纖對準尋光演算法，已接上「尋光」分頁 |
-| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) | 「尋光」／「光功率」分頁的假物件回歸測試（57／66 項，`python verify_scan_tab.py` 直接執行，不需硬體） |
+| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) | 「尋光」／「光功率」分頁的假物件回歸測試（57／66 項，pytest 測試檔，`python -m pytest verify_scan_tab.py -v` 執行，或用 VS Code Testing 面板，不需硬體） |
 | [Gtest.py](Gtest.py) | 外部第三方範例，`import control` 的模組不存在於本 repo，**無法執行** |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖。⚠ 其中 DS112 通訊細節（`\r\n`、9600、`!:` 輪詢）**全部是錯的** |
 
