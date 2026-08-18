@@ -21,6 +21,7 @@ import json
 import logging
 import csv
 import re
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -344,6 +345,7 @@ NON_RECORDING_JSON = frozenset(
         "scanner_config.json",
         "app_settings.json",
         "safety_settings.json",
+        "axis_calibration.json",
     }
 )
 # 連續幾輪讀不到任何軸的位置，就判定「畫面上的座標已不可信」。
@@ -407,6 +409,15 @@ class DS102Controller:
         # 貿然拿 DRDIV 去乘除會是未經驗證的假設（同一個理由，2026-08-05 拿掉
         # 了 um/mm 單位切換，見 CLAUDE.md）。
         self.axis_drdiv: Dict[str, str] = {}
+        # 軸機械校正參數（螺桿導程 / 馬達步進角 / 使用者手動設定的分割倍數）。
+        # 純粹用來把 pulse「額外」估算成 μm 顯示——不影響任何移動、限位、
+        # 教點比對邏輯，那些永遠只認 pulse（同一個理由，2026-08-05 拿掉了
+        # um/mm 單位切換，見上方 axis_drdiv 的說明與 CLAUDE.md）。
+        # 只有參數完整的軸才會是這個字典的 key，缺參數的軸沒有這個 key
+        # （不像 sw_limits 六軸都預先擺好 (None, None)）。
+        self.axis_calib: Dict[str, dict] = {}
+        # 同 _points_loaded：沒載入就存檔會把既有校正參數整份蓋掉
+        self._axis_calib_loaded = False
         # 通訊健康度：連續讀不到位置的次數，與上次成功的時間戳。
         # 用來讓畫面能區分「這是即時值」與「這是停住的舊值」。
         self.comm_failures = 0
@@ -1835,6 +1846,143 @@ class DS102Controller:
                 self.saved_points = json.load(f)
             self._points_loaded = True
             self._log("INFO", f"載入 {len(self.saved_points)} 個 Teaching Points")
+
+    # =========================================================================
+    # 軸機械校正參數（純顯示用的 pulse→μm 估算，不影響任何控制邏輯）
+    # =========================================================================
+    def load_axis_calib(self) -> None:
+        """開機載入 recordings/axis_calibration.json。找不到檔案也算已知狀態。"""
+        p = RECORDING_DIR / "axis_calibration.json"
+        if p.exists():
+            try:
+                self.axis_calib = json.loads(p.read_text(encoding="utf-8"))
+                self._log(
+                    "INFO", f"載入 {len(self.axis_calib)} 軸的機械校正參數"
+                )
+            except (OSError, json.JSONDecodeError) as e:
+                self._log("ERROR", f"軸機械校正參數檔讀取失敗: {e}")
+        self._axis_calib_loaded = True
+
+    def _persist_axis_calib(self) -> None:
+        """
+        寫回 axis_calibration.json。
+
+        沒先 load 過就寫回，等於拿一份不完整的記憶體狀態覆蓋磁碟——比照
+        _persist_points 的既有防護：比對磁碟既有內容缺哪些軸，缺就拒寫並記
+        ERROR，只有 .bak 可救。
+        """
+        p = RECORDING_DIR / "axis_calibration.json"
+        if not self._axis_calib_loaded and p.exists():
+            try:
+                existing = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            missing = set(existing) - set(self.axis_calib)
+            if missing:
+                self._log(
+                    "ERROR",
+                    f"拒絕寫入 axis_calibration.json：未先 load_axis_calib() 就儲存，"
+                    f"會遺失 {len(missing)} 軸既有校正參數（{'、'.join(sorted(missing))}）",
+                )
+                return
+        _write_json_with_backup(p, self.axis_calib, self._log)
+
+    def set_axis_calib(self, calib: Dict[str, dict]) -> List[str]:
+        """
+        合併更新軸機械校正參數（只更新傳入的軸，其餘軸既有資料不受影響，
+        仿照 capture_controller_config() 的合併邏輯，不是整份覆蓋）。
+
+        逐軸驗證 lead_pitch_mm / step_angle_deg 皆為正數，division 為正整數；
+        任一軸不合法就在回傳的 list 附加一則錯誤字串，該軸不寫入。
+        回傳空 list 代表全部合法並已存檔；非空 list 代表有錯誤，呼叫端
+        （GUI）要整批不當作套用成功——這批裡合法的軸也不會被寫入，維持
+        「全部成功或全部不動」，避免使用者以為六軸都套用了但其實只套用一半。
+        """
+        errors: List[str] = []
+        to_write: Dict[str, dict] = {}
+        for ax, params in calib.items():
+            lead = params.get("lead_pitch_mm")
+            angle = params.get("step_angle_deg")
+            division = params.get("division")
+
+            # math.isfinite() 排除 inf/nan——float("inf") 與 float("nan") 都不會
+            # 拋 ValueError，且兩者都滿足 x <= 0 為 False，沒有這道檢查會被前面的
+            # 正數判斷放行，算出 "≈ nan μm" 這種顯示（architect 審查抓到的邊界案例）。
+            if (
+                not isinstance(lead, (int, float))
+                or isinstance(lead, bool)
+                or not math.isfinite(lead)
+                or lead <= 0
+            ):
+                errors.append(f"{ax}: 導程需為正數")
+                continue
+            if (
+                not isinstance(angle, (int, float))
+                or isinstance(angle, bool)
+                or not math.isfinite(angle)
+                or angle <= 0
+            ):
+                errors.append(f"{ax}: 步進角需為正數")
+                continue
+            if not isinstance(division, int) or isinstance(division, bool) or division <= 0:
+                errors.append(f"{ax}: 分度值需為正整數")
+                continue
+
+            to_write[ax] = {
+                "lead_pitch_mm": float(lead),
+                "step_angle_deg": float(angle),
+                "division": int(division),
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            }
+
+        if errors:
+            return errors
+
+        if to_write:
+            self.axis_calib.update(to_write)
+            self._log(
+                "INFO",
+                f"軸機械校正參數已更新：{'、'.join(sorted(to_write))}",
+            )
+            self._persist_axis_calib()
+        return []
+
+    def estimate_um(self, ax: str, pulse: float) -> Optional[float]:
+        """
+        把 pulse 估算成 μm，純顯示用途。
+
+        um_per_pulse = (導程mm * 1000) / ((360 / 步進角) * 分度值)
+
+        軸沒有校正參數、或參數不合法（第二道防線，防的是 json 檔被手動編輯
+        繞過 GUI 輸入驗證，不是防使用者手滑），一律回傳 None——呼叫端據此
+        決定「不顯示」而不是顯示 0 或猜測值，沿用「未連線一律顯示 —
+        不顯示 0」的既有原則。
+        """
+        params = self.axis_calib.get(ax)
+        if not params:
+            return None
+        lead = params.get("lead_pitch_mm")
+        angle = params.get("step_angle_deg")
+        division = params.get("division")
+        if (
+            not isinstance(lead, (int, float))
+            or isinstance(lead, bool)
+            or not math.isfinite(lead)
+            or lead <= 0
+        ):
+            return None
+        if (
+            not isinstance(angle, (int, float))
+            or isinstance(angle, bool)
+            or not math.isfinite(angle)
+            or angle <= 0
+        ):
+            return None
+        if not isinstance(division, int) or isinstance(division, bool) or division <= 0:
+            return None
+
+        um_per_pulse = (lead * 1000.0) / ((360.0 / angle) * division)
+        return pulse * um_per_pulse
 
     # =========================================================================
     # 行程錄製與重播

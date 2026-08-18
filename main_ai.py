@@ -31,6 +31,7 @@ import threading
 import time
 import json
 import logging
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -416,6 +417,12 @@ class StatusBar(tk.Frame):
           正常     → 顯示數值，右側標註資料年齡
         另外把**當前選取軸**highlight 出來——選錯軸就是驅動錯的滑台，
         而軸選擇器只存在於兩個分頁，其餘分頁完全看不出選的是哪一軸。
+
+        ⚠ 刻意不在這裡附加 μm 估算：這顆 Label 是 width=10 的固定寬度
+        （六軸要並排塞進同一條 StatusBar），Consolas 10pt bold 底下連
+        原本的 pulse 數字都常常頂到邊界，再接一段「≈ 1234.5 μm」只會
+        被截斷或把整條 bar 撐爆。μm 估算的必顯示位置是儀表板
+        （_redraw_positions），這裡不做。
         """
         connected = self.ctrl.connected
         stale = self.ctrl.comm_stale
@@ -593,6 +600,11 @@ class DS102GUI:
         self._build_window()
         self._build_top_bar()
         self._build_banner()
+        # 軸機械校正參數卡片會在 _build_notebook() 內用 ctrl.axis_calib
+        # 回填 Entry（跟其餘設定檔不同，那些卡片建構時先留空、事後才靠
+        # _refresh_points() 這類方法補上；這裡選擇提早載入，讓卡片一次
+        # 建對，不必額外補一個「建構後回填 Entry」的路徑）。
+        self.ctrl.load_axis_calib()
         self._build_notebook()
 
         self.ctrl.load_points()
@@ -1304,6 +1316,203 @@ class DS102GUI:
             command=self._restore_controller_config,
         ).pack(side="left")
 
+    def _build_card_axis_calib(self, scr):
+        """
+        軸機械校正參數：純顯示用的 pulse→μm 估算換算表。
+
+        跟 DRDIV 是兩個不同語意的數字，刻意不互相關聯或自動代入
+        （division 是使用者自己讀實體開關填的，DRDIV 是控制器內部一個
+        跟實體開關無關的軟體暫存器，見 ds102_ctrl.py 的 axis_drdiv 註解）。
+        這張卡片完全不影響任何移動/限位/教點邏輯，錯了也不會有警報。
+        """
+        calib_card = self._card(
+            scr,
+            "軸機械校正參數（僅估算顯示，不影響任何移動/限位/教點判斷）",
+        )
+        tk.Label(
+            calib_card,
+            text="輸入螺桿導程、馬達步進角、目前手動轉到的分割倍數，"
+                 "換算出 pulse↔μm 的估算比例，附加顯示在座標旁邊。",
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 8),
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(2, 0))
+        tk.Label(
+            calib_card,
+            text="⚠ 估算值——導程/步進角/分度值任一填錯，顯示的 μm 就會是錯的，"
+                 "不會有任何警報或攔截。",
+            bg=CLR_CARD,
+            fg=CLR_WARN,
+            font=("Segoe UI", 8),
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
+        calib_grid = tk.Frame(calib_card, bg=CLR_CARD)
+        calib_grid.pack(fill="x", padx=12, pady=(0, 8))
+        headers = ["軸", "導程 (mm)", "步進角 (度)", "分度值", "韌體 DRDIV 參考", "目前生效"]
+        widths = [4, 12, 12, 10, 16, 20]
+        for c, (h, w) in enumerate(zip(headers, widths)):
+            tk.Label(
+                calib_grid,
+                text=h,
+                bg=CLR_CARD,
+                fg=CLR_MUTED,
+                font=("Segoe UI", 9),
+                width=w,
+            ).grid(row=0, column=c)
+
+        self._calib_vars: Dict[str, Dict[str, tk.StringVar]] = {}
+        self._calib_cur_vars: Dict[str, tk.StringVar] = {}
+        self._calib_drdiv_vars: Dict[str, tk.StringVar] = {}
+        for r, ax in enumerate(AXES, start=1):
+            tk.Label(
+                calib_grid,
+                text=ax,
+                bg=CLR_CARD,
+                fg=CLR_TEXT,
+                font=("Segoe UI", 9, "bold"),
+                width=4,
+            ).grid(row=r, column=0, pady=2)
+
+            existing = self.ctrl.axis_calib.get(ax) or {}
+            lead_v = tk.StringVar(
+                value="" if "lead_pitch_mm" not in existing
+                else str(existing["lead_pitch_mm"])
+            )
+            angle_v = tk.StringVar(
+                value="" if "step_angle_deg" not in existing
+                else str(existing["step_angle_deg"])
+            )
+            div_v = tk.StringVar(
+                value="" if "division" not in existing
+                else str(existing["division"])
+            )
+            self._calib_vars[ax] = {"lead": lead_v, "angle": angle_v, "div": div_v}
+            ttk.Entry(calib_grid, textvariable=lead_v, width=12).grid(
+                row=r, column=1, padx=4, pady=2
+            )
+            ttk.Entry(calib_grid, textvariable=angle_v, width=12).grid(
+                row=r, column=2, padx=4, pady=2
+            )
+            ttk.Entry(calib_grid, textvariable=div_v, width=10).grid(
+                row=r, column=3, padx=4, pady=2
+            )
+
+            drdiv_v = tk.StringVar(value="—")
+            self._calib_drdiv_vars[ax] = drdiv_v
+            tk.Label(
+                calib_grid,
+                textvariable=drdiv_v,
+                bg=CLR_CARD,
+                fg=CLR_MUTED,
+                font=("Consolas", 8),
+                width=16,
+                anchor="w",
+            ).grid(row=r, column=4, padx=4, pady=2)
+
+            cur_v = tk.StringVar(value="未設定")
+            self._calib_cur_vars[ax] = cur_v
+            tk.Label(
+                calib_grid,
+                textvariable=cur_v,
+                bg=CLR_CARD,
+                fg=CLR_MUTED,
+                font=("Consolas", 8),
+                width=20,
+                anchor="w",
+            ).grid(row=r, column=5, padx=4, pady=2)
+
+        ttk.Button(
+            calib_card,
+            text="套用機械校正參數",
+            style="Accent.TButton",
+            command=self._apply_axis_calib,
+        ).pack(padx=12, pady=(0, 8))
+
+        self._refresh_calib_display()
+
+    def _refresh_calib_display(self):
+        """
+        重新計算六軸「目前生效」欄的文字（estimate_um(ax, 1) 的結果）。
+        不掛進任何輪詢迴圈，只在卡片建構完成、與 _apply_axis_calib 成功後呼叫。
+        """
+        for ax in AXES:
+            v = self.ctrl.estimate_um(ax, 1)
+            if v is None:
+                self._calib_cur_vars[ax].set("未設定")
+            else:
+                self._calib_cur_vars[ax].set(f"≈ {v:.5f} μm/pulse")
+
+    def _apply_axis_calib(self):
+        """
+        套用軸機械校正參數：GUI 端先做型別/留空/部分填寫檢查，
+        全過才呼叫 controller 的 set_axis_calib()（那邊仍會再驗證一次，
+        但那道防線是防手動編輯 json，不是防這裡漏檢查，所以 GUI 端的
+        檢查不能省略）。
+        """
+        local_errors: List[str] = []
+        calib: Dict[str, dict] = {}
+        for ax in AXES:
+            vars_ = self._calib_vars[ax]
+            lead_s = vars_["lead"].get().strip()
+            angle_s = vars_["angle"].get().strip()
+            div_s = vars_["div"].get().strip()
+            filled = [bool(lead_s), bool(angle_s), bool(div_s)]
+
+            if not any(filled):
+                continue  # 三欄全空，本次不動這軸
+            if not all(filled):
+                local_errors.append(f"{ax}: 三個欄位需一起填寫或一起留空")
+                continue
+
+            try:
+                lead = float(lead_s)
+                angle = float(angle_s)
+                division = int(div_s)
+            except ValueError:
+                local_errors.append(f"{ax}: 導程/步進角須為數字、分度值須為整數")
+                continue
+
+            # math.isfinite() 排除 inf/nan——float("inf")/float("nan") 不會拋
+            # ValueError，且兩者都滿足 x <= 0 為 False，沒有這道檢查會被下面
+            # 的正數判斷放行，算出 "≈ nan μm" 這種顯示（GUI 端跟 ds102_ctrl.py
+            # 的 set_axis_calib()/estimate_um() 要用同一套檢查，不能只擋一邊）。
+            if not math.isfinite(lead) or lead <= 0:
+                local_errors.append(f"{ax}: 導程需為正數")
+                continue
+            if not math.isfinite(angle) or angle <= 0:
+                local_errors.append(f"{ax}: 步進角需為正數")
+                continue
+            if division <= 0:
+                local_errors.append(f"{ax}: 分度值必須是正整數")
+                continue
+
+            calib[ax] = {
+                "lead_pitch_mm": lead,
+                "step_angle_deg": angle,
+                "division": division,
+            }
+
+        if local_errors:
+            messagebox.showerror(
+                "機械校正參數格式錯誤", "\n".join(local_errors)
+            )
+            return
+
+        if not calib:
+            return  # 全部留空，沒有要更新的軸
+
+        ctrl_errors = self.ctrl.set_axis_calib(calib)
+        if ctrl_errors:
+            messagebox.showerror(
+                "機械校正參數套用失敗", "\n".join(ctrl_errors)
+            )
+            return
+
+        self._flash_banner("✔ 機械校正參數已存檔（僅影響 μm 估算顯示）", 5000)
+        self._refresh_calib_display()
+
     def _build_card_datalog(self, scr):
         """實驗數據記錄（CSV）。屬於「觀測」，留在儀表板。"""
         data_card = self._card(scr, "實驗數據記錄（CSV）")
@@ -1547,6 +1756,7 @@ class DS102GUI:
         ).pack(anchor="w", padx=14)
         self._build_card_sw_limits(scr)
         self._build_card_controller_cfg(scr)
+        self._build_card_axis_calib(scr)
 
     # ── 模式與驅動事件 ────────────────────────────────────────
     def _on_mode_change(self):
@@ -1911,7 +2121,11 @@ class DS102GUI:
             def _fmt(ax, pp=pos_p):
                 if ax not in pp:
                     return "—"  # 此點未含該軸 → goto 時不動
-                return f"{pp[ax]:.0f}"
+                txt = f"{pp[ax]:.0f}"
+                um = self.ctrl.estimate_um(ax, pp[ax])
+                if um is not None:
+                    txt += f" ≈ {um:,.1f} μm"
+                return txt
 
             # iid 直接用點名稱：Treeview 會把看起來像數字的儲存格值轉成 int
             # （"123"→123、"007"→7），從 values 讀回來的名稱對不上 saved_points 的
@@ -3839,6 +4053,10 @@ class DS102GUI:
                 f"韌體: {self.ctrl.firmware} | {self.ctrl.axis_count} 軸"
                 + (f" | DRDIV {_drdiv_txt}" if _drdiv_txt else "")
             )
+            # 軸機械校正卡片的「韌體 DRDIV 參考」欄：純資訊性顯示，
+            # 跟 division 輸入框不互相驗證（見卡片建構處的說明）。
+            for ax, var in self._calib_drdiv_vars.items():
+                var.set(self.ctrl.axis_drdiv.get(ax, "—"))
             self._set_drive_buttons_state("normal")
             for grp in self._all_axis_btn_groups:
                 for ax, b in grp.items():
@@ -4751,7 +4969,12 @@ class DS102GUI:
                     sv.set("未連線" if not connected else "未啟用")
                 continue
 
-            var.set(f"{pos_work.get(ax, 0.0):,.0f}")
+            pos_val = pos_work.get(ax, 0.0)
+            txt = f"{pos_val:,.0f}"
+            um = self.ctrl.estimate_um(ax, pos_val)
+            if um is not None:
+                txt += f" ≈ {um:,.1f} μm"
+            var.set(txt)
             if lbl:
                 lbl.config(fg=CLR_DANGER if stale else CLR_TEXT)
             if sv:

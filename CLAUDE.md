@@ -136,7 +136,19 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 
 ### 單位與座標（容易改錯的地方）
 
-- **單位一律 pulse，沒有 um / mm 切換**（2026-08-05 移除）。連線時送 `AXI{n}:UNIT 0` 把控制器也固定在 pulse，所以 `POS?` 回傳值即 pulse，不需要任何換算函式。之所以拿掉：控制器裡的 `SD`（每 pulse 距離）並未配置實際尺度（`RESOLUT?` = 1），換算成 um/mm 等於拿未經驗證的假設去乘除。
+- **單位一律 pulse，沒有 um / mm 切換**（2026-08-05 移除）。連線時送 `AXI{n}:UNIT 0` 把控制器也固定在 pulse，所以 `POS?` 回傳值即 pulse，不需要任何換算函式。之所以拿掉：控制器裡的 `SD`（每 pulse 距離）並未配置實際尺度（`RESOLUT?` = 1），換算成 um/mm 等於拿未經驗證的假設去乘除。**這個決定仍然成立**——下面的〈軸機械校正參數〉是額外疊加的估算顯示，不是恢復這個切換。
+
+#### 軸機械校正參數（`axis_calibration.json`，2026-08-18，純估算顯示）
+
+使用者提供了實際滑台的官網規格（駿河精機 KHE06008-C，導程 1mm 滾珠螺桿＋0.72°/step 五相馬達），驗算出 `um/pulse = 導程(um) ÷ (360/步進角 × 分度值)` 這條公式跟官網標示的「Full-step 2μm/Pulse、Half-step 1μm/Pulse」完全吻合，因此新增這個功能——但**刻意只做附加估算顯示，不是恢復 um/mm 單位切換**：`move_step`／`goto_point`／限位比對／教點座標比對永遠只認 pulse，um 純粹是額外算出來、擺在座標旁邊給人參考的數字。
+
+- **資料模型**：`ctrl.axis_calib: Dict[str, dict]`（`ds102_ctrl.py`），只有**參數填齊的軸才會是這個字典的 key**（跟 `sw_limits` 六軸都預先擺 `(None, None)` 不同——這裡沒有「安全預設值」的需求）。每軸存 `{lead_pitch_mm, step_angle_deg, division, ts}`。`division` 是**倍數本身**（Full=1、Half=2、1/10=10...），不是 `AXI{n}:DRDIV?` 那種韌體查詢索引——見下方為什麼這兩者刻意不合併。
+- **持久化**：`recordings/axis_calibration.json`，走 `_write_json_with_backup()`，套用跟 `teaching_points.json` 同一套 `_axis_calib_loaded` 拒寫保護（沒 load 過就存會拒寫並記 ERROR）。`set_axis_calib(calib)` 是**合併更新**（只更新傳入的軸，其餘軸既有資料不受影響，仿照 `capture_controller_config()` 的合併邏輯），不是整份覆蓋。已加進 `NON_RECORDING_JSON`。
+- **驗證是「全部成功或全部不動」**：`set_axis_calib()` 逐軸檢查導程/步進角為正數、分度值為正整數，任一軸不合法就整批不寫入、回傳錯誤字串清單——不會出現「六軸裡兩軸套用成功、一軸被拒絕」這種混合結果，避免使用者誤以為都套用了。GUI 端（`_apply_axis_calib()`）在呼叫 controller 之前還有一層本地檢查：**三個欄位必須一起填、一起留空**，只填一兩欄會被當成本地格式錯誤直接擋下，不會送到 controller。
+- **`estimate_um(ax, pulse) -> Optional[float]`** 是純計算（無 I/O），軸沒有校正參數或參數不合法一律回傳 `None`，呼叫端據此決定「不顯示」而不是顯示 0 或猜測值。掛在三個既有重繪點（`_redraw_positions()`／`_refresh_points()`／教點列表），都是純格式化附加文字，**沒有新增任何輪詢迴圈**——`_start_poller` 100ms 節奏跑的是乘法，不是查詢，不違反「絕不碰序列埠」的規則。`StatusBar.update_coords()` 刻意**沒有**附加 μm（Label 固定 `width=10`，空間放不下）。
+- 🔴 **`axis_calib.division`（使用者手動輸入）跟 `axis_drdiv`（連線時查詢、對 AMS 驅動器沒意義的軟體暫存器）刻意不合併、不自動代入、不互相驗證**——一個是使用者斷言的事實，一個是已知不可信的查詢結果，且兩者的數值定義不同（`division` 是倍數，`axis_drdiv` 的原始回應是查表索引）。GUI 上把兩欄並列顯示純粹讓使用者參考，**不要**為了「省事」讓 division 欄位預設抓 `axis_drdiv` 的值，那會把索引當倍數用，算出錯誤的 μm。
+- 輸入卡片（`_build_card_axis_calib()`）放在**移動控制分頁**、緊接「控制器設定」卡片之後，六軸一視同仁列出（不弱化 U/V/W 這類未接滑台的軸，跟既有 `_build_card_sw_limits` 的寫法一致）。套用按鈕用 `Accent.TButton`，**不是** `Warn.TButton`、也**沒有**確認視窗——這不是清除保護、沒有安全含意，跟 `_apply_sw_limits` 清空限制時的情境不同，照抄那套確認流程反而是把安全性修正的既定模式錯誤地移植到非安全情境。
+- **驗證過的手算範例**：KHE06008-C 規格（導程 1mm、步進角 0.72、division=1）代入 `estimate_um("X", 500)` = `500 × (1×1000)/((360/0.72)×1)` = `500 × 2.0` = `1000.0` μm，與官網「Full-step 2μm/Pulse」吻合。
 - `positions` property 回傳的是**工作座標 = 機械位置 − offset**。要機械座標請直接讀 `_positions_pulse`（記得取鎖）。
 - 座標系分工：**Teaching Point 存工作座標**（`goto_point` 會自行加回 offset），而 `_positions_pulse` 與 `sw_limits` 是**機械座標**。跨這條界線比較數值前先確認在同一個座標系。
 - ⚠ 但這只是約定、沒有強制：`save_point()` **完全不減 offset**，它照收 GUI 傳進來的數字。只有走「填入目前座標」按鈕（`_do_fill_current`，用的是 `ctrl.positions`）才保證存進去的是工作座標。設過 offset 之後手打一組數字存檔，goto 時會被**多加一次 offset**。
@@ -313,7 +325,7 @@ DS102 的 **MEMSW（復歸樣式）與韌體軟體限位都是 RAM-only**，控�
 | `AXI{n}:CWSLP?` / `CCWSLP?` | 軟體限位**座標** |
 | `AXI{n}:CWSLE?` / `CCWSLE?` | 軟體限位啟用(0=停用) |
 | `AXI{n}:RESOLUT?` | 1 pulse 的距離 = `STANDARD?` ÷ 分割數。手冊第 94 頁〈Unit Set〉證實 `RESOLUT?`＝`1` 的原因：真正代表機械行程的是 `SD`（馬達整步時的機械位移量，螺桿導程相關），要透過 DT100 手持終端機或控制軟體手動輸入，這台機器從未設定過——不是控制器的 bug，是沒人填過這個值 |
-| `AXI{n}:DRDIV?` | 驅動器分割(0=full step…15=1/250)。官方指令名 `:DRiverDIVision?`/`:DRDIV?`，查證來源 `ds102 (2).pdf` 第 131 頁〈Inquiry Command〉表。🔴 **對這台滑台裝的 AMS（微步進）型驅動器沒有意義，`:DRDIV` 指令對它完全不生效**——手冊第 73-75 頁〈3.5 Driver division number setting〉明講：Normal 型驅動器才能用手持終端機／軟體／通訊指令切換 FULL/Half；**Micro step 型驅動器要打開外殼、用螺絲起子調驅動器上的實體旋轉開關（DATA1）**，控制器沒有電路能讀回這顆開關的實際位置。2026-08-18 實機驗證：使用者把實體開關轉到 6，`DRDIV?` 依然回 `0`——因為查詢到的只是控制器內部一個獨立的軟體暫存器（預設 `0`），跟實體開關完全沒有連動，這是驅動器硬體設計本身如此，不是查詢邏輯錯誤。實體開關（DATA1）與軟體 `DRDIV?`／`:DRDIV` 是**同一套 0～F(15) 編號、對照表完全一致**（第 75 頁表格逐列以「步進角 = 0.72°÷分割數」驗算過，例如 `6=1/10`：0.72÷10=0.072° 吻合）：`0=1/1(Full) 1=1/2 2=1/2.5 3=1/4 4=1/5 5=1/8 6=1/10 7=1/20 8=1/25 9=1/40 A=1/50 B=1/80 C=1/100 D=1/125 E=1/200 F=1/250`（⚠ 這張表第一版用 `pdftotext -layout` 擷取時欄位對錯位，誤植成「差一位」，後來改用 `pdftotext -table` 重新擷取並逐列驗算才發現，查 PDF 表格前**兩種擷取模式都跑一次交叉比對比較保險**）。`connect()` 會查一次存進 `ctrl.axis_drdiv: Dict[str, str]`（GUI 頂部與 LOG 顯示），**這顆值目前對這台機器而言只是「軟體暫存器內容」，不代表實際細分設定**，pulse→um 換算不能拿它當依據 |
+| `AXI{n}:DRDIV?` | 驅動器分割(0=full step…15=1/250)。官方指令名 `:DRiverDIVision?`/`:DRDIV?`，查證來源 `ds102 (2).pdf` 第 131 頁〈Inquiry Command〉表。🔴 **對這台滑台裝的 AMS（微步進）型驅動器沒有意義，`:DRDIV` 指令對它完全不生效**——手冊第 73-75 頁〈3.5 Driver division number setting〉明講：Normal 型驅動器才能用手持終端機／軟體／通訊指令切換 FULL/Half；**Micro step 型驅動器要打開外殼、用螺絲起子調驅動器上的實體旋轉開關（DATA1）**，控制器沒有電路能讀回這顆開關的實際位置。2026-08-18 實機驗證：使用者把實體開關轉到 6，`DRDIV?` 依然回 `0`——因為查詢到的只是控制器內部一個獨立的軟體暫存器（預設 `0`），跟實體開關完全沒有連動，這是驅動器硬體設計本身如此，不是查詢邏輯錯誤。實體開關（DATA1）與軟體 `DRDIV?`／`:DRDIV` 是**同一套 0～F(15) 編號、對照表完全一致**（第 75 頁表格逐列以「步進角 = 0.72°÷分割數」驗算過，例如 `6=1/10`：0.72÷10=0.072° 吻合）：`0=1/1(Full) 1=1/2 2=1/2.5 3=1/4 4=1/5 5=1/8 6=1/10 7=1/20 8=1/25 9=1/40 A=1/50 B=1/80 C=1/100 D=1/125 E=1/200 F=1/250`（⚠ 這張表第一版用 `pdftotext -layout` 擷取時欄位對錯位，誤植成「差一位」，後來改用 `pdftotext -table` 重新擷取並逐列驗算才發現，查 PDF 表格前**兩種擷取模式都跑一次交叉比對比較保險**）。`connect()` 會查一次存進 `ctrl.axis_drdiv: Dict[str, str]`（GUI 頂部與 LOG 顯示），**這顆值目前對這台機器而言只是「軟體暫存器內容」，不代表實際細分設定**，pulse→um 換算不能拿它當依據——真的要換算請用〈軸機械校正參數〉那組使用者手動輸入的 `axis_calib.division`，見下方〈單位與座標〉一節 |
 | `AXI{n}:PULSA?` / `HOMEP?` | 絕對驅動座標 / Home 座標 |
 | `TCH00?`～`TCH63?` | 控制器**內建 64 組 teaching point** |
 
