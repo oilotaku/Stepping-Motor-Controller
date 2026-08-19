@@ -18,6 +18,9 @@ data/
 ds102_log_*.log
 *.log
 
+# --- 報告產出（md-document skill，本機檔案，不進版控）---
+reports/
+
 # --- 打包產出（PyInstaller / auto-py-to-exe）---
 output/
 build/
