@@ -722,6 +722,13 @@ class DS102GUI:
         self.root.title("DS102 / DS112 步進馬達控制器 ")
         self.root.configure(bg=CLR_BG)
         self.root.minsize(1020, 720)
+        # 開機預設最大化，不猜固定像素尺寸——這幾輪陸續加了不少新卡片
+        # （軸校正參數、安全常數橫幅、尋光控制列與更寬的圖表），沒有明確
+        # geometry() 時 Tk 只會照 widget 的最小需求尺寸開窗，內容容易被
+        # 擠壓成需要捲動。用 state("zoomed")（Windows 專用，非真正全螢幕，
+        # 保留標題列/工作列）自動吃滿目前螢幕的可用空間，不受解析度影響，
+        # 使用者仍可自行拖曳還原成任意大小。
+        self.root.state("zoomed")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Escape = 停止所有軸。機台旁操作時滑鼠不一定在手上，而停止鍵
