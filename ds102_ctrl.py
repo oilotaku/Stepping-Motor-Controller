@@ -2017,6 +2017,23 @@ class DS102Controller:
             self._persist_axis_calib()
         return []
 
+    def clear_axis_calib(self, ax: str) -> bool:
+        """
+        清除單一軸的機械校正參數。
+
+        `_apply_axis_calib()`（GUI）把「三欄全空」當成「本次不動這軸」，
+        因此使用者把已存的值手動清空再按套用，並不會真的刪除資料——這是
+        故意的（避免使用者不小心清掉某一欄就整軸消失），但也代表沒有任何
+        路徑能移除已存的校正參數。這個方法是唯一的清除入口，語意明確：
+        呼叫了就是真的要刪，不是「留空跳過」。
+        """
+        if ax not in self.axis_calib:
+            return False
+        self.axis_calib.pop(ax)
+        self._log("INFO", f"{ax} 軸的機械校正參數已清除")
+        self._persist_axis_calib()
+        return True
+
     def estimate_um(self, ax: str, pulse: float) -> Optional[float]:
         """
         把 pulse 估算成 μm，純顯示用途。

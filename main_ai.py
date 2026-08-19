@@ -1327,8 +1327,8 @@ class DS102GUI:
 
         calib_grid = tk.Frame(calib_card, bg=CLR_CARD)
         calib_grid.pack(fill="x", padx=12, pady=(0, 8))
-        headers = ["軸", "導程 (mm)", "步進角 (度)", "分度值", "韌體 DRDIV 參考", "目前生效"]
-        widths = [4, 12, 12, 10, 16, 20]
+        headers = ["軸", "導程 (mm)", "步進角 (度)", "分度值", "韌體 DRDIV 參考", "目前生效", ""]
+        widths = [4, 12, 12, 10, 16, 20, 6]
         for c, (h, w) in enumerate(zip(headers, widths)):
             tk.Label(
                 calib_grid,
@@ -1399,6 +1399,13 @@ class DS102GUI:
                 width=20,
                 anchor="w",
             ).grid(row=r, column=5, padx=4, pady=2)
+
+            ttk.Button(
+                calib_grid,
+                text="清除",
+                style="Flat.TButton",
+                command=lambda a=ax: self._do_clear_axis_calib(a),
+            ).grid(row=r, column=6, padx=4, pady=2)
 
         ttk.Button(
             calib_card,
@@ -1489,6 +1496,37 @@ class DS102GUI:
 
         self._flash_banner("✔ 機械校正參數已存檔（僅影響 μm 估算顯示）", 5000)
         self._refresh_calib_display()
+
+    def _do_clear_axis_calib(self, ax: str):
+        """
+        清除單一軸的機械校正參數。
+
+        `_apply_axis_calib()` 把「三欄全空」當成「本次不動這軸」（避免使用者
+        不小心清掉一欄就整軸消失），所以清除需要一個獨立、明確的入口——
+        這顆按鈕就是。這軸本來就沒設定時不彈任何視窗，按下去沒反應是合理的。
+        """
+        existing = self.ctrl.axis_calib.get(ax)
+        if not existing:
+            return
+        lead = existing.get("lead_pitch_mm")
+        angle = existing.get("step_angle_deg")
+        division = existing.get("division")
+        if not messagebox.askyesno(
+            "清除機械校正參數",
+            f"確定要清除 {ax} 軸的機械校正參數？\n\n"
+            f"目前設定：導程 {lead}mm、步進角 {angle}°、分度值 {division}\n\n"
+            f"清除後座標旁邊將不再顯示 {ax} 軸的估算 μm 值，"
+            f"直到重新輸入並套用。",
+            icon="warning",
+            default="no",
+        ):
+            return
+        if self.ctrl.clear_axis_calib(ax):
+            self._calib_vars[ax]["lead"].set("")
+            self._calib_vars[ax]["angle"].set("")
+            self._calib_vars[ax]["div"].set("")
+            self._refresh_calib_display()
+            self._flash_banner(f"✔ {ax} 軸機械校正參數已清除", 5000)
 
     def _build_card_datalog(self, scr):
         """實驗數據記錄（CSV）。屬於「觀測」，留在儀表板。"""
