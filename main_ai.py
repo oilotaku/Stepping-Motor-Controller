@@ -32,6 +32,7 @@ import time
 import logging
 import math
 import re
+import itertools
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -3314,23 +3315,55 @@ class DS102GUI:
 
     def _build_scan_plot(self, parent):
         """
-        建立尋光分頁的嵌入式即時圖：上排 XY／XZ 投影並排、下排功率收斂全寬，
-        圖表下方一列數值摘要（目前功率／最佳功率／樣本數／目前座標）。
+        建立尋光分頁的嵌入式即時圖：上排「配對投影／座標變化趨勢」並排、
+        下排功率收斂全寬，圖表下方一列數值摘要（目前功率／最佳功率／
+        樣本數／目前座標）。
 
         用單一 Figure + gridspec（而非三張獨立 Figure）：三張子圖共用一次
         draw_idle()，重繪成本比三個獨立 canvas 各自 draw 低。
+
+        2026-08-19「尋光彈性選軸」（1~6 軸）之前，左上／右上固定畫 XY／XZ
+        投影，選了 X/Y/Z 以外的軸組合時兩張子圖都會半殘。改成：左上是
+        可切換軸對的 2D 投影（`_scan_ax_xy`，名字沿用但語意變成「配對
+        投影」，可切換到任意兩軸組合）、右上是多軸 1D 相對位移趨勢線
+        （`_scan_ax_xz`，語意變成「趨勢線」，天生支援任意 1~6 軸、不需要
+        配對）。gridspec 骨架不變。
         """
         chart_card = self._card(parent, "即時軌跡與收斂")
 
+        # ── 「投影軸對」控制列：搜尋軸數決定顯示模式，見 _update_scan_pair_
+        # controls。三個元件建立時就都建好，之後只切換 pack/pack_forget，
+        # 不把整條列 pack_forget——避免像橫幅那樣造成版面跳動（見 CLAUDE.md
+        # 〈第四批修正〉）。內容物切換不影響這條列本身的存在。
+        pair_ctrl = tk.Frame(chart_card, bg=CLR_CARD)
+        pair_ctrl.pack(fill="x", padx=12, pady=(2, 0))
+        self._scan_pair_label = tk.Label(
+            pair_ctrl, text="投影軸對", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 8)
+        )
+        self._scan_pair_combo = ttk.Combobox(pair_ctrl, state="readonly", width=6)
+        self._scan_pair_combo.bind("<<ComboboxSelected>>", self._on_scan_pair_change)
+        self._scan_pair_static_label = tk.Label(
+            pair_ctrl, text="", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        )
+        # 目前 Combobox／靜態文字所代表的候選配對清單（"X-Y" 這種字串），
+        # 由 _update_scan_pair_controls 依這次搜尋軸重建；空清單＝只選了
+        # 1 軸、沒有配對可言。存字串而非 index，理由跟 ORG_MODES 一樣：
+        # 避免「清單起始位置不同、index 換算差一位」這類錯誤。
+        self._scan_pair_options: List[str] = []
+        # 這次搜尋涵蓋哪些軸（_scan_plot_reset 當下算出的 selected_axes，
+        # 依 AXES 固定順序排序）。scanner.active_axes 落地前的過渡態
+        # （active is None）用這份頂替，見 _scan_redraw_figure。
+        self._scan_last_selected_axes: List[str] = []
+
         self._scan_fig = Figure(figsize=(8, 5.5), dpi=100, facecolor=CLR_CARD)
         gs = self._scan_fig.add_gridspec(2, 2, height_ratios=[1, 1.1], hspace=0.45, wspace=0.28)
-        self._scan_ax_xy = self._scan_fig.add_subplot(gs[0, 0])
-        self._scan_ax_xz = self._scan_fig.add_subplot(gs[0, 1])
+        self._scan_ax_xy = self._scan_fig.add_subplot(gs[0, 0])   # 配對投影（軸對可切換）
+        self._scan_ax_xz = self._scan_fig.add_subplot(gs[0, 1])   # 多軸相對位移趨勢線
         self._scan_ax_pwr = self._scan_fig.add_subplot(gs[1, :])
 
         for ax, title, xlabel, ylabel in (
-            (self._scan_ax_xy, "XY 投影", "X (pulse)", "Y (pulse)"),
-            (self._scan_ax_xz, "XZ 投影", "X (pulse)", "Z (pulse)"),
+            (self._scan_ax_xy, "投影", "", ""),
+            (self._scan_ax_xz, "座標變化（相對起點）", "樣本編號", "Δ位置 (pulse)"),
             (self._scan_ax_pwr, "功率收斂", "樣本編號", "功率 (dBm)"),
         ):
             ax.set_facecolor(CLR_CARD)
@@ -3342,9 +3375,11 @@ class DS102GUI:
             for spine in ax.spines.values():
                 spine.set_color(CLR_BORDER)
 
-        # XY／XZ 投影：走過的路徑（細線、低對比）+ 起點／目前位置／最佳點
+        # 配對投影：走過的路徑（細線、低對比）+ 起點／目前位置／最佳點
         # （不同色 marker）+ 無效樣本（叉號）。用 set_data / set_offsets
-        # 重繪既有 artist，不必每輪 ax.clear() 重畫全部。
+        # 重繪既有 artist，不必每輪 ax.clear() 重畫全部。標題與軸標籤隨
+        # 目前選取的軸對動態更新（見 _scan_redraw_figure），這裡先給
+        # 通用預設值。
         (self._scan_line_xy_path,) = self._scan_ax_xy.plot(
             [], [], "-", color=CLR_MUTED, linewidth=0.8, zorder=1
         )
@@ -3364,34 +3399,32 @@ class DS102GUI:
             fontsize=6, facecolor=CLR_CARD, edgecolor=CLR_BORDER, labelcolor=CLR_TEXT, loc="best"
         )
 
-        (self._scan_line_xz_path,) = self._scan_ax_xz.plot(
-            [], [], "-", color=CLR_MUTED, linewidth=0.8, zorder=1
-        )
-        self._scan_scatter_xz_bad = self._scan_ax_xz.scatter(
-            [], [], color=CLR_DANGER, marker="x", s=28, zorder=2
-        )
-        self._scan_scatter_xz_start = self._scan_ax_xz.scatter(
-            [], [], color=CLR_INFO, marker="o", s=32, zorder=3
-        )
-        self._scan_scatter_xz_best = self._scan_ax_xz.scatter(
-            [], [], color=CLR_WARN, marker="*", s=90, zorder=4
-        )
-        self._scan_scatter_xz_cur = self._scan_ax_xz.scatter(
-            [], [], color=CLR_ACCENT, marker="o", s=40, zorder=5
-        )
-
-        # 「本次搜尋未包含 X/Y（或 X/Z）軸」防呆文字——使用者可以只勾選
-        # 部分軸搜尋（例如只搜 X/Z），這種情況下 XY 投影裡的 Y 座標全程
-        # 不動，畫出來會是一條沒有意義的水平線，容易被誤讀成「已對準」。
-        # 用疊在子圖中央的文字取代散點/軌跡，見 _scan_redraw_figure。
-        self._scan_xy_unavail_text = self._scan_ax_xy.text(
+        # 「僅選取 1 軸，無法顯示 2D 投影」防呆文字——2 軸以上都至少有一組
+        # 配對可畫，只有剛好 1 軸時完全沒有配對可言。用疊在子圖中央的文字
+        # 取代散點/軌跡，見 _scan_redraw_figure。
+        self._scan_pair_unavail_text = self._scan_ax_xy.text(
             0.5, 0.5, "", transform=self._scan_ax_xy.transAxes,
             ha="center", va="center", color=CLR_MUTED, fontsize=8, wrap=True,
         )
-        self._scan_xz_unavail_text = self._scan_ax_xz.text(
-            0.5, 0.5, "", transform=self._scan_ax_xz.transAxes,
-            ha="center", va="center", color=CLR_MUTED, fontsize=8, wrap=True,
-        )
+
+        # 座標變化趨勢：固定六條線（每軸一條），重繪時只更新「這次搜尋
+        # 涵蓋」的軸，沒涵蓋的軸線資料保持空，不動態增減 artist 數量。
+        # 顏色刻意不用 CLR_ACCENT／CLR_DANGER／CLR_WARN／CLR_INFO——這幾色
+        # 在本專案是「目前選取軸」「警報」等全域語意（CLAUDE.md〈視覺設計
+        # 原則〉），這裡的「軸」是搜尋範圍的概念，跟操作面板選到哪一軸是
+        # 兩件事，混用會誤導。X/Y/Z 用 CLR_TEXT、U/V/W 用 CLR_MUTED 分群，
+        # 同群組內再用線型（實線/虛線/點線）分軸。
+        trend_style = {
+            "X": (CLR_TEXT, "-"), "Y": (CLR_TEXT, "--"), "Z": (CLR_TEXT, ":"),
+            "U": (CLR_MUTED, "-"), "V": (CLR_MUTED, "--"), "W": (CLR_MUTED, ":"),
+        }
+        self._scan_trend_lines = {}
+        for ax_name in AXES:
+            color, style = trend_style[ax_name]
+            (line,) = self._scan_ax_xz.plot(
+                [], [], style, color=color, linewidth=1.1, label=ax_name
+            )
+            self._scan_trend_lines[ax_name] = line
 
         # 功率收斂：即時功率折線 + 累積最佳（逐點 running max）虛線
         (self._scan_line_pwr_cur,) = self._scan_ax_pwr.plot(
@@ -3428,11 +3461,71 @@ class DS102GUI:
                 cell, textvariable=var, bg=CLR_CARD, fg=CLR_TEXT, font=("Consolas", 13, "bold")
             ).pack(anchor="w", padx=8, pady=(0, 6))
 
-    def _scan_plot_reset(self):
+    def _update_scan_pair_controls(self, selected_axes):
         """
-        清空尋光圖表資料與數值摘要。在 _do_start_scan 開始新一輪尋光時呼叫
-        （主執行緒／按鈕回呼），避免上一輪殘留的軌跡疊在新一輪上面。
+        依這次搜尋涵蓋的軸數，切換左上「投影軸對」控制列的顯示模式：
+        ≥3 軸顯示 Combobox（可切換配對，預設選固定順序最前面兩軸的組合）、
+        剛好 2 軸顯示靜態文字（只有一種可能，不需要互動元件）、剛好 1 軸
+        整條列不顯示任何文字（沒有配對可言）。三個元件在 _build_scan_plot
+        就都建好，這裡只切換 pack/pack_forget，不整條列一起隱藏。
         """
+        ordered = [ax for ax in AXES if ax in selected_axes]
+        self._scan_pair_options = [f"{a}-{b}" for a, b in itertools.combinations(ordered, 2)]
+
+        self._scan_pair_label.pack_forget()
+        self._scan_pair_combo.pack_forget()
+        self._scan_pair_static_label.pack_forget()
+
+        if len(ordered) >= 3:
+            self._scan_pair_combo["values"] = self._scan_pair_options
+            self._scan_pair_combo.set(self._scan_pair_options[0])
+            self._scan_pair_label.pack(side="left")
+            self._scan_pair_combo.pack(side="left", padx=(6, 0))
+        elif len(ordered) == 2:
+            self._scan_pair_static_label.config(text=f"投影軸對：{self._scan_pair_options[0]}")
+            self._scan_pair_static_label.pack(side="left")
+        # len(ordered) <= 1（0 理論上不會發生，_do_start_scan 已在打開確認
+        # 視窗前擋下 0 軸）：三個元件都不顯示，配對投影子圖改顯示提示文字。
+
+    def _update_scan_trend_legend(self, selected_axes):
+        """
+        重建座標變化趨勢子圖的圖例，只列出這次搜尋涵蓋的軸——沒畫的線
+        不該出現在圖例裡造成困惑。
+        """
+        ordered = [ax for ax in AXES if ax in selected_axes]
+        legend = self._scan_ax_xz.get_legend()
+        if legend is not None:
+            legend.remove()
+        if ordered:
+            handles = [self._scan_trend_lines[ax] for ax in ordered]
+            self._scan_ax_xz.legend(
+                handles, ordered, fontsize=6, facecolor=CLR_CARD, edgecolor=CLR_BORDER,
+                labelcolor=CLR_TEXT, loc="best",
+            )
+
+    def _on_scan_pair_change(self, event=None):
+        """
+        「投影軸對」Combobox 的 command。這次搜尋頂多幾百筆樣本，直接重繪
+        整個 figure 即可，不特別只重繪左上子圖——資料量小，拆分優化只會
+        犧牲程式碼清晰度換不到有意義的效能差距。
+        """
+        if _MATPLOTLIB_AVAILABLE:
+            self._scan_redraw_figure()
+
+    def _scan_plot_reset(self, selected_axes=None):
+        """
+        清空尋光圖表資料與數值摘要，並依這次搜尋涵蓋的軸數重建「投影軸對」
+        控制列與趨勢線圖例。在 _do_start_scan 開始新一輪尋光時呼叫
+        （主執行緒／按鈕回呼，早於背景執行緒啟動，此時 scanner.active_axes
+        還沒有值），避免上一輪殘留的軌跡疊在新一輪上面。
+
+        selected_axes 對應 _do_start_scan 裡使用者這次勾選的搜尋軸。省略
+        （None）時退回讀取目前 GUI 勾選狀態——供既有呼叫端（測試在案例
+        之間單純想清空圖表、不關心控制列細節）沿用舊的免參數呼叫方式。
+        """
+        if selected_axes is None:
+            selected_axes = [ax for ax in AXES if self._scan_axis_selected_vars[ax].get()]
+
         with self._scan_plot_lock:
             self._scan_plot_pending = []
         self._scan_samples = []
@@ -3445,20 +3538,26 @@ class DS102GUI:
 
         if not _MATPLOTLIB_AVAILABLE:
             return
+
+        ordered = [ax for ax in AXES if ax in selected_axes]
+        self._scan_last_selected_axes = ordered
+
         empty_xy = np.empty((0, 2))  # set_offsets 內部要求 2D 形狀，空 list 會被當成 1D 陣列而炸掉
         self._scan_line_xy_path.set_data([], [])
-        self._scan_line_xz_path.set_data([], [])
         self._scan_line_pwr_cur.set_data([], [])
         self._scan_line_pwr_best.set_data([], [])
         for scatter in (
             self._scan_scatter_xy_bad, self._scan_scatter_xy_start,
             self._scan_scatter_xy_best, self._scan_scatter_xy_cur,
-            self._scan_scatter_xz_bad, self._scan_scatter_xz_start,
-            self._scan_scatter_xz_best, self._scan_scatter_xz_cur,
         ):
             scatter.set_offsets(empty_xy)
-        self._scan_xy_unavail_text.set_text("")
-        self._scan_xz_unavail_text.set_text("")
+        self._scan_pair_unavail_text.set_text("")
+        for line in self._scan_trend_lines.values():
+            line.set_data([], [])
+
+        self._update_scan_pair_controls(ordered)
+        self._update_scan_trend_legend(ordered)
+
         self._scan_canvas.draw_idle()
 
     def _on_scan_sample(self, sample):
@@ -3561,7 +3660,8 @@ class DS102GUI:
     def _scan_redraw_figure(self):
         """
         用 self._scan_samples 的完整歷史重建三張子圖的 artist 資料。
-        呼叫端（_scan_plot_extend）已確保只在主執行緒、matplotlib 可用時呼叫。
+        呼叫端（_scan_plot_extend／_on_scan_pair_change）已確保只在主
+        執行緒、matplotlib 可用時呼叫。
         """
         samples = self._scan_samples
         if not samples:
@@ -3571,86 +3671,89 @@ class DS102GUI:
         bad = [s for s in samples if not s.ok]
         empty_xy = np.empty((0, 2))  # set_offsets 內部要求 2D 形狀，空 list 會被當成 1D 陣列而炸掉
 
-        # 使用者可以只勾選部分軸搜尋（例如只搜 X/Z），這種情況下 XY 投影裡
-        # 的 Y 座標全程不動，畫出來會是一條沒有意義的水平線，容易被誤讀成
-        # 「已對準」。active_axes 是 scanner.run() 開始後才會有值（_active_axes()
-        # 與使用者勾選交集後的最終結果），尚未開始（active is None）沿用
-        # 舊行為照常畫，不因為這個防呆而改變既有時序。
-        scanner = self._active_scanner
-        active = getattr(scanner, "active_axes", None) if scanner else None
-        xy_available = active is None or ("X" in active and "Y" in active)
-        xz_available = active is None or ("X" in active and "Z" in active)
-
-        if xy_available:
-            self._scan_xy_unavail_text.set_text("")
-            xs = [s.coords.get("X", 0.0) for s in valid]
-            ys = [s.coords.get("Y", 0.0) for s in valid]
-            self._scan_line_xy_path.set_data(xs, ys)
-        else:
-            self._scan_xy_unavail_text.set_text("本次搜尋未包含 X/Y 軸")
+        # ── 配對投影：目前 Combobox／靜態文字選取的軸對，一定源自
+        # _scan_plot_reset 依這次搜尋軸算出的 _scan_pair_options，本身就是
+        # 選定範圍內的合法配對，不需要再對 active_axes 額外判斷可用性——
+        # 跟舊版 XY/XZ 寫死時不同（那時使用者可能只搜 X/Z，卻仍畫著沒
+        # 意義的 XY 投影）。
+        pair_options = self._scan_pair_options
+        if not pair_options:
+            axis_name = self._scan_last_selected_axes[0] if self._scan_last_selected_axes else "?"
+            self._scan_pair_unavail_text.set_text(
+                f"僅選取 1 軸（{axis_name}），無法顯示 2D 投影，請見右側座標變化趨勢"
+            )
+            self._scan_ax_xy.set_title("投影", color=CLR_TEXT, fontsize=9)
+            self._scan_ax_xy.set_xlabel("", color=CLR_TEXT, fontsize=8)
+            self._scan_ax_xy.set_ylabel("", color=CLR_TEXT, fontsize=8)
             self._scan_line_xy_path.set_data([], [])
-
-        if xz_available:
-            self._scan_xz_unavail_text.set_text("")
-            xs_z = [s.coords.get("X", 0.0) for s in valid]
-            zs = [s.coords.get("Z", 0.0) for s in valid]
-            self._scan_line_xz_path.set_data(xs_z, zs)
+            for scatter in (
+                self._scan_scatter_xy_bad, self._scan_scatter_xy_start,
+                self._scan_scatter_xy_best, self._scan_scatter_xy_cur,
+            ):
+                scatter.set_offsets(empty_xy)
         else:
-            self._scan_xz_unavail_text.set_text("本次搜尋未包含 X/Z 軸")
-            self._scan_line_xz_path.set_data([], [])
+            current = pair_options[0] if len(pair_options) == 1 else (
+                self._scan_pair_combo.get() or pair_options[0]
+            )
+            a, b = current.split("-")
+            self._scan_pair_unavail_text.set_text("")
+            self._scan_ax_xy.set_title(f"{a}-{b} 投影", color=CLR_TEXT, fontsize=9)
+            self._scan_ax_xy.set_xlabel(f"{a} (pulse)", color=CLR_TEXT, fontsize=8)
+            self._scan_ax_xy.set_ylabel(f"{b} (pulse)", color=CLR_TEXT, fontsize=8)
 
-        start, cur = samples[0], samples[-1]
-        if xy_available:
+            xs = [s.coords.get(a, 0.0) for s in valid]
+            ys = [s.coords.get(b, 0.0) for s in valid]
+            self._scan_line_xy_path.set_data(xs, ys)
+
+            start, cur = samples[0], samples[-1]
             self._scan_scatter_xy_start.set_offsets(
-                [[start.coords.get("X", 0.0), start.coords.get("Y", 0.0)]]
+                [[start.coords.get(a, 0.0), start.coords.get(b, 0.0)]]
             )
             self._scan_scatter_xy_cur.set_offsets(
-                [[cur.coords.get("X", 0.0), cur.coords.get("Y", 0.0)]]
+                [[cur.coords.get(a, 0.0), cur.coords.get(b, 0.0)]]
             )
-        else:
-            self._scan_scatter_xy_start.set_offsets(empty_xy)
-            self._scan_scatter_xy_cur.set_offsets(empty_xy)
 
-        if xz_available:
-            self._scan_scatter_xz_start.set_offsets(
-                [[start.coords.get("X", 0.0), start.coords.get("Z", 0.0)]]
-            )
-            self._scan_scatter_xz_cur.set_offsets(
-                [[cur.coords.get("X", 0.0), cur.coords.get("Z", 0.0)]]
-            )
-        else:
-            self._scan_scatter_xz_start.set_offsets(empty_xy)
-            self._scan_scatter_xz_cur.set_offsets(empty_xy)
+            best_sample = None
+            for s in valid:
+                if s.power is not None and (best_sample is None or s.power > best_sample.power):
+                    best_sample = s
+            if best_sample is not None:
+                self._scan_scatter_xy_best.set_offsets(
+                    [[best_sample.coords.get(a, 0.0), best_sample.coords.get(b, 0.0)]]
+                )
+            else:
+                self._scan_scatter_xy_best.set_offsets(empty_xy)
 
-        best_sample = None
-        for s in valid:
-            if s.power is not None and (best_sample is None or s.power > best_sample.power):
-                best_sample = s
-        if best_sample is not None and xy_available:
-            self._scan_scatter_xy_best.set_offsets(
-                [[best_sample.coords.get("X", 0.0), best_sample.coords.get("Y", 0.0)]]
-            )
-        else:
-            self._scan_scatter_xy_best.set_offsets(empty_xy)
-        if best_sample is not None and xz_available:
-            self._scan_scatter_xz_best.set_offsets(
-                [[best_sample.coords.get("X", 0.0), best_sample.coords.get("Z", 0.0)]]
-            )
-        else:
-            self._scan_scatter_xz_best.set_offsets(empty_xy)
+            if bad:
+                self._scan_scatter_xy_bad.set_offsets(
+                    [[s.coords.get(a, 0.0), s.coords.get(b, 0.0)] for s in bad]
+                )
+            else:
+                self._scan_scatter_xy_bad.set_offsets(empty_xy)
 
-        if bad and xy_available:
-            self._scan_scatter_xy_bad.set_offsets(
-                [[s.coords.get("X", 0.0), s.coords.get("Y", 0.0)] for s in bad]
-            )
-        else:
-            self._scan_scatter_xy_bad.set_offsets(empty_xy)
-        if bad and xz_available:
-            self._scan_scatter_xz_bad.set_offsets(
-                [[s.coords.get("X", 0.0), s.coords.get("Z", 0.0)] for s in bad]
-            )
-        else:
-            self._scan_scatter_xz_bad.set_offsets(empty_xy)
+        # ── 座標變化趨勢：active_axes 是 scanner.run() 開始後才會有值，
+        # 尚未落地（active is None）的極短暫過渡態沿用 _scan_plot_reset
+        # 當時算好的 selected_axes，等下一輪重繪自然校正（已知的既有
+        # 結論，見 CLAUDE.md〈尋光彈性選軸〉，不特別處理）。x 軸序號邏輯
+        # 跟下面的功率收斂子圖同一套：用樣本在整批歷史裡的原始序號，
+        # 無效樣本直接跳過（不重新壓縮編號），y 軸是相對起點的位移量。
+        scanner = self._active_scanner
+        active = getattr(scanner, "active_axes", None) if scanner else None
+        trend_axes = active if active else self._scan_last_selected_axes
+        base = samples[0]
+        base_vals = {ax_name: base.coords.get(ax_name, 0.0) for ax_name in AXES}
+        trend_idx = []
+        trend_delta = {ax_name: [] for ax_name in AXES}
+        for i, s in enumerate(samples, start=1):
+            if s.ok:
+                trend_idx.append(i)
+                for ax_name in AXES:
+                    trend_delta[ax_name].append(s.coords.get(ax_name, base_vals[ax_name]) - base_vals[ax_name])
+        for ax_name, line in self._scan_trend_lines.items():
+            if ax_name in trend_axes:
+                line.set_data(trend_idx, trend_delta[ax_name])
+            else:
+                line.set_data([], [])
 
         # 功率收斂：x 軸用樣本在整批歷史裡的序號（1-based），無效樣本沒有
         # power 可畫，直接跳過——折線會連過那些序號，不畫斷點，這是合理的
@@ -3747,7 +3850,7 @@ class DS102GUI:
         self._scan_stop_btn.config(state="normal")
         self._scan_status_var.set("初始化中…")
         self._scan_start_time = time.time()
-        self._scan_plot_reset()  # 清掉上一輪殘留的軌跡與數值摘要
+        self._scan_plot_reset(selected_axes)  # 清掉上一輪殘留的軌跡與數值摘要，並重建投影軸對控制列
         # 上一輪如果是無訊號中止、使用者還沒按「知道了」就直接開始下一輪，
         # 這條常駐提示不該繼續掛著誤導這一輪的狀態。
         self._hide_scan_no_signal_notice()
