@@ -47,6 +47,7 @@ os.environ.setdefault("PYTHONUTF8", "1")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 import main_ai  # noqa: E402  （需先設好上面的環境變數再 import，避免中文 log 亂碼）
+import ds102_ctrl  # noqa: E402
 
 
 def pump_until(root: tk.Tk, condition_fn, timeout: float = 15.0) -> None:
@@ -107,15 +108,31 @@ def _new_tk_root_with_retry(max_attempts: int = 3, retry_delay: float = 0.5) -> 
 
 def make_gui(recording_dir, extra_patches=()):
     """
-    建立一個新的 (root, gui)，並把 main_ai.RECORDING_DIR 導向指定的暫存
-    目錄（絕不使用真實 recordings/）。extra_patches 可傳入額外的、尚未
+    建立一個新的 (root, gui)，並把 RECORDING_DIR 導向指定的暫存目錄
+    （絕不使用真實 recordings/）。extra_patches 可傳入額外的、尚未
     start() 的 unittest.mock._patch 物件——例如 verify_scan_tab.py 需要
     另外 patch fiber_scanner._default_scan_dir，避免 FiberAlignmentScanner
     的 persist_samples() 把樣本寫進專案的 recordings/scans/。
 
+    🔴 同時 patch `main_ai.RECORDING_DIR` 與 `ds102_ctrl.RECORDING_DIR`
+    ——這是 2026-08-19 補 verify_axis_calib.py 時實測抓到的真坑：
+    `main_ai.py` 是用 `from ds102_ctrl import RECORDING_DIR` 重新引入，
+    這只是另一個獨立綁定同一初始物件的名字，patch 其中一個完全不影響
+    另一個。`DS102Controller` 的持久化方法（`save_point`／`set_axis_calib`
+    ／`save_recording`／`capture_controller_config` 等）全部定義在
+    `ds102_ctrl.py`，內部引用的是該模組自己的 `RECORDING_DIR`——只 patch
+    `main_ai.RECORDING_DIR` 的話，這些方法完全不會被攔到，會直接寫進
+    專案真正的 `recordings/`。`verify_scan_tab.py`／`verify_meter_panel.py`
+    之前沒踩到純粹是因為沒呼叫到這些方法，不代表這層防護真的有效——
+    跟 CLAUDE.md 記載「測試腳本清空過兩次 teaching points」是同一類風險，
+    這裡直接在共用 fixture 補起來，往後任何新測試檔都不用重新踩一次。
+
     回傳 (root, gui, patchers)；呼叫端負責在使用完後呼叫 close_gui()。
     """
-    patchers = [patch.object(main_ai, "RECORDING_DIR", new=Path(recording_dir))]
+    patchers = [
+        patch.object(main_ai, "RECORDING_DIR", new=Path(recording_dir)),
+        patch.object(ds102_ctrl, "RECORDING_DIR", new=Path(recording_dir)),
+    ]
     patchers.extend(extra_patches)
     for p in patchers:
         p.start()
