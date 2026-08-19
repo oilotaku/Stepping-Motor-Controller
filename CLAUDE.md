@@ -8,7 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Windows 桌面應用，用 Python + tkinter 控制 **駿河精機 SURUGA SEIKI DS102 / DS112 步進馬達控制箱**（RS-232C / USB 虛擬 COM 埠），用於光纖對準與光學自動化量測。長期目標（見 [step-motor.txt](step-motor.txt)）是把滑台與 **HP 8153A 光波萬用表**（GPIB）串起來做自動掃描尋光。
 
-沒有 CI、沒有套件化結構——全部是可直接執行的頂層腳本。有兩支回歸測試腳本（`verify_scan_tab.py` 57 項、`verify_meter_panel.py` 66 項，見下方〈常用指令〉），用假物件跑 GUI 邏輯。2026-08-18 起改寫成 **pytest 測試檔**（檔名不變，透過 `pytest.ini` 的 `python_files` 設定讓 pytest 認得這兩個既有檔名），VS Code 的 Testing 面板可以個別發現、個別重跑每一項；`conftest.py` 放共用的 fixture（建 GUI、跑 Tk mainloop、monkeypatch `RECORDING_DIR`）。
+沒有 CI、沒有套件化結構——全部是可直接執行的頂層腳本。有三支回歸測試腳本（`verify_scan_tab.py` 57 項、`verify_meter_panel.py` 66 項、`verify_axis_calib.py` 50 項，共 173 項，見下方〈常用指令〉），用假物件跑 GUI 邏輯。2026-08-18 起改寫成 **pytest 測試檔**（檔名不變，透過 `pytest.ini` 的 `python_files` 設定讓 pytest 認得 `verify_*.py` 這個既有命名），VS Code 的 Testing 面板可以個別發現、個別重跑每一項；`conftest.py` 放共用的 fixture（建 GUI、跑 Tk mainloop、monkeypatch `RECORDING_DIR`）。
+
+🔴 **`conftest.py` 的 `make_gui()` 必須同時 `patch.object(main_ai, "RECORDING_DIR", ...)` 與 `patch.object(ds102_ctrl, "RECORDING_DIR", ...)`，只 patch 一邊等於沒防護（2026-08-19 實測踩到）。** `main_ai.py` 是用 `from ds102_ctrl import RECORDING_DIR` 重新引入，這只是另一個獨立綁定同一初始物件的名字；`DS102Controller` 的持久化方法（`save_point`／`set_axis_calib`／`save_recording`／`capture_controller_config` 等）全部定義在 `ds102_ctrl.py`，引用的是該模組**自己的**模組層級綁定，只 patch `main_ai.RECORDING_DIR` 完全攔不到這些方法，會直接寫進專案真正的 `recordings/`。`verify_scan_tab.py`／`verify_meter_panel.py` 之前沒踩到純粹是因為沒呼叫到這些方法，不代表這層防護真的有效——跟本檔記載「測試腳本清空過兩次 teaching points」是同一類風險。已在 `make_gui()` 修好，**任何新增的測試檔案都不需要（也不應該）再自己額外 patch 一次**，但改動 `conftest.py` 本身時要記得這兩邊要同步。
 
 ## 常用指令
 
@@ -21,7 +23,7 @@ venv/Scripts/python.exe probe_ds102.py --list            # 只列埠，不送任
 venv/Scripts/python.exe -m serial.tools.list_ports -v    # 原始序列埠清單
 venv/Scripts/python.exe -m pip install -r requirements.txt
 venv/Scripts/python.exe -m ruff check .                  # ruff 未列於 requirements.txt，需另行安裝
-venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py -v  # 兩支合計 123 項，不需硬體
+venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py -v  # 三支合計 173 項，不需硬體
 venv/Scripts/python.exe -m pytest verify_scan_tab.py::TestUserStop -v          # 只跑某個 class／單一測試（VS Code Test Explorer 用同一套機制）
 ```
 
@@ -47,7 +49,7 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
 | [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝（PyVISA）。**已於 2026-08-12 整合進 GUI**（main_ai.py 直接 `from meter_GPIB import HP8153APowerMeter`），供「光功率」與「尋光」分頁使用；仍**未接上真實儀器驗證過**，本機沒有 GPIB 卡可測 |
 | [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`：光纖對準尋光演算法（座標下降＋K近鄰精修＋收尾微擾）。**已於 2026-08-13～17 分六階段接上 GUI**（main_ai.py 的「尋光」分頁），並補上 57 項假物件回歸測試（見下方〈光功率／尋光分頁〉）。本檔自己**仍刻意不 import main_ai.py**（避免循環相依），軸命名自成一份，main_ai.py 改軸命名時要同步 |
-| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) | 「尋光」／「光功率」分頁的假物件回歸測試（合計 123 項 pytest 測試函式，`python -m pytest verify_scan_tab.py verify_meter_panel.py -v` 執行，VS Code Testing 面板也認得）。用假的 `ctrl` / `meter` 物件驅動 GUI 邏輯，不需要真實硬體 |
+| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) | 「尋光」／「光功率」分頁／軸機械校正參數的假物件回歸測試（合計 173 項 pytest 測試函式，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py -v` 執行，VS Code Testing 面板也認得）。用假的 `ctrl` / `meter` 物件驅動邏輯，不需要真實硬體 |
 | [conftest.py](conftest.py) / [pytest.ini](pytest.ini) | pytest 共用設定：`conftest.py` 放建 GUI／跑 Tk mainloop／monkeypatch `RECORDING_DIR` 這類共用 fixture；`pytest.ini` 把 `python_files` 放寬成同時認得 `verify_*.py` 與標準 `test_*.py`，並排除 `venv`／驅動資料夾等不相關目錄 |
 | [Gtest.py](Gtest.py) | 外部第三方範例（NTT-Mabuchi），`import control` 的模組不存在於本 repo，**無法執行**，僅作參考 |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖與 GPIB 側注意事項。⚠ 但其中的 **DS112 通訊細節全部是錯的**（宣稱結束符 `\r\n`、鮑率 9600、用 `!:` 輪詢 B/R 狀態）——實機是 `\r`、38400、查 `SB1?`。此檔只採信 HP 8153A 與「馬達動則不讀光」那幾段 |
@@ -171,7 +173,7 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 - **`sample_cb` 跑在 scanner 的背景執行緒**，🔴 只能做資料寫入（丟進 `_scan_plot_pending` 佇列），不能碰 matplotlib 或 tkinter widget——實際重繪固定在 Tk 主執行緒的 `_redraw_scan_plot()` 做。
 - **設定持久化**：`meter_config.json`（GPIB 位址／channel／波長）與 `scanner_config.json`（速度、安全判準、是否啟用階段二 K 近鄰精修等跨次搜尋穩定的參數）都在 `RECORDING_DIR`，走 `_load_meter_config()` / `_save_meter_config()` / `_load_scanner_config()` / `_save_scanner_config()`。兩者都是純量欄位的整份覆寫，**不需要**比照 teaching points 的 `_points_loaded` 拒寫保護（沒有「累積型集合被空狀態蓋掉」的風險）。兩個檔名都已加進 `NON_RECORDING_JSON`。
 - ⚠ **階段二相關的 `tk.BooleanVar`（`_scan_stage2_var`）不能用寫死的初始值建立**——它要在讀到 `scanner_config.json` 的 `enable_stage2` 欄位後才建立變數，順序反了會讓存檔值永遠讀不回來（2026-08-17 由假物件回歸測試抓到並修正）。
-- **回歸測試**：[verify_scan_tab.py](verify_scan_tab.py)（尋光分頁，57 項）與 [verify_meter_panel.py](verify_meter_panel.py)（光功率分頁，66 項）用假的 `ctrl` / `meter` 物件跑 GUI 邏輯，不需要真實硬體或 GPIB 卡，改動這兩個分頁後應該先跑這兩支腳本。2026-08-17 `DS102Controller` 拆到 `ds102_ctrl.py` 後兩支腳本仍全數通過，可作為「模組拆分沒有破壞既有行為」的既有驗證手段之一。
+- **回歸測試**：[verify_scan_tab.py](verify_scan_tab.py)（尋光分頁，57 項）、[verify_meter_panel.py](verify_meter_panel.py)（光功率分頁，66 項）、[verify_axis_calib.py](verify_axis_calib.py)（軸機械校正參數，50 項，涵蓋 `ds102_ctrl.py`／`fiber_scanner.py`／`main_ai.py` 三個層級）用假的 `ctrl` / `meter` 物件跑邏輯，不需要真實硬體或 GPIB 卡，改動對應功能後應該先跑對應的測試檔。2026-08-17 `DS102Controller` 拆到 `ds102_ctrl.py` 後前兩支仍全數通過，可作為「模組拆分沒有破壞既有行為」的既有驗證手段之一。
 
 ### 單位與座標（容易改錯的地方）
 
