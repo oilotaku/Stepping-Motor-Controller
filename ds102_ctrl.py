@@ -1789,11 +1789,29 @@ class DS102Controller:
         """
         儲存 Teaching Point（工作座標，單位 pulse）。
         只有有填值的軸會被納入；未納入的軸在 goto_point 時不動。
+
+        若某軸當下有設定機械校正參數（axis_calib），額外存一份 μm 估算值
+        與當下的校正參數快照——校正參數之後可能被使用者改掉或清除
+        （clear_axis_calib），沒有存快照的話，這筆歷史紀錄的 μm 之後就沒
+        辦法驗證是怎麼算出來的。這兩個新欄位純粹是附加的歷史快照，
+        goto_point() 完全不讀它們，只讀 positions_pulse。
         """
-        self.saved_points[name] = {
+        entry = {
             "positions_pulse": dict(positions),
             "ts": datetime.now().isoformat(timespec="seconds"),
         }
+        positions_um = {}
+        axis_calib_snapshot = {}
+        for ax, pulse in positions.items():
+            um = self.estimate_um(ax, pulse)
+            if um is not None:
+                positions_um[ax] = um
+                axis_calib_snapshot[ax] = dict(self.axis_calib[ax])
+        if positions_um:
+            entry["positions_um"] = positions_um
+            entry["axis_calib_snapshot"] = axis_calib_snapshot
+
+        self.saved_points[name] = entry
         self._log("INFO", f"Teaching Point [{name}] 已儲存: {positions}")
         self._persist_points()
 

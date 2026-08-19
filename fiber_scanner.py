@@ -127,6 +127,12 @@ class Sample:
     power: Optional[float] = None
     note: str = ""
     ts: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    # 純附加的估算快照（見 CLAUDE.md〈軸機械校正參數〉）：只有 coords 裡
+    # 有校正參數的軸才會出現在這兩個字典中。軸沒有校正參數就整個是
+    # None（不是空字典），呼叫端／報表據此分辨「沒有校正資料」跟「量到
+    # 但剛好沒有軸」。演算法邏輯只讀 coords（pulse），不讀這兩個欄位。
+    coords_um: Optional[Dict[str, float]] = None
+    calib_snapshot: Optional[Dict[str, dict]] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -865,7 +871,19 @@ class FiberAlignmentScanner:
             self._log(f"讀值 {raw_power:.3f} dBm 低於絕對訊號下限 "
                        f"{self.min_valid_power_dbm:.3f} dBm，判定無效")
 
-        s = Sample(coords=coords, ok=ok, power=power, note=note)
+        coords_um = {}
+        calib_snapshot = {}
+        for ax, pulse in coords.items():
+            um = self.ctrl.estimate_um(ax, pulse)
+            if um is not None:
+                coords_um[ax] = um
+                calib_snapshot[ax] = dict(self.ctrl.axis_calib[ax])
+
+        s = Sample(
+            coords=coords, ok=ok, power=power, note=note,
+            coords_um=coords_um or None,
+            calib_snapshot=calib_snapshot or None,
+        )
         self.samples.append(s)
         if self._sample_cb:
             try:
