@@ -24,6 +24,13 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 
 **本程式沒有模擬模式**——它驅動的是真實滑台，假造的回應會讓人誤以為已連上硬體。沒有硬體時要測控制邏輯，請用假的 serial 物件取代 `ctrl.ser`。
 
+```bash
+# 跑回歸測試（假物件，不需硬體，173 項）
+venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py -v
+```
+
+VS Code 的 Testing 面板也能個別發現、個別重跑每一項（`.vscode/settings.json` 已設定 `python.testing.pytestEnabled`）。
+
 ---
 
 ## 環境
@@ -51,8 +58,9 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 - **速度 Profile** — 命名儲存四參數（L0/F0/R0/S0）快速切換
 - **軟體行程限制** — Python 端限位攔截（與控制器韌體端限位是兩套，見下方注意事項）
 - **控制器設定持久化** — MEMSW 與韌體軟體限位是 RAM-only，斷電即失；存檔後連線時自動補回
+- **軸機械校正參數** — 輸入每軸導程／步進角／分度值，把 pulse 座標額外估算成 μm 顯示（純參考，不影響任何移動/限位/教點判斷，內部永遠只認 pulse）
 - **光功率監看** — HP 8153A GPIB 讀值，獨立分頁與浮動視窗
-- **自動尋光** — 座標下降＋K 近鄰局部精修的對準演算法，內建即時軌跡圖
+- **自動尋光** — 座標下降＋K 近鄰局部精修的對準演算法，可彈性勾選 1～6 軸參與搜尋，內建即時軌跡圖（可切換軸對 2D 投影＋多軸相對位移趨勢線）
 - **實驗數據記錄** — 時間戳 + 各軸位置（含光功率 dBm）匯出 CSV
 - **LOG** — 分級記錄與匯出
 
@@ -64,8 +72,8 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 
 | 檔案 | 定位 |
 |---|---|
-| [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，約 4850 行。GUI 與各分頁邏輯都加在這裡 |
-| [ds102_ctrl.py](ds102_ctrl.py) | `DS102Controller` 本體（2026-08-17 從 main_ai.py 拆出的獨立模組，約 1945 行，完全不碰 tkinter）。🔴 不要跟下面的 `ds102_controller.py` 搞混 |
+| [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，約 5408 行。GUI 與各分頁邏輯都加在這裡 |
+| [ds102_ctrl.py](ds102_ctrl.py) | `DS102Controller` 本體（2026-08-17 從 main_ai.py 拆出的獨立模組，約 2326 行，完全不碰 tkinter）。🔴 不要跟下面的 `ds102_controller.py` 搞混 |
 | [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照（跟上面的 `ds102_ctrl.py` 是完全不同的兩個檔案）。可作對照，**不要在此新增功能** |
 | [main.py](main.py) | 廠商官方範例，是**指令格式的權威來源**。修改指令前先回頭比對 |
 | [test.py](test.py) | 無 GUI 的連線／狀態查詢腳本。名稱誤導——不是單元測試 |
@@ -112,7 +120,8 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 
 ### 程式
 
-- 單位**一律 pulse**，沒有 um / mm 切換。
+- 單位**一律 pulse**，沒有 um / mm 切換——但可以在「移動控制」分頁輸入每軸機械參數，額外附加估算的 μm 顯示（見上方〈功能〉，純參考不影響內部判斷）。
+- 這台滑台的驅動器是 **AMS（微步進）型**，細分設定要打開外殼用實體旋轉開關調，`AXI{n}:DRDIV?` 對它沒有意義（查回來的只是控制器內部一個沒人寫過的軟體暫存器，跟實體開關無關）。
 - 任何**會阻塞的序列操作**必須在背景執行緒；背景執行緒**絕不可直接碰 tkinter widget**，一律 `root.after(0, ...)` 回主執行緒。
 - 序列埠交易受 `_serial_lock` 保護，一次 TX→RX 不可分割。`stop()` 與 `emergency_stop()` 刻意不受此限，避免等鎖延遲停止。
 - `limit_direction()` 比對方向字串時**必須先判斷 `"CCW"`**——`"CCW"` 本身就含有 `"CW"`。
@@ -128,7 +137,7 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 | 路徑 | 內容 |
 |---|---|
 | `logs/` | 每次啟動一個檔；關閉時另存 `*_history.txt` |
-| `recordings/` | 錄製的行程；同目錄的 `teaching_points.json`、`speed_profiles.json`、`controller_config.json`、`meter_config.json`、`scanner_config.json`、`app_settings.json`、`safety_settings.json` 是設定檔 |
+| `recordings/` | 錄製的行程；同目錄的 `teaching_points.json`、`speed_profiles.json`、`controller_config.json`、`meter_config.json`、`scanner_config.json`、`app_settings.json`、`safety_settings.json`、`axis_calibration.json` 是設定檔 |
 | `data/` | 實驗數據 CSV |
 
 ---
