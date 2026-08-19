@@ -145,6 +145,18 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 
 `check_sw_limits_batch()` 與 `wait_axis_stop()`（`_wait_axis_stop` 的公開版本）是專門給 scanner 多軸批次移動流程用的公開方法。`positions_machine` 屬性回傳機械座標，供 scanner 全程在同一個座標系下運作（不透過 offset）。
 
+#### 尋光彈性選軸（1～6 軸，2026-08-19）
+
+`FiberAlignmentScanner` 原本就是動態軸數架構（`_active_axes()` 用 `ctrl.axis_count`＋`query_status()` 即時偵測硬體可用性，座標下降／K 近鄰精修的迴圈與矩陣維度全部用 `len(axes)` 動態決定，不是寫死 3 或 6），這次新增的是**使用者主動排除某軸**的能力，不是「自動跟著接了幾軸走」——例如實機接了 X/Y/Z 三軸，使用者這次可以只勾選 X/Z 搜尋。
+
+- **`FiberAlignmentScanner.__init__` 新增 `selected_axes: Optional[List[str]] = None`**（關鍵字傳遞），存成 `self._selected_axes`。`_active_axes()` 在既有的硬體可用性偵測**之後**，再與這份清單取交集；`None` 時完全不過濾，向下相容改動前的行為。`run_stage1`/`run_stage2`/`run_stage3` 完全不用改——它們一律呼叫 `self._active_axes()`，交集邏輯對它們透明，這是這次改動範圍能維持小的關鍵。
+- **`run()` 開頭**先算一次 `self.active_axes = self._active_axes()`（供 GUI 讀「這次實際搜尋範圍」）：交集後為空就 `raise ScanAbort`，訊息依 `self._selected_axes is not None` 分兩種文案（「選定的軸目前皆不可動」vs 舊行為的「沒有可動的軸」）；非空但有勾選軸被交集排除（使用者勾了、但這軸現在被偵測為不可動），用 `self._log()` 回報一則警告，不靜默吞掉這個落差。
+- **main_ai.py 的軸勾選 UI 刻意不「連線後重建分頁」**——沿用專案既有的「固定建六組、連線後依 `axis_count` 動態 enable/disable」模式（跟軸驅動按鈕群組 `_all_axis_btn_groups` 同一招），`_build_tab_scan` 用 `AXES`（固定六軸）建立，`_on_connect_result` 才依實際軸數切 `_scan_axis_checkbuttons` 的 state，停用的軸連帶把 `BooleanVar` 強制設回 `False`。「連線後重建分頁」這個做法被 architect 明確否決過——matplotlib canvas、自我重新排程的 `_redraw_scan_plot`、`_scanner_cfg_pending` 這些既有機制沒有為「分頁被銷毀重建」設計過，硬做風險遠高於沿用已驗證的既有模式。
+- 🔴 **「該軸是否勾選搜尋」與「階段二總開關」是兩個獨立條件，必須用 AND 合成，不能讓其中一個 handler 覆寫另一個**——`_refresh_scan_entry_states()` 是唯一改 Entry state 的地方，`_on_scan_stage2_toggle()` 與六個軸勾選框的 command 都只呼叫這個函式，不再各自直接 `.config(state=...)`。這是照抄 `_update_stat_ui` 曾經「不認得復歸中被覆寫回正常」那次教訓的預防措施，兩層狀態疊加時最容易犯的錯就是後呼叫的 handler 無條件覆寫前一個已經算好的結果。
+- **0 軸要擋在打開確認對話框之前**：`_do_start_scan()` 主執行緒收集 `selected_axes` 後立刻檢查，空清單就 `_flash_banner` 並 `return`，不讓使用者看到一個注定沒有意義的確認流程。確認對話框文案加了「搜尋軸：X、Z」這行，擺在起始步長摘要之前。
+- **`scanner_config.json` 新增 `selected_axes` 欄位**，只在使用者確認開始尋光後才存（不是每次點勾選框就寫檔）。這跟 `initial_step`／`stage2_local_radius`／`axis_scale` 那些刻意不存檔的 per-axis 數值不同類——選軸是跟裝置物理配置綁定的操作習慣，比較像 `l_speed`／`step_min` 這類「跨次搜尋穩定的參數」。缺這個欄位（舊格式設定檔）時六軸預設全勾選，向下相容。
+- **即時軌跡圖只做最小防呆**：`_redraw_scan_plot()` 畫 XY／XZ 子圖前檢查 `self._active_scanner.active_axes` 有沒有涵蓋對應軸，沒有就顯示文字提示（例如「本次搜尋未包含 X/Y 軸」）取代空白圖表。**任意 1～6 軸組合的完整視覺化留給下一輪**（要嘛軸對選擇器、要嘛多子圖矩陣，屬於版面設計問題不是這次選軸功能的架構問題）——樣本資料本身（`Sample.coords`）不受影響，CSV／JSON 落地永遠完整記錄實際搜尋到的軸，只有即時圖表這個呈現層有這個已知限制。
+
 #### 光功率／尋光分頁（2026-08-12～17，分六階段＋一輪 architect 審查落地）
 
 「光功率」分頁（`_build_tab_power`）與「尋光」分頁（`_build_tab_scan`）是兩個獨立但互相協調的分頁：

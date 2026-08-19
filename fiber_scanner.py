@@ -238,9 +238,17 @@ class FiberAlignmentScanner:
         speed_scale_pulses: Optional[Tuple[int, int]] = None,
         progress_cb: Optional[ProgressCallback] = None,
         sample_cb: Optional[SampleCallback] = None,
+        selected_axes: Optional[List[str]] = None,
     ):
         self.ctrl = ctrl
         self._power_query = power_query
+        # 使用者從 GUI 勾選的搜尋範圍（None＝不限制，維持改動前的行為：
+        # 全部交給硬體可用性偵測決定）。_active_axes() 在偵測結果之後
+        # 再與這份清單取交集，兩層判斷互不取代——見該方法 docstring。
+        self._selected_axes = list(selected_axes) if selected_axes is not None else None
+        # run() 開始後才會有值，供呼叫端（GUI 畫即時軌跡圖）讀「這次
+        # 實際搜尋範圍」，不需要自己重算一次交集。
+        self.active_axes: List[str] = []
         self._l_speed = l_speed
         self._rate = rate
         self._s_rate = s_rate
@@ -313,6 +321,22 @@ class FiberAlignmentScanner:
             raise ScanAbort("控制器未連線")
         if self.ctrl.scanning_active:
             raise ScanAbort("已有搜尋在進行中")
+
+        # 先算一次交集結果並存起來，供 GUI 端（即時軌跡圖）讀取「這次
+        # 實際搜尋範圍」；同時在這裡就擋下「選了軸但交集後是空的」情況，
+        # 不必等 run_stage1 內部再拋一次語意不夠精確的「沒有可動的軸」。
+        self.active_axes = self._active_axes()
+        if not self.active_axes:
+            if self._selected_axes is not None:
+                raise ScanAbort("選定的軸目前皆不可動（未接滑台或未啟用）")
+            raise ScanAbort("沒有可動的軸")
+        if self._selected_axes is not None:
+            missing = [ax for ax in self._selected_axes if ax not in self.active_axes]
+            if missing:
+                self._log(
+                    "⚠ 已排除目前偵測不到滑台的軸："
+                    f"{'、'.join(missing)}（原已勾選）"
+                )
 
         self.ctrl.scanning_active = True
         self.last_abort_reason = None  # 重置：這個實例若被重複呼叫 run()，不能沿用上一輪的中止原因
@@ -951,6 +975,11 @@ class FiberAlignmentScanner:
         偵測「目前實際可動」的軸清單——不是寫死 AXES 常數。比照
         `origin_all()` 判斷 `Stage not connected` 的既有寫法，U 軸
         目前未接滑台就會被排除。
+
+        再與 `self._selected_axes`（使用者從 GUI 勾選的搜尋範圍）取
+        交集——`None` 代表沒有限制，行為與改動前完全一致；`run_stage1`
+        / `run_stage2` / `run_stage3` 都透過呼叫這個方法間接受益，
+        它們本身不需要知道有這道篩選存在。
         """
         axes = []
         for i in range(self.ctrl.axis_count):
@@ -962,6 +991,8 @@ class FiberAlignmentScanner:
             if st == "Stage not connected":
                 continue
             axes.append(ax)
+        if self._selected_axes is not None:
+            axes = [ax for ax in axes if ax in self._selected_axes]
         return axes
 
     def _check_abort(self) -> None:

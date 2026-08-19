@@ -222,7 +222,12 @@ def _load_scanner_config(log=None) -> dict:
 
 
 def _save_scanner_config(data: dict, log=None) -> None:
-    """整份覆寫尋光演算法設定。欄位皆為純量值，不需要 teaching_points 那種拒寫保護。"""
+    """
+    整份覆寫尋光演算法設定。欄位大多是純量值，不需要 teaching_points 那種
+    拒寫保護；例外是 `selected_axes`（使用者勾選的搜尋軸清單，字串
+    list），但它同樣沒有「累積型集合被空狀態覆寫」的風險——每次存檔都是
+    當下六個勾選框的完整快照，整份覆寫本來就是正確行為，不需要另外處理。
+    """
     _write_json_with_backup(
         RECORDING_DIR / "scanner_config.json", data, log=log or _log_level_adapter
     )
@@ -2901,26 +2906,52 @@ class DS102GUI:
     # TAB：尋光（FiberAlignmentScanner）。第一階段骨架＋第三階段的嵌入式
     # matplotlib 即時軌跡圖／收斂圖；三層設定卡片與完整確認文案留給第四階段。
     # =========================================================================
-    def _scan_active_axes(self) -> List[str]:
-        """
-        決定尋光分頁要顯示哪幾軸的起始步長／階段二欄位。
-
-        比照連線成功回呼那段既有的按鈕 enable/disable 判斷
-        （`int(AXIS_NO[ax]) <= self.ctrl.axis_count`）。未連線時
-        `axis_count` 是 0，這裡保守降級為實機目前實際可動的 X/Y/Z——
-        U 軸接了控制器但沒接滑台，顯示出來也只會讓使用者誤填。
-        """
-        if self.ctrl.connected and self.ctrl.axis_count:
-            axes = [ax for ax in AXES if int(AXIS_NO[ax]) <= self.ctrl.axis_count]
-            if axes:
-                return axes
-        return ["X", "Y", "Z"]
-
     def _on_scan_stage2_toggle(self):
-        """階段二勾選狀態連動「進階設定」裡的局部半徑／軸縮放係數 Entry 可否編輯。"""
-        state = "normal" if self._scan_stage2_var.get() else "disabled"
-        for ent in getattr(self, "_scan_stage2_entries", []):
-            ent.config(state=state)
+        """
+        階段二勾選狀態連動「進階設定」裡的局部半徑／軸縮放係數 Entry 可否編輯。
+
+        改走 `_refresh_scan_entry_states()`，不再自己整批 `.config(state=...)`
+        ——那樣會覆寫掉「軸未勾選」這個獨立條件算出來的 disabled 狀態
+        （AND 合成邏輯必須集中在單一函式，兩個 handler 各自局部覆寫會
+        重演 `_update_stat_ui` 曾經不認得「復歸中」被覆寫的那類 bug）。
+        """
+        self._refresh_scan_entry_states()
+
+    def _refresh_scan_entry_states(self):
+        """
+        依「軸是否勾選」×「階段二總開關」兩個獨立條件的 AND，合成起始
+        步長／階段二 Entry 的可編輯狀態。任何一個條件改變（軸勾選框、
+        階段二總開關）都呼叫這個函式重新算一次，不要各自局部
+        `.config(state=...)`——那樣一個 handler 的結果會被另一個蓋掉。
+
+        matplotlib 未安裝時 `_build_tab_scan` 提早 return，這些 widget
+        字典根本不存在，這裡直接跳過（呼叫端可能是 `_on_connect_result`
+        這類不知道尋光分頁有沒有建成的通用流程）。
+        """
+        if not hasattr(self, "_scan_axis_selected_vars"):
+            return
+        stage2_on = self._scan_stage2_var.get()
+        for ax in AXES:
+            axis_on = self._scan_axis_selected_vars[ax].get()
+            step_state = "normal" if axis_on else "disabled"
+            for w in self._scan_axis_step_entries.get(ax, []):
+                w.config(state=step_state)
+            stage2_state = "normal" if (axis_on and stage2_on) else "disabled"
+            for w in self._scan_axis_stage2_entries.get(ax, []):
+                w.config(state=stage2_state)
+
+    def _set_scan_axis_selection(self, value: bool):
+        """
+        「全選」／「全不選」：只操作目前未被 disable 的軸——硬體偵測不到
+        的軸維持原狀（`BooleanVar` 早已在 `_on_connect_result` 被強制設
+        `False`，這裡再碰它沒有意義，channel 讀取時反正也不會算進去）。
+        """
+        for ax in AXES:
+            cb = self._scan_axis_checkbuttons.get(ax)
+            if cb is None or cb.instate(["disabled"]):
+                continue
+            self._scan_axis_selected_vars[ax].set(value)
+        self._refresh_scan_entry_states()
 
     def _on_scan_abort_toggle(self):
         """取消勾選「無訊號時中止」要顯示警示；沒有對應收工旗標，純粹是文字顯示。"""
@@ -2950,7 +2981,10 @@ class DS102GUI:
             return
 
         cfg = self._scanner_cfg_pending  # __init__ 已載入的 scanner_config.json 內容，可能是空 dict
-        scan_axes = self._scan_active_axes()
+        # 固定顯示六軸，不再依連線狀態決定要建立哪些 Entry——使用者現在
+        # 可以自行勾選要搜尋的軸（見下方「搜尋軸」子區塊），停用的軸只是
+        # 灰階，不是不存在。_scan_active_axes() 已隨這次改動移除。
+        scan_axes = AXES
 
         self._add_status_bar(parent)
 
@@ -3004,8 +3038,49 @@ class DS102GUI:
         # =================== 左欄卡片一：掃描設定 ===================
         card1 = self._card(left, "掃描設定")
 
+        # ── 搜尋軸：使用者勾選這次尋光要用哪幾軸，不再只是被動跟著硬體
+        # 偵測到的軸數走。兩列排列（X/Y/Z、U/V/W），停用的軸（`_on_connect_
+        # result` 依 axis_count 判斷）只是灰階、Checkbutton 本身仍在——
+        # 固定六軸版面，不隨連線狀態重建。
+        axis_sel_f = tk.Frame(card1, bg=CLR_CARD)
+        axis_sel_f.pack(fill="x", padx=12, pady=(6, 2))
+        axis_sel_head = tk.Frame(axis_sel_f, bg=CLR_CARD)
+        axis_sel_head.pack(fill="x")
+        tk.Label(
+            axis_sel_head, text="搜尋軸", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(side="left")
+        ttk.Button(
+            axis_sel_head, text="全不選", style="Flat.TButton",
+            command=lambda: self._set_scan_axis_selection(False),
+        ).pack(side="right")
+        ttk.Button(
+            axis_sel_head, text="全選", style="Flat.TButton",
+            command=lambda: self._set_scan_axis_selection(True),
+        ).pack(side="right", padx=(0, 4))
+
+        self._scan_axis_selected_vars: Dict[str, tk.BooleanVar] = {}
+        self._scan_axis_checkbuttons: Dict[str, ttk.Checkbutton] = {}
+        # 舊格式（或第一次啟動）沒有這個欄位時六軸皆預設勾選——維持
+        # 「今天的行為＝搜尋全部偵測到的軸」這個既有預期，向下相容。
+        saved_selected_axes = cfg.get("selected_axes")
+        for row_axes in (("X", "Y", "Z"), ("U", "V", "W")):
+            row_f = tk.Frame(axis_sel_f, bg=CLR_CARD)
+            row_f.pack(fill="x", pady=(4, 0))
+            for ax in row_axes:
+                initial = True if saved_selected_axes is None else (ax in saved_selected_axes)
+                var = tk.BooleanVar(value=initial)
+                self._scan_axis_selected_vars[ax] = var
+                cb = ttk.Checkbutton(
+                    row_f, text=ax, variable=var, command=self._refresh_scan_entry_states,
+                )
+                cb.pack(side="left", padx=(0, 10))
+                self._scan_axis_checkbuttons[ax] = cb
+
+        ttk.Separator(card1, orient="horizontal").pack(fill="x", padx=12, pady=(6, 6))
+
+        self._scan_axis_step_entries: Dict[str, List[ttk.Entry]] = {}
         step_f = tk.Frame(card1, bg=CLR_CARD)
-        step_f.pack(fill="x", padx=12, pady=(6, 2))
+        step_f.pack(fill="x", padx=12, pady=(0, 2))
         tk.Label(
             step_f, text="起始步長（每軸，pulse）", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
         ).pack(anchor="w")
@@ -3018,10 +3093,13 @@ class DS102GUI:
             # 預設值不可以是 0——那幾乎就是「原地不動」，對座標下降演算法毫無意義。
             var = tk.StringVar(value="64")
             self._scan_axis_step_vars[ax] = var
-            ttk.Entry(col, textvariable=var, width=8).pack()
+            ent = ttk.Entry(col, textvariable=var, width=8)
+            ent.pack()
+            self._scan_axis_step_entries.setdefault(ax, []).append(ent)
         tk.Label(
             card1,
-            text="粗定位的起始步長，越大收斂越快但越容易跳過訊號峰值。只列出目前可動的軸。",
+            text="勾選要搜尋的軸；起始步長越大收斂越快但越容易跳過訊號峰值。"
+                 "灰階＝控制器目前未偵測到此軸。",
             bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
         ).pack(anchor="w", padx=12, pady=(2, 8))
 
@@ -3164,8 +3242,13 @@ class DS102GUI:
 
         self._scan_stage2_radius_vars: Dict[str, tk.StringVar] = {}
         self._scan_stage2_axis_scale_vars: Dict[str, tk.StringVar] = {}
-        self._scan_stage2_entries: List[ttk.Entry] = []
-        stage2_enabled_state = "normal" if self._scan_stage2_var.get() else "disabled"
+        # 按軸分桶（取代舊的扁平 list）——_refresh_scan_entry_states 要能
+        # 針對單一軸把「軸勾選」×「階段二總開關」AND 起來單獨判斷可編輯性，
+        # 扁平 list 做不到這件事。初始狀態這裡先算一次正確值（避免建立瞬間
+        # 閃一下錯的狀態），_build_tab_scan 結尾仍會呼叫
+        # _refresh_scan_entry_states() 做最終校正。
+        self._scan_axis_stage2_entries: Dict[str, List[ttk.Entry]] = {}
+        stage2_on = self._scan_stage2_var.get()
 
         radius_f = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
         radius_f.pack(fill="x", padx=12, pady=(0, 2))
@@ -3180,9 +3263,13 @@ class DS102GUI:
             tk.Label(col, text=ax, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)).pack(anchor="w")
             var = tk.StringVar(value="")
             self._scan_stage2_radius_vars[ax] = var
-            ent = ttk.Entry(col, textvariable=var, width=8, state=stage2_enabled_state)
+            axis_on = self._scan_axis_selected_vars[ax].get()
+            ent = ttk.Entry(
+                col, textvariable=var, width=8,
+                state="normal" if (axis_on and stage2_on) else "disabled",
+            )
             ent.pack()
-            self._scan_stage2_entries.append(ent)
+            self._scan_axis_stage2_entries.setdefault(ax, []).append(ent)
 
         scale_f2 = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
         scale_f2.pack(fill="x", padx=12, pady=(0, 2))
@@ -3197,9 +3284,13 @@ class DS102GUI:
             tk.Label(col, text=ax, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)).pack(anchor="w")
             var = tk.StringVar(value="")
             self._scan_stage2_axis_scale_vars[ax] = var
-            ent = ttk.Entry(col, textvariable=var, width=8, state=stage2_enabled_state)
+            axis_on = self._scan_axis_selected_vars[ax].get()
+            ent = ttk.Entry(
+                col, textvariable=var, width=8,
+                state="normal" if (axis_on and stage2_on) else "disabled",
+            )
             ent.pack()
-            self._scan_stage2_entries.append(ent)
+            self._scan_axis_stage2_entries.setdefault(ax, []).append(ent)
 
         tk.Label(
             self._scan_adv_frame,
@@ -3209,6 +3300,11 @@ class DS102GUI:
 
         # =================== 右欄：即時圖表（第三階段既有邏輯，不動）===================
         self._build_scan_plot(right)
+
+        # 這個分頁建立過程分散在多處設定初始 Entry state（軸勾選、階段二
+        # 各自算過一次），這裡收尾統一重算一次最終狀態，確保兩個條件的
+        # AND 合成結果正確，不受建立順序影響。
+        self._refresh_scan_entry_states()
 
         # 資料寫入（sample_cb，背景執行緒）與重繪（此迴圈，主執行緒）分離，
         # 見 self._on_scan_sample / self._redraw_scan_plot 的說明。跟
@@ -3284,6 +3380,19 @@ class DS102GUI:
             [], [], color=CLR_ACCENT, marker="o", s=40, zorder=5
         )
 
+        # 「本次搜尋未包含 X/Y（或 X/Z）軸」防呆文字——使用者可以只勾選
+        # 部分軸搜尋（例如只搜 X/Z），這種情況下 XY 投影裡的 Y 座標全程
+        # 不動，畫出來會是一條沒有意義的水平線，容易被誤讀成「已對準」。
+        # 用疊在子圖中央的文字取代散點/軌跡，見 _scan_redraw_figure。
+        self._scan_xy_unavail_text = self._scan_ax_xy.text(
+            0.5, 0.5, "", transform=self._scan_ax_xy.transAxes,
+            ha="center", va="center", color=CLR_MUTED, fontsize=8, wrap=True,
+        )
+        self._scan_xz_unavail_text = self._scan_ax_xz.text(
+            0.5, 0.5, "", transform=self._scan_ax_xz.transAxes,
+            ha="center", va="center", color=CLR_MUTED, fontsize=8, wrap=True,
+        )
+
         # 功率收斂：即時功率折線 + 累積最佳（逐點 running max）虛線
         (self._scan_line_pwr_cur,) = self._scan_ax_pwr.plot(
             [], [], "-", color=CLR_ACCENT, linewidth=1.3, label="即時功率"
@@ -3348,6 +3457,8 @@ class DS102GUI:
             self._scan_scatter_xz_best, self._scan_scatter_xz_cur,
         ):
             scatter.set_offsets(empty_xy)
+        self._scan_xy_unavail_text.set_text("")
+        self._scan_xz_unavail_text.set_text("")
         self._scan_canvas.draw_idle()
 
     def _on_scan_sample(self, sample):
@@ -3458,52 +3569,87 @@ class DS102GUI:
 
         valid = [s for s in samples if s.ok]
         bad = [s for s in samples if not s.ok]
+        empty_xy = np.empty((0, 2))  # set_offsets 內部要求 2D 形狀，空 list 會被當成 1D 陣列而炸掉
 
-        xs = [s.coords.get("X", 0.0) for s in valid]
-        ys = [s.coords.get("Y", 0.0) for s in valid]
-        zs = [s.coords.get("Z", 0.0) for s in valid]
-        self._scan_line_xy_path.set_data(xs, ys)
-        self._scan_line_xz_path.set_data(xs, zs)
+        # 使用者可以只勾選部分軸搜尋（例如只搜 X/Z），這種情況下 XY 投影裡
+        # 的 Y 座標全程不動，畫出來會是一條沒有意義的水平線，容易被誤讀成
+        # 「已對準」。active_axes 是 scanner.run() 開始後才會有值（_active_axes()
+        # 與使用者勾選交集後的最終結果），尚未開始（active is None）沿用
+        # 舊行為照常畫，不因為這個防呆而改變既有時序。
+        scanner = self._active_scanner
+        active = getattr(scanner, "active_axes", None) if scanner else None
+        xy_available = active is None or ("X" in active and "Y" in active)
+        xz_available = active is None or ("X" in active and "Z" in active)
+
+        if xy_available:
+            self._scan_xy_unavail_text.set_text("")
+            xs = [s.coords.get("X", 0.0) for s in valid]
+            ys = [s.coords.get("Y", 0.0) for s in valid]
+            self._scan_line_xy_path.set_data(xs, ys)
+        else:
+            self._scan_xy_unavail_text.set_text("本次搜尋未包含 X/Y 軸")
+            self._scan_line_xy_path.set_data([], [])
+
+        if xz_available:
+            self._scan_xz_unavail_text.set_text("")
+            xs_z = [s.coords.get("X", 0.0) for s in valid]
+            zs = [s.coords.get("Z", 0.0) for s in valid]
+            self._scan_line_xz_path.set_data(xs_z, zs)
+        else:
+            self._scan_xz_unavail_text.set_text("本次搜尋未包含 X/Z 軸")
+            self._scan_line_xz_path.set_data([], [])
 
         start, cur = samples[0], samples[-1]
-        self._scan_scatter_xy_start.set_offsets(
-            [[start.coords.get("X", 0.0), start.coords.get("Y", 0.0)]]
-        )
-        self._scan_scatter_xz_start.set_offsets(
-            [[start.coords.get("X", 0.0), start.coords.get("Z", 0.0)]]
-        )
-        self._scan_scatter_xy_cur.set_offsets(
-            [[cur.coords.get("X", 0.0), cur.coords.get("Y", 0.0)]]
-        )
-        self._scan_scatter_xz_cur.set_offsets(
-            [[cur.coords.get("X", 0.0), cur.coords.get("Z", 0.0)]]
-        )
+        if xy_available:
+            self._scan_scatter_xy_start.set_offsets(
+                [[start.coords.get("X", 0.0), start.coords.get("Y", 0.0)]]
+            )
+            self._scan_scatter_xy_cur.set_offsets(
+                [[cur.coords.get("X", 0.0), cur.coords.get("Y", 0.0)]]
+            )
+        else:
+            self._scan_scatter_xy_start.set_offsets(empty_xy)
+            self._scan_scatter_xy_cur.set_offsets(empty_xy)
+
+        if xz_available:
+            self._scan_scatter_xz_start.set_offsets(
+                [[start.coords.get("X", 0.0), start.coords.get("Z", 0.0)]]
+            )
+            self._scan_scatter_xz_cur.set_offsets(
+                [[cur.coords.get("X", 0.0), cur.coords.get("Z", 0.0)]]
+            )
+        else:
+            self._scan_scatter_xz_start.set_offsets(empty_xy)
+            self._scan_scatter_xz_cur.set_offsets(empty_xy)
 
         best_sample = None
         for s in valid:
             if s.power is not None and (best_sample is None or s.power > best_sample.power):
                 best_sample = s
-        empty_xy = np.empty((0, 2))  # set_offsets 內部要求 2D 形狀，空 list 會被當成 1D 陣列而炸掉
-        if best_sample is not None:
+        if best_sample is not None and xy_available:
             self._scan_scatter_xy_best.set_offsets(
                 [[best_sample.coords.get("X", 0.0), best_sample.coords.get("Y", 0.0)]]
             )
+        else:
+            self._scan_scatter_xy_best.set_offsets(empty_xy)
+        if best_sample is not None and xz_available:
             self._scan_scatter_xz_best.set_offsets(
                 [[best_sample.coords.get("X", 0.0), best_sample.coords.get("Z", 0.0)]]
             )
         else:
-            self._scan_scatter_xy_best.set_offsets(empty_xy)
             self._scan_scatter_xz_best.set_offsets(empty_xy)
 
-        if bad:
+        if bad and xy_available:
             self._scan_scatter_xy_bad.set_offsets(
                 [[s.coords.get("X", 0.0), s.coords.get("Y", 0.0)] for s in bad]
             )
+        else:
+            self._scan_scatter_xy_bad.set_offsets(empty_xy)
+        if bad and xz_available:
             self._scan_scatter_xz_bad.set_offsets(
                 [[s.coords.get("X", 0.0), s.coords.get("Z", 0.0)] for s in bad]
             )
         else:
-            self._scan_scatter_xy_bad.set_offsets(empty_xy)
             self._scan_scatter_xz_bad.set_offsets(empty_xy)
 
         # 功率收斂：x 軸用樣本在整批歷史裡的序號（1-based），無效樣本沒有
@@ -3538,9 +3684,17 @@ class DS102GUI:
             self._flash_banner("已有搜尋在進行中")
             return
 
-        axis_summary = " ".join(
-            f"{ax}={self._scan_axis_step_vars[ax].get()}" for ax in self._scan_axis_step_vars
-        )
+        # 搜尋軸清單必須在主執行緒讀出來（BooleanVar.get()），理由跟下面
+        # initial_step 那段一致——tkinter Variable 不可從背景執行緒讀取。
+        # 0 軸要在打開確認對話框之前擋下，不要讓使用者看到一個注定沒有
+        # 意義的確認視窗。
+        selected_axes = [ax for ax in AXES if self._scan_axis_selected_vars[ax].get()]
+        if not selected_axes:
+            self._flash_banner("尋光需要至少選擇一個軸")
+            return
+
+        axis_summary = " ".join(f"{ax}={self._scan_axis_step_vars[ax].get()}" for ax in selected_axes)
+        axes_txt = "、".join(selected_axes)
         stage2_txt = "啟用" if self._scan_stage2_var.get() else "不啟用"
         floor_val = self._scan_min_valid_power_var.get().strip()
         floor_txt = "未設定（僅依讀值相對變化判斷）" if not floor_val else f"{floor_val} dBm"
@@ -3548,6 +3702,7 @@ class DS102GUI:
 
         if not messagebox.askyesno(
             "確認開始尋光",
+            f"搜尋軸：{axes_txt}\n\n"
             f"即將開始自動尋光，滑台會依演算法自主移動並持續量測光功率。\n\n"
             f"起始步長：{axis_summary}\n"
             f"階段二精修：{stage2_txt}\n"
@@ -3582,6 +3737,7 @@ class DS102GUI:
                 "abort_if_no_signal": self._scan_abort_no_signal_var.get(),
                 "min_valid_power_dbm": self._scan_min_valid_power_var.get(),
                 "enable_stage2": self._scan_stage2_var.get(),
+                "selected_axes": selected_axes,
             },
             log=self.ctrl._log,
         )
@@ -3693,6 +3849,7 @@ class DS102GUI:
             self.ctrl, self._scanner_power_query,
             progress_cb=_progress,
             sample_cb=self._on_scan_sample,
+            selected_axes=selected_axes,
             **scanner_kwargs,
         )
         self._active_scanner = scanner
@@ -4082,6 +4239,16 @@ class DS102GUI:
                             else "disabled"
                         )
                     )
+            # 尋光分頁的搜尋軸勾選框比照同一套 axis_count 判斷 enable/disable；
+            # matplotlib 未安裝時尋光分頁沒有建立這些 widget，用 getattr 保護。
+            scan_checkbuttons = getattr(self, "_scan_axis_checkbuttons", None)
+            if scan_checkbuttons is not None:
+                for ax in AXES:
+                    enabled = int(AXIS_NO[ax]) <= self.ctrl.axis_count
+                    scan_checkbuttons[ax].config(state="normal" if enabled else "disabled")
+                    if not enabled:
+                        self._scan_axis_selected_vars[ax].set(False)
+                self._refresh_scan_entry_states()
             # 控制器設定是 RAM-only，斷電就沒了。連線時已嘗試從設定檔補回，
             # 這裡把結果告訴使用者：補了什麼、還缺什麼。
             # 復歸樣式下拉要填當前軸的實際值（設定檔還原之後才讀才準）
@@ -4622,6 +4789,16 @@ class DS102GUI:
         for grp in self._all_axis_btn_groups:
             for b in grp.values():
                 b.config(state=state)
+        if state == "disabled":
+            # 斷線時尋光分頁的六個搜尋軸勾選框比照軸選擇按鈕組一併關閉——
+            # 只在關閉方向連動：重新 enable 要靠 _on_connect_result 依
+            # axis_count 個別判斷，不能整批 normal（那會把偵測不到的軸也
+            # 開放勾選）。matplotlib 未安裝時用 getattr 保護。
+            for ax in AXES:
+                cb = getattr(self, "_scan_axis_checkbuttons", {}).get(ax)
+                if cb is not None:
+                    cb.config(state="disabled")
+            self._refresh_scan_entry_states()
 
     def _toggle_ems(self):
         if not self.ctrl.ems_active:
