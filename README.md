@@ -25,8 +25,8 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 **本程式沒有模擬模式**——它驅動的是真實滑台，假造的回應會讓人誤以為已連上硬體。沒有硬體時要測控制邏輯，請用假的 serial 物件取代 `ctrl.ser`。
 
 ```bash
-# 跑回歸測試（假物件，不需硬體，173 項）
-venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py -v
+# 跑回歸測試（假物件，不需硬體，187 項）
+venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py -v
 ```
 
 VS Code 的 Testing 面板也能個別發現、個別重跑每一項（`.vscode/settings.json` 已設定 `python.testing.pytestEnabled`）。
@@ -80,7 +80,7 @@ VS Code 的 Testing 面板也能個別發現、個別重跑每一項（`.vscode/
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
 | [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝，已整合進「光功率」／「尋光」分頁，尚未接上真實儀器驗證 |
 | [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`，光纖對準尋光演算法，已接上「尋光」分頁 |
-| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) | 「尋光」／「光功率」分頁／軸機械校正參數的假物件回歸測試（57／66／50 項，共 173 項，pytest 測試檔，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py -v` 執行，或用 VS Code Testing 面板，不需硬體） |
+| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) / [verify_fiber_scanner_signal.py](verify_fiber_scanner_signal.py) | 「尋光」／「光功率」分頁／軸機械校正參數／`fiber_scanner.py` 訊號有效性判準的假物件回歸測試（57／66／50／14 項，共 187 項，pytest 測試檔，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py -v` 執行，或用 VS Code Testing 面板，不需硬體） |
 | [Gtest.py](Gtest.py) | 外部第三方範例，`import control` 的模組不存在於本 repo，**無法執行** |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖。⚠ 其中 DS112 通訊細節（`\r\n`、9600、`!:` 輪詢）**全部是錯的** |
 

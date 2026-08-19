@@ -31,7 +31,7 @@
 
 ### 測試涵蓋缺口
 
-- `verify_fiber_scanner_signal.py`（33 項，訊號有效性判準測試）目前只存在於某次 session 的 scratchpad，**沒有進版控**——比照 `verify_scan_tab.py`／`verify_meter_panel.py`／`verify_axis_calib.py` 的既有慣例應該補進 repo。✅ 這個缺口的「補測試」部分已經有前例可循：2026-08-19 才剛把整個軸校正參數功能從零補了 50 項永久測試（`verify_axis_calib.py`），流程與規模可以直接參考。
+- ✅ **已解決（2026-08-19）**：`verify_fiber_scanner_signal.py`（訊號有效性判準測試）原本只存在於某次 session 的 scratchpad，已比照 `verify_scan_tab.py`／`verify_meter_panel.py`／`verify_axis_calib.py` 的既有慣例補進版控，並從獨立可執行腳本（自製 record/check helper）轉成 pytest（4 個 class、14 個測試函式，涵蓋原本 33 項個別斷言的邏輯——pytest 慣例把同一情境的相關斷言合併進同一個測試函式，數字下降不代表覆蓋率下降）。轉換過程中發現原腳本的 `FakeCtrl` 沒有 `estimate_um()`，因為它寫於 μm 快照功能加入之前，`_measure_here()` 現在無條件呼叫這個方法會直接炸例外——這本身就是「scratchpad 測試沒進版控、沒跟著程式碼一起演進」的活生生案例，佐證了補進版控的必要性。四支測試檔合計 **187 項**，全數重跑通過。
 - HP 8153A **channel A 從未驗證過**，只確認 channel B 可正常回應；channel A 據稱需要外接光學頭，這點是轉述資訊，沒有找到第二來源佐證。
 - 尋光演算法核心邏輯與尋光「分頁」各自都驗證過，但「使用者在 GUI 按下開始尋光、完整跑完一輪」這條端到端路徑**沒有真機驗證紀錄**——2026-08-19 新增的彈性選軸／軌跡圖重繪功能同樣只有假物件驗證，沒有真機驗證。
 
@@ -68,7 +68,7 @@
 - **即時軌跡圖支援任意 1～6 軸組合**——原本固定畫 XY/XZ 投影，選了非 X/Y/Z 的軸組合時會半殘。改成左上「可切換軸對的 2D 投影」（Combobox）＋右上「多軸 1D 相對位移趨勢線」（固定六條線，天生支援任意軸數）。
 - **pytest 測試基礎建設**——`verify_scan_tab.py`／`verify_meter_panel.py` 從自訂 PASS/FAIL 腳本改寫成 pytest 測試檔（檔名不變），VS Code Testing 面板可以個別發現、個別重跑；新增 `conftest.py`（共用 fixture）／`pytest.ini`。過程中發現整個「軸機械校正參數」功能完全沒有永久回歸測試覆蓋，補了 `verify_axis_calib.py`（50 項）。**補測試過程中意外抓到 `conftest.py` 的真坑**：`make_gui()` 原本只 patch `main_ai.RECORDING_DIR`，但 `DS102Controller` 的持久化方法用的是 `ds102_ctrl.py` 自己獨立的 `RECORDING_DIR` 模組層級綁定，只 patch 一邊完全沒有防護效果（跟 CLAUDE.md 記載的「測試腳本清空過兩次 teaching points」是同一類風險）。已修好，現在三支測試檔合計 **173 項**。
 
-以上每一步都經過至少一輪 architect 審查、獨立驗證（不只信任實作代理的自我報告，通常會自己重寫一份驗證腳本交叉確認）、既有回歸測試全程保持通過（從最初的 123 項成長到現在的 173 項）。詳細設計理由與逐項驗證數據都寫進 CLAUDE.md 對應章節，這裡不重複。
+以上每一步都經過至少一輪 architect 審查、獨立驗證（不只信任實作代理的自我報告，通常會自己重寫一份驗證腳本交叉確認）、既有回歸測試全程保持通過（從最初的 123 項成長到現在的 187 項，含補進版控的 `verify_fiber_scanner_signal.py`）。詳細設計理由與逐項驗證數據都寫進 CLAUDE.md 對應章節，這裡不重複。
 
 ## 交接注意事項
 

@@ -134,7 +134,7 @@ for cycle in 1..max_cycles:
 - `_weighted_least_squares` 精確還原已知線性關係
 - 階段一+階段二混合仍能收斂
 
-訊號有效性判準（`min_valid_power_dbm` 絕對下限、`_check_signal_detectable`、門檻公式修正，見上方〈訊號有效性判準〉）另外用**合成資料**補了 33 項測試，涵蓋絕對下限、`_check_signal_detectable` 單元測試、`run_stage1` 整合測試、開關回歸驗證。🔴 **這 33 項（`verify_fiber_scanner_signal.py`）目前只存在於某次 session 的 scratchpad，沒有進版控**——比照 `verify_scan_tab.py`／`verify_meter_panel.py`／`verify_axis_calib.py` 的既有慣例應該補進 repo，是已知缺口（HANDOVER.md〈測試涵蓋缺口〉同步記載）。
+訊號有效性判準（`min_valid_power_dbm` 絕對下限、`_check_signal_detectable`、門檻公式修正，見上方〈訊號有效性判準〉）另外用**合成資料**驗證，涵蓋絕對下限、`_check_signal_detectable` 單元測試、`run_stage1` 整合測試、開關回歸驗證。✅ **已進版控（2026-08-19）**：`verify_fiber_scanner_signal.py` 原本只存在於某次 session 的 scratchpad（獨立可執行腳本、33 項個別斷言），已比照 `verify_scan_tab.py`／`verify_meter_panel.py`／`verify_axis_calib.py` 的既有慣例補進 repo 並轉為 pytest（4 個 class、14 個測試函式，同一情境的相關斷言合併進同一函式，覆蓋範圍不變）。轉換時發現原腳本的 `FakeCtrl` 缺 `estimate_um()`（寫於 2026-08-19 μm 快照功能加入之前，`_measure_here()` 現在無條件呼叫它），已補上回傳 `None` 的樁修正。
 
 ⚠ **這一節測的是 `fiber_scanner.py` 演算法本身**（假 serial + 合成功率曲線）。GUI 整合層另有獨立的 57 項假物件回歸測試（`verify_scan_tab.py`，已進版控，見下方〈GUI 整合〉），測的是「`main_ai.py` 怎麼呼叫 scanner」，兩層測試互不重疊也互不取代。
 
@@ -148,7 +148,7 @@ for cycle in 1..max_cycles:
 | 假 serial + 合成功率曲線驗證收斂性與安全邏輯 | ✅ 已完成（48 項測試） | 不需要 |
 | 假 GPIB ＋真滑台，驗證執行緒與鎖的實際延遲 | ✅ 已驗證（2026-08-07，COM2） | 已完成 |
 | 真滑台小範圍驗證多軸批次收尾（比照 `origin_all` 用韌體軟體限位模擬撞限位） | ✅ 已驗證（2026-08-07，COM2） | 已完成 |
-| 訊號有效性判準（絕對下限＋全域無訊號偵測） | ✅ 已完成，合成資料驗證（33 項，**未進版控**，見上方） | 不需要 |
+| 訊號有效性判準（絕對下限＋全域無訊號偵測） | ✅ 已完成，合成資料驗證（14 項，已進版控，見上方） | 不需要 |
 | HP 8153A 整合進 GUI（光功率／尋光分頁）＋ 尋光六階段 GUI 整合 | ✅ 已完成，假物件驗證（57 項，已進版控） | 不需要 |
 | 尋光彈性選軸（1～6 軸）＋ 即時軌跡圖支援任意軸組合 | ✅ 已完成，假物件驗證（併入 123 項既有回歸測試） | 不需要 |
 | 真機端到端跑一次「GUI 按下開始尋光→完整跑完一輪」 | ⬜ 待執行 | **需要滑台＋光功率計** |
@@ -217,7 +217,7 @@ for cycle in 1..max_cycles:
 1. **觸發時機**：`_check_signal_detectable()` 原本只在「本輪改善量（`total_improvement`）低於雜訊底限」時才呼叫。但 `total_improvement`（各軸 `max(0, 改善)` 相加、負值夾成 0）在純雜訊情境下有結構性正偏誤——方向探測比較 `p_plus > p0` 沒有雜訊門檻，等同挑雜訊讀值中較大者的選擇偏誤，多軸加總後這個偏誤會意外讓 `total_improvement` 大於雜訊底限，導致判準完全沒被觸發。實測跑到離合成峰值 1000+ pulse 遠的地方才「收斂」。修法：改成第一輪跑完就無條件檢查一次，不再依賴這個有偏誤的中介指標。
 2. **門檻公式**：修好觸發時機後，門檻本身還是卡在邊緣沒攔下來（range 只比固定的 `no_signal_range_mult × 3σ` 門檻高 1.5%）。純雜訊下 range 的期望值本來就隨樣本數 n 增加（統計製程管制文獻的 d2(n) 係數），固定門檻隱含假設了 n 不會太大，但單輪座標下降實測會累積到 n≈206（3 軸情境）。修法：新增 `_norm_ppf()`（標準常態反累積分布函數的有理近似 + 一次 Newton 修正，只用標準庫 `math`，非 scipy）與 `_expected_noise_range_factor(n)`（Blom (1958) 近似：`E[R_n]/σ ≈ 2·Φ⁻¹((n−0.375)/(n+0.25))`），把門檻改成 `no_signal_range_mult × d2(n) × σ`，不再是固定值。已與已發表 d2 表核對，n=5/10/25/50/100 誤差皆 <2%。
 
-兩次修正後既有 33 項回歸測試（`verify_fiber_scanner_signal.py`，見下方〈驗證方式〉的版控缺口說明）全數通過。
+兩次修正後既有回歸測試（`verify_fiber_scanner_signal.py`，見上方〈驗證方式〉）全數通過。
 
 ## GUI 整合（2026-08-17，`8dbc24e`～`32b4c66`）
 
@@ -250,7 +250,7 @@ architect 對整個 `feat/fiber-search-gui` 分支做完整審查，**第一版�
 - **CRITICAL：`ScanAbort` 被 `fiber_scanner.run()` 吞掉，結果分級功能整組失效。** `run()` 內部把使用者中止／EMS 觸發／無訊號判定全部用 `ScanAbort` 自己接住、正常 `return`——`main_ai.py` 精心比對三種訊息字面量來分類結果的程式碼，實際上永遠不會被執行到（`run()` 唯一真的會拋出例外的路徑在啟動背景執行緒前就被 `_do_start_scan` 擋掉了）。實際影響：**使用者按停止、甚至 EMS 緊急停止觸發，畫面都會顯示「✔ 尋光完成」**——安全訊息層級的問題，操作者可能誤以為對準流程正常結束。修法：`fiber_scanner.py` 新增 `self.last_abort_reason`（`None`＝真的收斂完成，否則是中止原因字串），`run()` 在 `except ScanAbort` 分支設定它；`main_ai.py` 改成讀這個屬性分類，不再只依賴例外傳遞。用真的跑滿 `scanner.run()` 背景執行緒（不是直接呼叫 `_on_scan_done`）驗證中途停止／EMS 觸發／純雜訊無訊號中止三種情境，確認都不會再被誤報成「完成」。
 - 三項高/中風險：`scanner_config.json`／`meter_config.json` 讀到「合法 JSON 但頂層不是物件」會讓整個 `DS102GUI.__init__` 崩潰（已加 `isinstance(dict)` 檢查）；`_redraw_scan_plot()` 只接 `tk.TclError`，其他型別例外會讓 250ms 重繪迴圈永久斷掉且無任何提示（已加 `except Exception` 但不 `return`）；`_on_close()` 沒有通知進行中的尋光背景執行緒視窗正在關閉（已比照 `_stop_playback.set()` 補上）。
 
-全部修正後 `fiber_scanner.py` 既有 33 項合成資料測試全數維持通過，`main_ai.py` 端補上 57 項假物件回歸測試（`verify_scan_tab.py`，`32b4c66`）。
+全部修正後 `fiber_scanner.py` 既有合成資料測試全數維持通過，`main_ai.py` 端補上 57 項假物件回歸測試（`verify_scan_tab.py`，`32b4c66`）。
 
 🔴 **本文件與 HANDOVER.md 一致地如實記錄：沒有找到 architect 對整個分支重新審查、並給出「建議合併」結論的紀錄。** 之後（2026-08-19）的尋光彈性選軸與即時軌跡圖重繪都各自經過針對該子功能的 architect 審查（見下方），但那是「對單一子功能」的審查，不等於「對整個分支」的總覽式複審——分支目前仍未合併回 `main`。
 
@@ -294,5 +294,4 @@ architect 收尾審查（`286aaea`）額外記錄三個**判定不影響安全�
 - **`meter_GPIB.py` 的實際連線驗證，仍不完整**——2026-08-12 已用真實 HP 8153A 查證修正兩個 SCPI 指令 bug（`WAV`→`WAVE`、`FETC`→`READ`），且原始碼註解記載 **channel B 實機驗證過可正常回應**，但 **channel A 從未驗證過**（據稱需要外接光學頭，這點是轉述資訊，未找到第二來源佐證）；`GPIB_THROTTLE_SEC` 等節流參數仍是起跳值，未接上真實儀器校準；`VisaIOError` 處理路徑本身也還沒有真實儀器可以觸發驗證。
 - **軟體限位與韌體限位在掃描期間的交互**——階段二的批次移動走 `check_sw_limits_batch`（Python 端），韌體端的限位（`CWSLE`）依 CLAUDE.md〈硬體連不上時〉2026-08-05 複測記載目前維持出廠預設（未啟用），這件事在正式跑真實掃描前需要重新確認，截至 2026-08-19 未見狀態變更的紀錄。
 - **GUI 整合層的端到端真機驗證**——`fiber_scanner.py` 演算法核心與「尋光」分頁各自都驗證過（前者真機、後者假物件），但「使用者在 GUI 按下開始尋光、完整跑完一輪」這條路徑**沒有真機驗證紀錄**，2026-08-19 新增的彈性選軸／即時軌跡圖重繪同樣只有假物件驗證。這是目前最大的驗證缺口。
-- **`verify_fiber_scanner_signal.py` 補進版控**——33 項訊號有效性判準的合成資料測試目前只存在於 scratchpad，見上方〈驗證方式〉。
 - **architect 對整個 `feat/fiber-search-gui` 分支的總覽式複審**——目前只有對整個分支的「第一輪」審查（`2648861`，最初「不建議合併」，修正後未見重新複審結論）與之後各子功能各自的審查，沒有「這個分支現在可以合併」的正式結論，見上方〈GUI 整合〉。
