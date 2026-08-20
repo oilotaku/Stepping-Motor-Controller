@@ -22,6 +22,7 @@ import logging
 import csv
 import re
 import math
+import contextlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -547,6 +548,13 @@ class DS102Controller:
         self._jog_stop = threading.Event()
         self._jog_stop.set()
 
+        # 序列埠移動動作巢狀計數器（供 motion_active property 使用）。
+        # 用計數器而非 bool 是因為 origin_all 會巢狀呼叫 move_origin，
+        # 必須等最外層也離開才算真正結束。刻意不共用 self._lock
+        # （那把鎖保護 _positions_pulse/_offsets，是熱路徑，不擴大其責任）。
+        self._motion_depth = 0
+        self._motion_lock = threading.Lock()
+
         # 狀態異常回調（用於 GUI 彈窗）
         self._alarm_cb = None
 
@@ -575,6 +583,42 @@ class DS102Controller:
         """
         with self._lock:
             return dict(self._positions_pulse)
+
+    @contextlib.contextmanager
+    def _motion_scope(self):
+        """
+        標記「目前有一段序列埠移動動作正在進行」的內部 context manager。
+
+        用巢狀計數器（_motion_depth）而非單純 bool，是因為 origin_all()
+        會巢狀呼叫 move_origin()——用 bool 的話內層 move_origin 結束時會
+        把旗標提前清成 False，此時 origin_all 其實還沒收尾。只給
+        motion_active property 讀，不對外公開、不做任何移動守衛判斷
+        （守衛邏輯各自沿用既有的 playback_running/scanning_active 檢查）。
+        """
+        with self._motion_lock:
+            self._motion_depth += 1
+        try:
+            yield
+        finally:
+            with self._motion_lock:
+                self._motion_depth -= 1
+
+    @property
+    def motion_active(self) -> bool:
+        """
+        是否有任何序列埠移動動作正在進行（涵蓋點動/步進/原點復歸/重播/尋光）。
+
+        🔴 只給「要不要占用其他硬體資源（如 GPIB）」的判斷用，絕對不可拿來
+        當移動守衛（不可放進 move_step/move_continue/goto_point 的守衛條件）。
+        scanning_active 進 move_step 的守衛曾經導致所有收斂測試卡死
+        （scanner 呼叫自己的移動被自己設的旗標擋住），這裡是同一個陷阱的翻版。
+        """
+        return (
+            self.playback_running
+            or self.scanning_active
+            or not self._jog_stop.is_set()
+            or self._motion_depth > 0
+        )
 
     def set_offset_here(self, axis_no: str) -> None:
         """將當前位置設為工作原點（offset = 目前機械位置）"""
@@ -1026,6 +1070,9 @@ class DS102Controller:
         return unset
 
     def disconnect(self) -> None:
+        # 中斷連線也要確保點動監看執行緒收工，否則 _jog_stop 會卡在
+        # clear() 狀態，motion_active 永遠回報 True（見 emergency_stop 同一類前置缺陷）。
+        self._jog_stop.set()
         if self.ser and self.ser.is_open:
             self.ser.close()
         self.connected = False
@@ -1276,32 +1323,36 @@ class DS102Controller:
             self._log("ERROR", f"步進距離格式錯誤: {amount}")
             return False
 
-        ax = NO_AXIS.get(axis_no)
-        if ax:
-            with self._lock:
-                cur = self._positions_pulse[ax]
-            target = cur + (pulse_amt if direction == "CW" else -pulse_amt)
-            ok, reason = self._check_sw_limit(axis_no, target)
-            if not ok:
-                self._log("WARN", f"軟體限位攔截: {reason}")
-                if self._alarm_cb:
-                    self._alarm_cb("軟體行程限制", reason)
-                return False
+        # 用 _motion_scope 標記「這段期間有序列埠移動動作」，供
+        # motion_active property 讀取（目前用途：暫停光功率背景輪詢，
+        # 避免馬達震動期間讀到不可信的雜訊值）。
+        with self._motion_scope():
+            ax = NO_AXIS.get(axis_no)
+            if ax:
+                with self._lock:
+                    cur = self._positions_pulse[ax]
+                target = cur + (pulse_amt if direction == "CW" else -pulse_amt)
+                ok, reason = self._check_sw_limit(axis_no, target)
+                if not ok:
+                    self._log("WARN", f"軟體限位攔截: {reason}")
+                    if self._alarm_cb:
+                        self._alarm_cb("軟體行程限制", reason)
+                    return False
 
-        # DS102 韌體會「靜默忽略」帶小數點的 PULS 值：實測 PULS 500.0000
-        # 完全不動且不回報錯誤，PULS 500 才會動。一律送整數。
-        amount = f"{amount_f:.0f}"
+            # DS102 韌體會「靜默忽略」帶小數點的 PULS 值：實測 PULS 500.0000
+            # 完全不動且不回報錯誤，PULS 500 才會動。一律送整數。
+            amount = f"{amount_f:.0f}"
 
-        cmd = (
-            f"AXI{axis_no}:L0 {l_speed}:R0 {rate}"
-            f":S0 {s_rate}:F0 {f_speed}:PULS {amount}:GO {direction}"
-        )
-        self._serial_write(cmd)
-        self._log("INFO", f"步進 軸{axis_no} {direction} {amount} pulse", tx=cmd)
+            cmd = (
+                f"AXI{axis_no}:L0 {l_speed}:R0 {rate}"
+                f":S0 {s_rate}:F0 {f_speed}:PULS {amount}:GO {direction}"
+            )
+            self._serial_write(cmd)
+            self._log("INFO", f"步進 軸{axis_no} {direction} {amount} pulse", tx=cmd)
 
-        if wait_done:
-            return self._wait_axis_stop(axis_no)
-        return True
+            if wait_done:
+                return self._wait_axis_stop(axis_no)
+            return True
 
     def move_origin(
         self,
@@ -1330,30 +1381,33 @@ class DS102Controller:
         """
         if self.ems_active or self.playback_running or self.scanning_active:
             return False
-        self._serial_write(f"AXI{axis_no}:MEMSW0 {org_type}")
-        time.sleep(0.1)
-        cmd = f"AXI{axis_no}:L0 {l_speed}:R0 {rate}" f":S0 {s_rate}:F0 {f_speed}:GO ORG"
-        self._serial_write(cmd)
-        self._log("INFO", f"原點返回 軸{axis_no} ORG{org_type}", tx=cmd)
-        if not wait_done:
-            return True
-
-        ax = NO_AXIS.get(axis_no, axis_no)
-        if not self._wait_origin_done(axis_no):
-            self._log("ERROR", f"軸 {ax} 原點復歸逾時")
-            if self._alarm_cb:
-                self._alarm_cb(f"軸 {ax} 復歸逾時", "原點復歸未在時限內完成")
-            return False
-
-        _, pos = self.query_status(axis_no)
-        try:
-            if abs(float(pos)) < 0.5:
+        # 用 _motion_scope 標記移動期間（見 _do_move_step 同一段註解）。
+        # origin_all 會巢狀呼叫本方法，_motion_scope 用計數器正確處理巢狀。
+        with self._motion_scope():
+            self._serial_write(f"AXI{axis_no}:MEMSW0 {org_type}")
+            time.sleep(0.1)
+            cmd = f"AXI{axis_no}:L0 {l_speed}:R0 {rate}" f":S0 {s_rate}:F0 {f_speed}:GO ORG"
+            self._serial_write(cmd)
+            self._log("INFO", f"原點返回 軸{axis_no} ORG{org_type}", tx=cmd)
+            if not wait_done:
                 return True
-        except (ValueError, TypeError):
-            pass
-        self._log("WARN", f"軸 {ax} 復歸後 POS={pos} 未自動歸零，強制設為 0")
-        self.set_position(axis_no, "0")
-        return True
+
+            ax = NO_AXIS.get(axis_no, axis_no)
+            if not self._wait_origin_done(axis_no):
+                self._log("ERROR", f"軸 {ax} 原點復歸逾時")
+                if self._alarm_cb:
+                    self._alarm_cb(f"軸 {ax} 復歸逾時", "原點復歸未在時限內完成")
+                return False
+
+            _, pos = self.query_status(axis_no)
+            try:
+                if abs(float(pos)) < 0.5:
+                    return True
+            except (ValueError, TypeError):
+                pass
+            self._log("WARN", f"軸 {ax} 復歸後 POS={pos} 未自動歸零，強制設為 0")
+            self.set_position(axis_no, "0")
+            return True
 
     @staticmethod
     def limit_direction(status: str) -> Optional[str]:
@@ -1433,100 +1487,104 @@ class DS102Controller:
         done, skipped, failed = [], [], []
         saved: Dict[str, Tuple[str, str]] = {}
 
-        try:
-            for i in range(self.axis_count):
-                axis_no = str(i + 1)
-                ax = NO_AXIS.get(axis_no, axis_no)
-                if progress_cb:
-                    progress_cb(ax, "檢查中")
+        # 用 _motion_scope 標記整批復歸期間（見 _do_move_step 同一段註解）。
+        # 計數器設計讓這裡即使巢狀呼叫到其他也會進入 _motion_scope 的
+        # 移動方法也不會提早清空旗標。
+        with self._motion_scope():
+            try:
+                for i in range(self.axis_count):
+                    axis_no = str(i + 1)
+                    ax = NO_AXIS.get(axis_no, axis_no)
+                    if progress_cb:
+                        progress_cb(ax, "檢查中")
 
-                st, _ = self.query_status(axis_no)
-                if st == "Stage not connected":
-                    skipped.append(f"{ax}(未接滑台)")
-                    continue
+                    st, _ = self.query_status(axis_no)
+                    if st == "Stage not connected":
+                        skipped.append(f"{ax}(未接滑台)")
+                        continue
 
-                org_type = self._serial_write_read(f"AXI{axis_no}:MEMSW0?")
-                if org_type.strip() == "0":
-                    skipped.append(f"{ax}(復歸樣式 Type0＝不執行)")
-                    continue
+                    org_type = self._serial_write_read(f"AXI{axis_no}:MEMSW0?")
+                    if org_type.strip() == "0":
+                        skipped.append(f"{ax}(復歸樣式 Type0＝不執行)")
+                        continue
 
-                # 暫時解除軟體限位，記下原值以便還原
-                saved[axis_no] = self._soft_limits_enabled(axis_no)
-                self._set_soft_limits_enabled(axis_no, False)
+                    # 暫時解除軟體限位，記下原值以便還原
+                    saved[axis_no] = self._soft_limits_enabled(axis_no)
+                    self._set_soft_limits_enabled(axis_no, False)
 
-                # MEMSW7=0 才會讓控制器在復歸完成後自動把 POS 歸零。
-                # 程式以前從來沒讀過也沒設過它，只是「假設」已經是 0——
-                # 這正是「歸位後 0 點不固定」的成因：控制器若不是 0，
-                # 復歸後座標會停在任意值。這裡明確設定，不再靠假設。
-                msw7 = self._serial_write_read(f"AXI{axis_no}:MEMSW7?").strip()
-                if msw7 != "0":
-                    self._log(
-                        "WARN",
-                        f"軸 {ax} MEMSW7={msw7 or '讀取失敗'}（非 0），"
-                        f"復歸不會自動歸零——已改設為 0",
-                    )
-                    self._serial_write(f"AXI{axis_no}:MEMSW7 0")
-                    time.sleep(0.1)
-
-                if progress_cb:
-                    progress_cb(ax, f"復歸中 (Type{org_type})")
-                cmd = (
-                    f"AXI{axis_no}:L0 {l_speed}:R0 {rate}"
-                    f":S0 {s_rate}:F0 {f_speed}:GO ORG"
-                )
-                self._serial_write(cmd)
-                self._log("INFO", f"原點復歸 軸{ax} Type{org_type}", tx=cmd)
-                time.sleep(0.1)  # 給控制器一點時間啟動復歸
-
-                if not self._wait_origin_done(axis_no):
-                    failed.append(f"{ax}(復歸逾時)")
-                    continue
-
-                _, pos2 = self.query_status(axis_no)
-                try:
-                    zeroed = abs(float(pos2)) < 0.5
-                except (ValueError, TypeError):
-                    zeroed = False
-                if zeroed:
-                    done.append(f"{ax}(POS=0)")
-                else:
-                    # 已經先設過 MEMSW7=0 還是沒歸零 → 直接強制寫入 POS 0。
-                    # 「原點復歸後座標必為 0」是後續所有教點與限位的共同前提，
-                    # 讓它停在任意值等於整組座標系失準。
-                    self._log(
-                        "WARN",
-                        f"軸 {ax} 復歸後 POS={pos2} 未自動歸零，強制設為 0",
-                    )
-                    self.set_position(axis_no, "0")
-                    _, pos3 = self.query_status(axis_no)
-                    try:
-                        forced_ok = abs(float(pos3)) < 0.5
-                    except (ValueError, TypeError):
-                        forced_ok = False
-                    if forced_ok:
-                        done.append(f"{ax}(POS=0 強制)")
-                    else:
-                        failed.append(f"{ax}(歸零失敗 POS={pos3})")
-        finally:
-            # 無論成功與否都要把軟體限位還原回去。
-            #
-            # 還原不到就一律開啟（"1"），絕不 fallback 到停用：
-            # _serial_write_read 三次失敗會回傳空字串，舊寫法的 `cw or '0'`
-            # 會把它變成 '0'＝停用，於是「序列埠壅塞一下」就等於把韌體端
-            # 唯一可靠的那層保護永久關掉，而且不留任何痕跡。
-            # 保護該有的失效方向是「寧可多擋」，不是「寧可放行」。
-            for axis_no, (cw, ccw) in saved.items():
-                ax = NO_AXIS.get(axis_no, axis_no)
-                for cmd, val in (("CWSLE", cw), ("CCWSLE", ccw)):
-                    v = (val or "").strip()
-                    if v not in ("0", "1"):
+                    # MEMSW7=0 才會讓控制器在復歸完成後自動把 POS 歸零。
+                    # 程式以前從來沒讀過也沒設過它，只是「假設」已經是 0——
+                    # 這正是「歸位後 0 點不固定」的成因：控制器若不是 0，
+                    # 復歸後座標會停在任意值。這裡明確設定，不再靠假設。
+                    msw7 = self._serial_write_read(f"AXI{axis_no}:MEMSW7?").strip()
+                    if msw7 != "0":
                         self._log(
-                            "ERROR",
-                            f"軸 {ax} {cmd} 原始值讀不到（收到 {val!r}），"
-                            f"改以啟用(1)還原——請確認限位設定是否符合預期",
+                            "WARN",
+                            f"軸 {ax} MEMSW7={msw7 or '讀取失敗'}（非 0），"
+                            f"復歸不會自動歸零——已改設為 0",
                         )
-                        v = "1"
-                    self._serial_write(f"AXI{axis_no}:{cmd} {v}")
+                        self._serial_write(f"AXI{axis_no}:MEMSW7 0")
+                        time.sleep(0.1)
+
+                    if progress_cb:
+                        progress_cb(ax, f"復歸中 (Type{org_type})")
+                    cmd = (
+                        f"AXI{axis_no}:L0 {l_speed}:R0 {rate}"
+                        f":S0 {s_rate}:F0 {f_speed}:GO ORG"
+                    )
+                    self._serial_write(cmd)
+                    self._log("INFO", f"原點復歸 軸{ax} Type{org_type}", tx=cmd)
+                    time.sleep(0.1)  # 給控制器一點時間啟動復歸
+
+                    if not self._wait_origin_done(axis_no):
+                        failed.append(f"{ax}(復歸逾時)")
+                        continue
+
+                    _, pos2 = self.query_status(axis_no)
+                    try:
+                        zeroed = abs(float(pos2)) < 0.5
+                    except (ValueError, TypeError):
+                        zeroed = False
+                    if zeroed:
+                        done.append(f"{ax}(POS=0)")
+                    else:
+                        # 已經先設過 MEMSW7=0 還是沒歸零 → 直接強制寫入 POS 0。
+                        # 「原點復歸後座標必為 0」是後續所有教點與限位的共同前提，
+                        # 讓它停在任意值等於整組座標系失準。
+                        self._log(
+                            "WARN",
+                            f"軸 {ax} 復歸後 POS={pos2} 未自動歸零，強制設為 0",
+                        )
+                        self.set_position(axis_no, "0")
+                        _, pos3 = self.query_status(axis_no)
+                        try:
+                            forced_ok = abs(float(pos3)) < 0.5
+                        except (ValueError, TypeError):
+                            forced_ok = False
+                        if forced_ok:
+                            done.append(f"{ax}(POS=0 強制)")
+                        else:
+                            failed.append(f"{ax}(歸零失敗 POS={pos3})")
+            finally:
+                # 無論成功與否都要把軟體限位還原回去。
+                #
+                # 還原不到就一律開啟（"1"），絕不 fallback 到停用：
+                # _serial_write_read 三次失敗會回傳空字串，舊寫法的 `cw or '0'`
+                # 會把它變成 '0'＝停用，於是「序列埠壅塞一下」就等於把韌體端
+                # 唯一可靠的那層保護永久關掉，而且不留任何痕跡。
+                # 保護該有的失效方向是「寧可多擋」，不是「寧可放行」。
+                for axis_no, (cw, ccw) in saved.items():
+                    ax = NO_AXIS.get(axis_no, axis_no)
+                    for cmd, val in (("CWSLE", cw), ("CCWSLE", ccw)):
+                        v = (val or "").strip()
+                        if v not in ("0", "1"):
+                            self._log(
+                                "ERROR",
+                                f"軸 {ax} {cmd} 原始值讀不到（收到 {val!r}），"
+                                f"改以啟用(1)還原——請確認限位設定是否符合預期",
+                            )
+                            v = "1"
+                        self._serial_write(f"AXI{axis_no}:{cmd} {v}")
 
         parts = []
         if done:
@@ -1599,6 +1657,9 @@ class DS102Controller:
         """
         self.ems_active = True
         self.playback_running = False
+        # 點動中觸發緊急停止也要讓監看執行緒收工，否則 _jog_stop 會卡在
+        # clear() 狀態，motion_active 永遠回報 True（見 disconnect 同一類前置缺陷）。
+        self._jog_stop.set()
         raw = b"STOP 0\r"
         if self.ser and self.ser.is_open:
             try:

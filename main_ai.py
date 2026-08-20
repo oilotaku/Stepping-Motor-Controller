@@ -2792,9 +2792,9 @@ class DS102GUI:
 
         # 尋光執行中的狀態提示列——狀態驅動（跟著 ctrl.scanning_active），
         # 不是 _flash_banner 那種計時後自動消失的提示。預設不 pack，顯示/
-        # 隱藏交給 _pm_sync_scan_notice()（掛在 _redraw_scan_plot 既有的
-        # 250ms 節奏上，見該方法與 main_ai.py 架構說明的〈scanning_active
-        # 與 scan_move_step〉一節）。
+        # 隱藏交給 _pm_sync_scan_notice()（2026-08-20 起掛在 _start_poller
+        # 既有的 100ms 節奏上，見該方法與 main_ai.py 架構說明的
+        # 〈scanning_active 與 scan_move_step〉一節）。
         self._pm_scan_notice = tk.Label(
             pow_card,
             text="🔍 尋光進行中 — 讀值由「尋光」分頁提供，本頁自動輪詢已暫停",
@@ -3590,13 +3590,17 @@ class DS102GUI:
         尋光沒在跑時 _scan_plot_pending 理應是空的（sample_cb 不會被呼叫），
         這裡仍然檢查 self._scanning 再處理，避免尋光剛結束、佇列裡還有
         最後幾筆待處理樣本時被跳過而遺漏。
+
+        ⚠ `_pm_sync_scan_notice()` 的呼叫已於 2026-08-20 搬去 `_start_poller`
+        （100ms、不受「有沒有裝 matplotlib」影響的節奏）——這條迴圈整條
+        在沒裝 matplotlib 時不會執行，之前掛在這裡會讓光功率分頁的提示列
+        在那種環境下永遠不會被同步，這裡不再重複呼叫。
         """
         try:
             with self._scan_plot_lock:
                 pending, self._scan_plot_pending = self._scan_plot_pending, []
             if pending:
                 self._scan_plot_extend(pending)
-            self._pm_sync_scan_notice()
         except tk.TclError:
             return  # widget 已被銷毀（關閉流程中），安靜收工
         except Exception:
@@ -4596,14 +4600,16 @@ class DS102GUI:
         """
         依 ctrl.scanning_active 同步光功率分頁的狀態提示列與操作按鈕。
 
-        沒有另開輪詢——搭 _redraw_scan_plot 既有的 250ms 節奏（尋光分頁
-        建立時就啟動，跑到程式結束為止，跟尋光是否進行中無關），加上
-        _on_scan_done 收尾時額外呼叫一次，讓收回不必等到下一輪節奏。
+        沒有另開輪詢——搭 _start_poller 既有的 100ms 節奏（2026-08-20 從
+        _redraw_scan_plot 搬過來，原本掛在那條鏈上時，沒裝 matplotlib
+        的環境整條迴圈不會執行，會讓這裡永遠不同步；_start_poller 不做
+        任何 I/O 且一定會跑，是更合適的節奏來源），加上 _on_scan_done
+        收尾時額外呼叫一次，讓收回不必等到下一輪節奏。
         """
         scanning = self.ctrl.scanning_active
         notice = self._pm_scan_notice
         # ⚠ 用 winfo_manager() 而非 winfo_ismapped() 判斷是否已顯示——這裡
-        # 的節奏來源是 _redraw_scan_plot（250ms），使用者尋光期間通常會
+        # 的節奏來源是 _start_poller（100ms），使用者尋光期間通常會
         # 留在「尋光」分頁盯著圖表看，這代表「光功率」分頁十之八九不是
         # 當下選取的分頁。winfo_ismapped() 反映的是「目前實際畫在螢幕
         # 上」，未選取分頁底下的元件永遠回傳 False，即使早就 pack() 過。
@@ -4634,13 +4640,9 @@ class DS102GUI:
             self._pm_set_widgets_state("connected" if self.meter is not None else "disconnected")
             # _scan_plot_extend 尋光期間把 _pm_status_var 改成「尋光中…」，
             # 收尾後要還原成正常狀態文字，否則會卡在「尋光中」字樣不放，
-            # 使用者看畫面會誤以為尋光還沒真的結束。
-            if self.meter is not None:
-                self._pm_status_var.set("已連線")
-                self._pm_status_lbl.config(fg=CLR_ACCENT)
-            else:
-                self._pm_status_var.set("未連線")
-                self._pm_status_lbl.config(fg=CLR_MUTED)
+            # 使用者看畫面會誤以為尋光還沒真的結束。還原邏輯交給
+            # _pm_refresh_status_line()（唯一寫入者），不再自己判斷。
+            self._pm_refresh_status_line()
 
     def _pm_sync_poll_interval_state(self):
         """輪詢間隔輸入框：僅當已連線且勾選自動輪詢時才 enabled。"""
@@ -4682,15 +4684,12 @@ class DS102GUI:
         if ok:
             if self._pm_comm_failures >= COMM_FAIL_THRESHOLD:
                 self.ctrl._log("INFO", "光功率讀取已恢復正常")
-                self._pm_status_var.set("已連線")
-                self._pm_status_lbl.config(fg=CLR_ACCENT)
                 self._pm_set_status_dot(CLR_ACCENT)
             self._pm_comm_failures = 0
             self._pm_last_ok_time = time.time()
             self._pm_last_value = val
             self._pm_power_var.set(f"{val:.2f}")
             self._pm_unit_var.set("dBm")
-            self._pm_power_lbl.config(fg=CLR_TEXT)
         else:
             self._pm_comm_failures += 1
             if self._pm_comm_failures == COMM_FAIL_THRESHOLD:
@@ -4700,14 +4699,14 @@ class DS102GUI:
                 if detail:
                     banner += f"（{detail}）"
                 self._flash_banner(banner)
-                self._pm_status_var.set(
-                    f"⚠ 已停止更新（{detail}）" if detail else "⚠ 已停止更新"
-                )
-                self._pm_status_lbl.config(fg=CLR_DANGER)
                 self._pm_set_status_dot(CLR_DANGER)
                 self._pm_power_var.set("—")
                 self._pm_unit_var.set("")
-                self._pm_power_lbl.config(fg=CLR_DANGER)
+        # 文字與前景色統一交給 _pm_refresh_status_line()（唯一寫入者），
+        # 這裡只需確保 _pm_comm_failures 已更新到最新值再呼叫；即使不主動
+        # 呼叫，_start_poller 的 100ms 節奏最終也會校正，這裡呼叫純粹是
+        # 讓事件當下就反映，不必多等一輪。
+        self._pm_refresh_status_line()
         self._pm_update_age_label()
 
     def _get_last_pm_value(self) -> Optional[float]:
@@ -4748,6 +4747,67 @@ class DS102GUI:
         age = time.time() - self._pm_last_ok_time
         self._pm_age_var.set("剛更新" if age < 1.5 else f"{age:.0f}s 前")
 
+    def _pm_refresh_status_line(self):
+        """
+        `_pm_status_var` / `_pm_status_lbl` / `_pm_power_lbl` 前景色的
+        唯一寫入者。優先序：未連線 > 通訊失敗 > 尋光中 > 移動中 > 正常。
+
+        掛在 `_start_poller`（100ms、不做 I/O、一定會跑）而非
+        `_redraw_scan_plot`（250ms，僅在裝了 matplotlib 時才會執行——
+        掛在那條鏈上會讓「移動中」這個新狀態在沒裝 matplotlib 的環境下
+        完全失效）。`_on_meter_reading`／`_pm_sync_scan_notice` 也會在
+        各自的事件當下呼叫一次，讓畫面立即反映，不必多等一輪 100ms。
+
+        只管「文字說明＋前景色」這組顯示狀態，不碰 `_pm_power_var`／
+        `_pm_unit_var`（實際數值文字）——那些各自的資料來源（背景輪詢／
+        尋光 sample callback）本來就知道該顯示什麼數字，不屬於這裡。
+        """
+        if self.meter is None:
+            self._pm_status_var.set("未連線")
+            self._pm_status_lbl.config(fg=CLR_MUTED)
+            self._pm_power_lbl.config(fg=CLR_MUTED)
+            return
+        if self._pm_comm_failures >= COMM_FAIL_THRESHOLD:
+            detail = self.meter.last_error_detail if self.meter is not None else ""
+            self._pm_status_var.set(
+                f"⚠ 已停止更新（{detail}）" if detail else "⚠ 已停止更新"
+            )
+            self._pm_status_lbl.config(fg=CLR_DANGER)
+            self._pm_power_lbl.config(fg=CLR_DANGER)
+            return
+        if self.ctrl.scanning_active:
+            self._pm_status_var.set("尋光中（讀值由尋光分頁提供）")
+            self._pm_status_lbl.config(fg=CLR_ACCENT)
+            self._pm_power_lbl.config(fg=CLR_TEXT)
+            return
+        if self.ctrl.motion_active:
+            # 移動中：數值本身不清空（清成「—」會誤導成斷線），只改
+            # label 文字跟顏色——不用 pack/pack_forget 切換，那是
+            # _pm_scan_notice 給長狀態用的模式，移動是次秒級高頻切換，
+            # 用那招會讓版面一直跳動（見 CLAUDE.md〈第四批修正〉）。
+            self._pm_status_var.set("⏸ 滑台移動中，暫停讀取")
+            self._pm_status_lbl.config(fg=CLR_MUTED)
+            self._pm_power_lbl.config(fg=CLR_MUTED)
+            return
+        self._pm_status_var.set("已連線")
+        self._pm_status_lbl.config(fg=CLR_ACCENT)
+        self._pm_power_lbl.config(fg=CLR_TEXT)
+
+    def _pm_should_poll(self) -> bool:
+        """
+        光功率背景輪詢這一輪要不要真的送出 GPIB 查詢。
+
+        `motion_active` 涵蓋點動/步進/原點復歸/重播/尋光——序列埠移動中
+        GPIB 讀值會混進馬達震動雜訊，且會悄悄流進 data/*.csv 沒有任何
+        標記。這裡整批擋下，不逐一列舉個別旗標（scanning_active 已經是
+        motion_active 的一部分，不必重複檢查）。
+        """
+        return (
+            self.meter is not None
+            and self._pm_auto_poll.get()
+            and not self.ctrl.motion_active
+        )
+
     def _start_meter_poll_worker(self):
         """
         光功率背景輪詢，獨立執行緒——不塞進既有四條輪詢迴圈任何一條。
@@ -4757,14 +4817,7 @@ class DS102GUI:
         """
         def _worker():
             while not self._shutting_down.is_set():
-                if (
-                    self.meter is not None
-                    and self._pm_auto_poll.get()
-                    # 預留掛勾：future fiber_scanner 接入時可能要跟 GPIB
-                    # 輪詢互斥。目前 scanning_active 恆為 False，這行不
-                    # 影響現有行為。
-                    and not self.ctrl.scanning_active
-                ):
+                if self._pm_should_poll():
                     try:
                         ok, val = self.meter.get_power()
                     except Exception as e:
@@ -5313,6 +5366,11 @@ class DS102GUI:
                 if self._scanning.is_set():
                     elapsed = int(time.time() - self._scan_start_time)
                     self._scan_elapsed_var.set(f"{elapsed // 60:02d}:{elapsed % 60:02d}")
+                # 這兩個都不做 I/O，純畫面同步。掛在這裡（而非
+                # _redraw_scan_plot）是因為那條鏈只在裝了 matplotlib 時
+                # 才會執行；這裡是唯一保證一定會跑的節奏。
+                self._pm_refresh_status_line()
+                self._pm_sync_scan_notice()
             except tk.TclError:
                 return  # widget 已被銷毀（關閉流程中），安靜收工
             self.root.after(UI_REDRAW_INTERVAL, _poll)

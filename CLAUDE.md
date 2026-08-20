@@ -23,7 +23,7 @@ venv/Scripts/python.exe probe_ds102.py --list            # 只列埠，不送任
 venv/Scripts/python.exe -m serial.tools.list_ports -v    # 原始序列埠清單
 venv/Scripts/python.exe -m pip install -r requirements.txt
 venv/Scripts/python.exe -m ruff check .                  # ruff 未列於 requirements.txt，需另行安裝
-venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py -v  # 四支合計 187 項，不需硬體
+venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py -v  # 四支合計 203 項，不需硬體
 venv/Scripts/python.exe -m pytest verify_scan_tab.py::TestUserStop -v          # 只跑某個 class／單一測試（VS Code Test Explorer 用同一套機制）
 ```
 
@@ -137,7 +137,7 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 
 第二層是「事後偵測」，從發現到停穩還會滑一段，提前量 `lookahead = f_speed × period + f_speed × rate / 2000`。`period` **必須用每輪實測值**（`time.time()` 差）而非常數：實測用常數 60ms 時真正的週期是 116ms，結果滑出限位 36 pulse。改動這裡前先讀該函式的 docstring，兩次超限的數據都記在裡面。
 
-`self._jog_stop` 事件負責讓監看執行緒收工——`stop()` 會 set 它，所以任何新增的停止路徑都要記得 set，否則執行緒會活到程式結束。
+`self._jog_stop` 事件負責讓監看執行緒收工——`stop()` 會 set 它，所以任何新增的停止路徑都要記得 set，否則執行緒會活到程式結束。🔴 **2026-08-20 補齊了兩個漏掉的路徑：`emergency_stop()` 與 `disconnect()` 原本都不會 set `_jog_stop`**——點動中觸發這兩者會讓監看執行緒收工旗標卡在 `clear()` 狀態。這原本只是「執行緒活到程式結束」的既有已知代價，但後來新增的 `motion_active` property（見下方〈移動期間暫停光功率背景輪詢〉）直接讀 `_jog_stop.is_set()`，卡住的旗標會讓 `motion_active` 永久回報 `True`。兩處都已補上 `self._jog_stop.set()`。
 
 #### `scanning_active` 與 `scan_move_step`（尋光演算法用，2026-08-07）
 
@@ -173,7 +173,20 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 - **`sample_cb` 跑在 scanner 的背景執行緒**，🔴 只能做資料寫入（丟進 `_scan_plot_pending` 佇列），不能碰 matplotlib 或 tkinter widget——實際重繪固定在 Tk 主執行緒的 `_redraw_scan_plot()` 做。
 - **設定持久化**：`meter_config.json`（GPIB 位址／channel／波長）與 `scanner_config.json`（速度、安全判準、是否啟用階段二 K 近鄰精修等跨次搜尋穩定的參數）都在 `RECORDING_DIR`，走 `_load_meter_config()` / `_save_meter_config()` / `_load_scanner_config()` / `_save_scanner_config()`。兩者都是純量欄位的整份覆寫，**不需要**比照 teaching points 的 `_points_loaded` 拒寫保護（沒有「累積型集合被空狀態蓋掉」的風險）。兩個檔名都已加進 `NON_RECORDING_JSON`。
 - ⚠ **階段二相關的 `tk.BooleanVar`（`_scan_stage2_var`）不能用寫死的初始值建立**——它要在讀到 `scanner_config.json` 的 `enable_stage2` 欄位後才建立變數，順序反了會讓存檔值永遠讀不回來（2026-08-17 由假物件回歸測試抓到並修正）。
-- **回歸測試**：[verify_scan_tab.py](verify_scan_tab.py)（尋光分頁，57 項）、[verify_meter_panel.py](verify_meter_panel.py)（光功率分頁，66 項）、[verify_axis_calib.py](verify_axis_calib.py)（軸機械校正參數，50 項，涵蓋 `ds102_ctrl.py`／`fiber_scanner.py`／`main_ai.py` 三個層級）用假的 `ctrl` / `meter` 物件跑邏輯，不需要真實硬體或 GPIB 卡，改動對應功能後應該先跑對應的測試檔。2026-08-17 `DS102Controller` 拆到 `ds102_ctrl.py` 後前兩支仍全數通過，可作為「模組拆分沒有破壞既有行為」的既有驗證手段之一。
+- **回歸測試**：[verify_scan_tab.py](verify_scan_tab.py)（尋光分頁，57 項）、[verify_meter_panel.py](verify_meter_panel.py)（光功率分頁，82 項）、[verify_axis_calib.py](verify_axis_calib.py)（軸機械校正參數，50 項，涵蓋 `ds102_ctrl.py`／`fiber_scanner.py`／`main_ai.py` 三個層級）用假的 `ctrl` / `meter` 物件跑邏輯，不需要真實硬體或 GPIB 卡，改動對應功能後應該先跑對應的測試檔。2026-08-17 `DS102Controller` 拆到 `ds102_ctrl.py` 後前兩支仍全數通過，可作為「模組拆分沒有破壞既有行為」的既有驗證手段之一。
+
+#### 移動期間暫停光功率背景輪詢（`motion_active`，2026-08-20）
+
+`_start_meter_poll_worker`（獨立執行緒，每 0.5s 打一次 GPIB）原本只在 `ctrl.scanning_active`（尋光演算法執行中）為真時暫停，但使用者在**移動控制分頁**手動點動／單步／原點復歸時這顆旗標是 False，GPIB 與序列埠通訊會同時進行——不是硬體安全問題（兩條匯流排實體分離），但讀到的光功率值在馬達震動時是不可信的雜訊，且會悄悄流進 `data/*.csv` 沒有任何標記。
+
+- **`DS102Controller.motion_active`（`ds102_ctrl.py`，唯讀 property）** 涵蓋點動/步進/原點復歸/重播/尋光，定義為 `playback_running or scanning_active or not _jog_stop.is_set() or _motion_depth > 0`。`_motion_depth`／`_motion_lock`（獨立於 `self._lock`，不擴大熱路徑鎖的責任）搭配內部 `_motion_scope()` context manager，包住 `_do_move_step()`／`move_origin()`／`origin_all()` 的核心邏輯——用計數器而非 bool 是因為 `origin_all` 可能巢狀呼叫其他也進入 `_motion_scope` 的方法，計數器能正確處理巢狀（內層先離開不會提早清空旗標）。`play_recording()` 不需要掛，它已經有 `playback_running`。
+  - 🔴 **`motion_active` 只給「要不要占用其他硬體資源」的判斷用，絕對不可拿來當移動守衛**（不可放進 `move_step`/`move_continue`/`goto_point` 的守衛條件）。`scanning_active` 進 `move_step` 守衛曾導致所有收斂測試卡死（scanner 呼叫自己的移動被自己設的旗標擋住，見上方〈`scanning_active` 與 `scan_move_step`〉），這是同一個陷阱的翻版。
+  - 🔴 **`ems_active` 刻意不在判斷式內**——EMS 代表滑台已經停止（不是還在動），沒有理由連光功率讀取都跟著暫停。
+  - **前置修復**：`emergency_stop()` 與 `disconnect()` 原本都不會 `set()` `_jog_stop`，點動中觸發這兩者會讓 `_jog_stop` 卡在 `clear()` 狀態，`motion_active` 永久回報 True、光功率背景輪詢從此永遠不會恢復。兩處都已補上 `self._jog_stop.set()`（`emergency_stop()` 放在設 `ems_active = True` 附近；`disconnect()` 放在關閉序列埠之前）。
+- **`main_ai.py` 的 `_pm_should_poll()`** 是 `_start_meter_poll_worker` 迴圈的守衛：`meter is not None and _pm_auto_poll.get() and not ctrl.motion_active`。
+- **`_pm_refresh_status_line()`** 是 `_pm_status_var` / `_pm_status_lbl` / `_pm_power_lbl` 前景色的唯一寫入者，優先序：未連線 > 通訊失敗 > 尋光中 > 移動中 > 正常。移動中呈現「⏸ 滑台移動中，暫停讀取」（`CLR_MUTED`），數值本身不清空（清成 `—` 會誤導成斷線）；不用 pack/pack_forget 切換（移動是次秒級高頻切換，會讓版面一直跳動，違反〈第四批修正〉的既有原則），改個 label 文字跟顏色即可。掛在 `_start_poller`（100ms、不做 I/O、一定會跑）而非 `_redraw_scan_plot`（沒裝 matplotlib 時整條不會執行，會讓這個機制在那種環境下失效）——`_pm_sync_scan_notice()` 原本掛在 `_redraw_scan_plot` 的呼叫也一併搬去 `_start_poller`，順便修掉它在無 matplotlib 環境下的同一種既有失效問題。
+- ⚠ **`_wait_axis_stop()` 期間寫入 `data/*.csv` 的光功率值語意已改變**：改動前是「移動中的即時值（可能含震動雜訊）」，改動後背景輪詢在移動期間暫停，`_get_last_pm_value()` 回傳的會是**移動開始前最後一次背景輪詢的值**，可能已經過期（最舊可達背景輪詢間隔 `METER_POLL_INTERVAL` 那麼久）。這是刻意的取捨（過期但穩定的值優於即時但含雜訊的值），但下游若有人假設「CSV 裡這欄是移動當下量到的」，這個假設從這次改動起不再成立。
+- **回歸測試**：`verify_meter_panel.py` 的 `TestMotionPausesMeterPoll`（16 項，含 `motion_active` property、`_motion_scope` 巢狀、`emergency_stop`/`disconnect` 的 `_jog_stop` 回歸鎖、GUI 層 `_pm_should_poll()` 各狀態組合）。
 
 ### 單位與座標（容易改錯的地方）
 

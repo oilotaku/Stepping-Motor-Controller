@@ -39,6 +39,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import main_ai
+import ds102_ctrl
 
 from conftest import close_gui, make_gui, pump_until
 
@@ -934,3 +935,203 @@ class TestRegressionGuardValidity:
         finally:
             g._pm_comm_failures = 0
             g._pm_status_var.set("未連線")
+
+
+class TestMotionPausesMeterPoll:
+    """
+    案例集（2026-08-20）：`ctrl.motion_active` property 與
+    `gui._pm_should_poll()`——移動控制分頁手動點動/單步/原點復歸期間
+    暫停光功率背景輪詢，避免馬達震動雜訊悄悄流進 data/*.csv。
+
+    controller 層測試一律直接用 `ds102_ctrl.DS102Controller()`（.ser 全程
+    None，不觸發真實序列埠 I/O，也不需要 RECORDING_DIR，因為這裡完全
+    不呼叫任何持久化方法）；GUI 層測試沿用本檔案模組層級的 `gui` fixture。
+    """
+
+    # =========================================================================
+    # controller 層：motion_active property
+    # =========================================================================
+    def test_initial_motion_active_is_false(self):
+        """案例 a：全新 controller、沒有任何動作進行中 -> motion_active is False。"""
+        ctrl = ds102_ctrl.DS102Controller()
+        assert ctrl.motion_active is False
+
+    def test_move_continue_sets_motion_active_true(self):
+        """
+        案例 b：點動開始（move_continue）-> motion_active is True。
+
+        sw_limits 全軸預設 (None, None)，move_continue 不會啟動
+        _watch_jog_limit 背景執行緒（見該函式 `if lim is not None` 的
+        判斷），這裡只驗證 _jog_stop 被 clear() 這件事本身，不牽涉執行緒。
+        """
+        ctrl = ds102_ctrl.DS102Controller()
+        ctrl.move_continue("1", "CW", "1", "1", "1", "1")
+        try:
+            assert ctrl.motion_active is True
+        finally:
+            ctrl.stop()  # 收工：把 _jog_stop 設回去，避免污染下一個測試
+
+    def test_stop_clears_motion_active(self):
+        """案例 c：放開點動（stop）-> motion_active 回到 False。"""
+        ctrl = ds102_ctrl.DS102Controller()
+        ctrl.move_continue("1", "CW", "1", "1", "1", "1")
+        ctrl.stop()
+        assert ctrl.motion_active is False
+
+    def test_motion_scope_nesting_only_clears_after_outermost_exit(self):
+        """
+        案例 d：`_motion_scope()` 巢狀進出——這是 origin_all 可能巢狀呼叫
+        其他移動方法的情境，用計數器而非 bool 才能讓內層先離開時不會
+        提早把旗標清成 False。
+        """
+        ctrl = ds102_ctrl.DS102Controller()
+        assert ctrl.motion_active is False
+        with ctrl._motion_scope():
+            assert ctrl.motion_active is True
+            with ctrl._motion_scope():
+                assert ctrl.motion_active is True
+            # 內層已離開，外層仍在——必須仍是 True，不能被內層的離開清空
+            assert ctrl.motion_active is True
+        assert ctrl.motion_active is False
+
+    def test_playback_running_makes_motion_active_true(self):
+        """案例 e：playback_running=True -> motion_active is True。"""
+        ctrl = ds102_ctrl.DS102Controller()
+        ctrl.playback_running = True
+        try:
+            assert ctrl.motion_active is True
+        finally:
+            ctrl.playback_running = False
+
+    def test_scanning_active_makes_motion_active_true(self):
+        """案例 f：scanning_active=True -> motion_active is True。"""
+        ctrl = ds102_ctrl.DS102Controller()
+        ctrl.scanning_active = True
+        try:
+            assert ctrl.motion_active is True
+        finally:
+            ctrl.scanning_active = False
+
+    def test_ems_active_alone_does_not_make_motion_active_true(self):
+        """
+        回歸鎖：`ems_active` 刻意不在 motion_active 的判斷式內。EMS 代表
+        滑台已經停止（不是還在動），沒有理由連光功率背景輪詢都跟著暫停
+        不讀——防止之後有人誤把 ems_active 也塞進這條 property 的判斷式。
+        """
+        ctrl = ds102_ctrl.DS102Controller()
+        ctrl.ems_active = True
+        try:
+            assert ctrl.motion_active is False
+        finally:
+            ctrl.ems_active = False
+
+    # =========================================================================
+    # 回歸鎖（最重要）：emergency_stop() / disconnect() 必須清 _jog_stop，
+    # 否則點動中觸發這兩者會讓 motion_active 永久卡在 True，光功率背景
+    # 輪詢從此永遠不會恢復——這是本次改動的前置修復項目。
+    # =========================================================================
+    def test_emergency_stop_during_jog_clears_motion_active(self):
+        """案例 g：點動中觸發 emergency_stop() -> motion_active 必須回到 False。"""
+        ctrl = ds102_ctrl.DS102Controller()
+        ctrl.move_continue("1", "CW", "1", "1", "1", "1")
+        assert ctrl.motion_active is True, "前置條件：此刻應在點動中"
+        ctrl.emergency_stop()
+        try:
+            assert ctrl.motion_active is False
+        finally:
+            ctrl.ems_active = False
+            ctrl.playback_running = False
+
+    def test_disconnect_during_jog_clears_motion_active(self):
+        """案例 h：點動中呼叫 disconnect() -> motion_active 必須回到 False。"""
+        ctrl = ds102_ctrl.DS102Controller()
+        ctrl.move_continue("1", "CW", "1", "1", "1", "1")
+        assert ctrl.motion_active is True, "前置條件：此刻應在點動中"
+        ctrl.disconnect()
+        assert ctrl.motion_active is False
+
+    # =========================================================================
+    # GUI 層：_pm_should_poll()
+    # =========================================================================
+    def test_pm_should_poll_true_in_normal_state(self, gui):
+        """案例 i：已連線、勾選自動輪詢、無任何移動 -> True。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g._pm_auto_poll.set(True)
+        try:
+            assert g._pm_should_poll() is True
+        finally:
+            g.meter = None
+            g._pm_auto_poll.set(False)
+
+    def test_pm_should_poll_false_without_meter(self, gui):
+        """案例 j：meter=None -> False。"""
+        root, g = gui
+        g.meter = None
+        g._pm_auto_poll.set(True)
+        try:
+            assert g._pm_should_poll() is False
+        finally:
+            g._pm_auto_poll.set(False)
+
+    def test_pm_should_poll_false_without_auto_poll(self, gui):
+        """案例 k：auto_poll=False -> False。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g._pm_auto_poll.set(False)
+        try:
+            assert g._pm_should_poll() is False
+        finally:
+            g.meter = None
+
+    def test_pm_should_poll_false_during_playback(self, gui):
+        """案例 l：playback_running=True -> False。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g._pm_auto_poll.set(True)
+        g.ctrl.playback_running = True
+        try:
+            assert g._pm_should_poll() is False
+        finally:
+            g.ctrl.playback_running = False
+            g.meter = None
+            g._pm_auto_poll.set(False)
+
+    def test_pm_should_poll_false_during_scanning(self, gui):
+        """案例 m：scanning_active=True -> False。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g._pm_auto_poll.set(True)
+        g.ctrl.scanning_active = True
+        try:
+            assert g._pm_should_poll() is False
+        finally:
+            g.ctrl.scanning_active = False
+            g.meter = None
+            g._pm_auto_poll.set(False)
+
+    def test_pm_should_poll_false_during_jog(self, gui):
+        """案例 n：點動中（_jog_stop.clear()）-> False。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g._pm_auto_poll.set(True)
+        g.ctrl._jog_stop.clear()
+        try:
+            assert g._pm_should_poll() is False
+        finally:
+            g.ctrl._jog_stop.set()
+            g.meter = None
+            g._pm_auto_poll.set(False)
+
+    def test_pm_should_poll_false_with_motion_depth(self, gui):
+        """案例 o：_motion_depth 手動 +1（模擬移動核心邏輯執行中）-> False。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g._pm_auto_poll.set(True)
+        g.ctrl._motion_depth += 1
+        try:
+            assert g._pm_should_poll() is False
+        finally:
+            g.ctrl._motion_depth -= 1
+            g.meter = None
+            g._pm_auto_poll.set(False)
