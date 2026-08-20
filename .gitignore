@@ -42,6 +42,9 @@ desktop.ini
 .DS_Store
 *.swp
 
+# --- MS Office 暫存鎖定檔（開啟 .pptx/.docx/.xlsx 時產生，不是文件本體）---
+~$*
+
 # .vscode 只保留團隊共用設定，個人覆寫不進版控
 .vscode/*
 !.vscode/settings.json
