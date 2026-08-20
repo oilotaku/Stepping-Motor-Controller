@@ -478,9 +478,18 @@ DS102 的 **MEMSW（復歸樣式）與韌體軟體限位都是 RAM-only**，控�
 - **自包含限制不可違反**：不能連外部字型 CDN（Google Fonts 等）——嚴格 CSP 會擋。要用有特色的字型，選擇系統常見的 serif/mono 字型堆疊，或把字型檔案內嵌成 data URI（注意檔案大小，Artifact 上限 16MB）。
 - 這類報告的資料**必須先查證再寫入**（見〈子代理分工〉裡 `mathematician` 與 `reporter` 的分工），視覺設計服務的是「把已經查證過的數據講清楚」，不能為了美觀而簡化或誤導數據本身的意義。
 
+### md-document／design-system skill（本機 HTML 報告，另一條產出路徑）
+
+`.claude/skills/` 底下的 `md-document` 與 `design-system` 是**第三方通用 markdown→HTML 外掛**（`author: Alireza Rezvani`），不是為本專案寫的程式碼，跟上面「HTML / Artifact 報告」那節的手工視覺規範是兩套獨立機制，不要混為一談：
+
+- `md-document` 把長篇 markdown（規格、報告、說明文件）轉成單檔 HTML，附側邊 TOC／搜尋／程式碼複製鈕；`design-system` 是它的品牌設定來源，10 題 onboarding wizard 決定主色／字型／版面風格，兩者共用 `config_loader.py` 讀寫。
+- **輸出目錄是 `reports/`，已加進 `.gitignore`**（跟 `logs/`／`recordings/`／`data/` 同一類「本機產出、不進版控」）。
+- `design-system` 的 onboarding 設定檔存在**專案外的全域路徑** `~/.config/markdown-html/design-system.json`（本機已於 2026-08-19 完成過一次），不是 repo 內的專案設定——同一台機器上其他專案用這套外掛也會沿用同一份品牌設定，除非另外跑 `--scope project` 覆寫。
+- 目前唯一實際引用它的是 `data-scientist` 代理（見下方〈子代理分工〉）：圖表若要嵌進這種本機 HTML 報告就用 `matplotlib` 轉 base64 內嵌；若目標是可分享的 Artifact 連結，則走前一節的手工 SVG／CSP 限制那套規範。`reporter` 本身目前仍以 markdown／CLAUDE.md 更新為主要產出形式，尚未串接這個 skill。
+
 ## 子代理分工（常設規則，不需逐次指派）
 
-`.claude/agents/` 底下有七個代理：`architect`（設計與審查）、`coder`（實作）、`tester`（測試）、`ui-designer`（介面與操作體驗）、`mathematician`（數值方法與量測數據分析）、`reporter`（彙整跨代理討論與測試紀錄成正式文件）、`questioner`（針對報告提出釐清與批判性問題，不改寫文件本身）。
+`.claude/agents/` 底下有八個代理：`architect`（設計與審查）、`coder`（實作）、`tester`（測試）、`ui-designer`（介面與操作體驗）、`mathematician`（數值方法與量測數據分析）、`reporter`（彙整跨代理討論與測試紀錄成正式文件）、`questioner`（針對報告提出釐清與批判性問題，不改寫文件本身）、`data-scientist`（把已查證數據轉成圖表與統計摘要供報告使用，不蒐集新數據、不做演算法設計）。
 **以下情況直接派工，不必等使用者開口**：
 
 | 時機 | 派給 |
@@ -492,6 +501,7 @@ DS102 的 **MEMSW（復歸樣式）與韌體軟體限位都是 RAM-only**，控�
 | 使用者只給規格、要求產出實作 | `coder` |
 | 多個代理已分別提出結論、或一輪開發＋測試＋bug 修正告一段落，要收斂成文件 | `reporter` 彙整既有討論與實測數據，不重新做設計判斷 |
 | `reporter` 產出或更新的報告要定稿交付前 | `questioner` 挑缺口、找沒查證的宣稱，問題丟回 `reporter`／使用者，`questioner` 本身不改寫報告 |
+| 報告需要新增數據圖表、趨勢線、統計摘要 | `data-scientist` 只用已查證數據產圖表與摘要，交回 `reporter` 嵌入報告行文 |
 
 例外——**這些情況自己做，不要派工**：一兩行的修正、純文件更新、使用者已明確指定做法的改動、以及任何會實際驅動硬體的操作（那必須先取得使用者授權，不可轉手給代理）。
 
