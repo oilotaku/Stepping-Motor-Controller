@@ -127,11 +127,20 @@ def make_gui(recording_dir, extra_patches=()):
     跟 CLAUDE.md 記載「測試腳本清空過兩次 teaching points」是同一類風險，
     這裡直接在共用 fixture 補起來，往後任何新測試檔都不用重新踩一次。
 
+    🔴 `DATA_DIR` 是同一類風險，2026-08-21 補上：`save_homing_repeat_result()`
+    （原點復歸重現性量測結果存檔）與既有的 `_record_data_point()`（實驗
+    數據 CSV）都寫模組層級的 `ds102_ctrl.DATA_DIR`，`main_ai.py` 一樣是
+    `from ds102_ctrl import DATA_DIR` 重新引入同一個獨立綁定。只 patch
+    `RECORDING_DIR` 完全攔不到這兩個方法，會直接寫進專案真正的 `data/`。
+
     回傳 (root, gui, patchers)；呼叫端負責在使用完後呼叫 close_gui()。
     """
+    data_dir = Path(recording_dir) / "data"
     patchers = [
         patch.object(main_ai, "RECORDING_DIR", new=Path(recording_dir)),
         patch.object(ds102_ctrl, "RECORDING_DIR", new=Path(recording_dir)),
+        patch.object(main_ai, "DATA_DIR", new=data_dir),
+        patch.object(ds102_ctrl, "DATA_DIR", new=data_dir),
     ]
     patchers.extend(extra_patches)
     for p in patchers:

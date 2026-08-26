@@ -22,10 +22,11 @@ import logging
 import csv
 import re
 import math
+import statistics
 import contextlib
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Callable
 
 import serial
 
@@ -400,6 +401,33 @@ STOP_LOCK_TIMEOUT = _safety_setting_num(
     _safety_settings, "stop_lock_timeout", 0.15, float, 0.0, 0.5
 )
 
+# 原點復歸「有沒有真的執行」的判定參數（2026-08-21 COM2 實機驗證抓到：
+# Z 軸送出 GO ORG 後第一次 SB1? 往返約 56ms，但 Driving 位元要 +0.08s
+# 才 assert，_wait_origin_done() 舊語意「非 Driving 即完成」會在復歸
+# 根本還沒開始時就回報成功，下游 set_position(axis_no, "0") 因此在
+# 滑台飛行途中把座標系原點寫在錯的地方）。
+#
+# 🔴 刻意不外部化成 safety_settings.json 的第七顆常數——CLAUDE.md
+# 定義的 B 類安全常數清單是固定六顆（MAX_RETRY/WAIT_TIMEOUT/
+# WAIT_INTERVAL/JOG_WATCH_INTERVAL/STOP_LOCK_TIMEOUT/COMM_FAIL_
+# THRESHOLD），新增這兩顆並讓它們可被 safety_settings.json 覆寫，
+# 等於讓維護人員可以把「復歸有沒有真的執行」這道驗證整組關掉或調鬆
+# 到失去意義——而這正是這次要新增的保護，不是可以選擇性停用的旋鈕。
+#
+# 2026-08-21 COM2 實測的 Driving assert 延遲（決定 GRACE 要多長）：
+#   GO ORG（壓在限位上出發）  96 ms
+#   GO CW （一般步進）        96 ms
+#   GO ORG（離開限位後出發）  80 ms
+# 三種起始條件幾乎一致，所以延遲是韌體處理 GO 指令的固定成本，跟
+# 「是不是從限位上出發」無關。GRACE 取 2.0s 對 96ms 有約 20 倍餘裕。
+ORIGIN_START_GRACE = 2.0   # 送出 GO ORG 後容許 Driving 尚未 assert 的寬限期（秒）
+ORIGIN_MOTION_EPS = 2.0    # 判定「POS 確實變化過」的門檻（pulse）
+ORIGIN_START_POLL = 0.1    # 寬限期內的快輪詢間隔（秒）
+# 寬限期內刻意不用 WAIT_INTERVAL(0.5s)：2 秒只取樣 4 次，對 96ms 的
+# assert 延遲解析度太差。用 0.1s 可得約 20 次機會，且只有「還沒看到
+# Driving」這條路徑會用到——Driving 一 assert 就切回 WAIT_INTERVAL 的
+# 節奏，正常復歸最多只多送 1～3 筆 SB1?。
+
 # 控制器設定檔（放在 RECORDING_DIR，與 teaching_points / speed_profiles 同區）。
 # 存的是 MEMSW0 復歸樣式與韌體軟體限位——這些都是 RAM-only，
 # 控制器一斷電就整組回到出廠值。
@@ -425,6 +453,119 @@ NON_RECORDING_JSON = frozenset(
 COMM_FAIL_THRESHOLD = _safety_setting_num(
     _safety_settings, "comm_fail_threshold", 3, int, 1, 10
 )
+
+
+# =============================================================================
+# 原點復歸重現性量測——結果存檔（模組層級函式）
+#
+# 獨立於 DS102Controller.measure_homing_repeatability() 之外，由 GUI 端
+# 量測結束後另外呼叫。這是 data/ 底下的實驗數據，跟 teaching_points.json
+# 那類「整份覆蓋的累積型集合」不是同一種風險——每次都是全新的時間戳
+# 檔名，不需要 _write_json_with_backup()／_points_loaded 那套拒寫保護。
+# =============================================================================
+def save_homing_repeat_result(result: dict) -> Tuple[str, str]:
+    """
+    把 measure_homing_repeatability() 的回傳結果寫入 data/ 目錄，
+    回傳 (csv_path, json_path)（字串）。
+
+    CSV 是長格式（每輪每筆一列），JSON 是完整 metadata + 統計摘要。
+    檔名精確到秒，理論上不會撞名；萬一真的撞上（同一秒內呼叫兩次），
+    用遞增後綴避免靜默覆蓋前一份資料，而不是直接蓋掉——這裡沒有
+    _write_json_with_backup() 那層備份機制，覆蓋就是真的丟資料。
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = f"homing_repeat_{ts}"
+    csv_path = DATA_DIR / f"{base}.csv"
+    json_path = DATA_DIR / f"{base}.json"
+    n = 1
+    while csv_path.exists() or json_path.exists():
+        csv_path = DATA_DIR / f"{base}_{n}.csv"
+        json_path = DATA_DIR / f"{base}_{n}.json"
+        n += 1
+
+    fieldnames = [
+        "ts", "axis", "offset", "trial", "residual_pulse", "residual_um",
+        "status", "left_switch", "on_sensor", "direction", "org_type",
+        "origin_lost", "offset_below_switch", "homed_off_sensor", "memsw7",
+        "note",
+    ]
+    with open(csv_path, "x", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for combo in result.get("combos", []):
+            samples = combo.get("samples", [])
+            last_idx = len(samples) - 1
+            if not samples:
+                # n_samples=0 的組合（多半正是 origin_lost 那些最重要的
+                # 失敗記錄，例如基準復歸成功但第一輪一開始就撞限位）
+                # 以前一列都不會輸出到 CSV，只存在於 JSON——這裡補一列
+                # 只有 axis/offset/note 的紀錄，不讓失敗案例在 CSV 裡
+                # 完全消失。
+                writer.writerow(
+                    {
+                        "ts": "",
+                        "axis": combo.get("axis", ""),
+                        "offset": combo.get("offset", ""),
+                        "trial": "",
+                        "residual_pulse": "",
+                        "residual_um": "",
+                        "status": "",
+                        # 零樣本代表連一輪都沒收集到 left_switch（連離開
+                        # 移動的等待都沒成功過），留空而不是猜一個值——
+                        # DictWriter 只要求欄位存在，不要求非空。
+                        "left_switch": "",
+                        "on_sensor": "",
+                        "direction": combo.get("direction", ""),
+                        "org_type": combo.get("org_type", ""),
+                        "origin_lost": combo.get("origin_lost", ""),
+                        "offset_below_switch": combo.get("offset_below_switch", ""),
+                        "homed_off_sensor": combo.get("homed_off_sensor", ""),
+                        "memsw7": combo.get("memsw7", ""),
+                        "note": combo.get("note", ""),
+                    }
+                )
+                continue
+            for i, s in enumerate(samples):
+                note_parts = [s["note"]] if s.get("note") else []
+                if i == last_idx and combo.get("note"):
+                    note_parts.append(combo["note"])
+                p = s.get("residual_pulse")
+                um = s.get("residual_um")
+                writer.writerow(
+                    {
+                        "ts": s.get("ts", ""),
+                        "axis": combo.get("axis", ""),
+                        "offset": combo.get("offset", ""),
+                        "trial": s.get("trial", ""),
+                        "residual_pulse": p if p is not None else "",
+                        "residual_um": f"{um:.5f}" if um is not None else "",
+                        "status": s.get("status", ""),
+                        # 每一輪自己的到位結果（M1/M2 的免費副產品）：這一
+                        # 輪離開移動結束時是否已經脫離出發側限位開關。
+                        "left_switch": s.get("left_switch", ""),
+                        # 這一輪復歸後是否停在原點/限位感測器上。False 代表
+                        # 復歸結束時軸不在任何感測器上，殘差意義存疑。
+                        "on_sensor": s.get("on_sensor", ""),
+                        "direction": combo.get("direction", ""),
+                        "org_type": combo.get("org_type", ""),
+                        # 跟 axis/offset/direction/org_type 一樣是組合層級
+                        # 的中繼資料，每一列都重複填、不是只填最後一列——
+                        # 這樣用 pandas 之類工具依 axis/offset group-by
+                        # 時每一列都拿得到完整資訊，不需要另外找最後一列。
+                        "origin_lost": combo.get("origin_lost", ""),
+                        "offset_below_switch": combo.get("offset_below_switch", ""),
+                        "homed_off_sensor": combo.get("homed_off_sensor", ""),
+                        "memsw7": combo.get("memsw7", ""),
+                        "note": "；".join(note_parts),
+                    }
+                )
+
+    with open(json_path, "x", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"復歸重現性量測結果已存檔: {csv_path.name} / {json_path.name}")
+    return str(csv_path), str(json_path)
 
 
 # =============================================================================
@@ -543,6 +684,14 @@ class DS102Controller:
         # 的背景輪詢）都必須讓路，否則會跟演算法的移動指令交錯、
         # 或在演算法等待到位時搶走 _serial_lock 拖慢量測預算。
         self.scanning_active = False
+
+        # 原點復歸重現性量測鎖定旗標（見 measure_homing_repeatability）。
+        # 比照 scanning_active 的既有模式，擋 GUI 手動操作與背景輪詢，
+        # 但絕對不可以放進 _do_move_step()／_do_origin()（那兩個是無守衛
+        # 層，量測方法自己要呼叫它們）——scanning_active 進 move_step
+        # 守衛曾經導致所有收斂測試卡死（scanner 呼叫自己的移動被自己設的
+        # 旗標擋住），這是同一個陷阱的第三次翻版，不能再犯。
+        self.measuring_active = False
 
         # 點動結束訊號：放開按鈕（stop）時設起，讓限位監看執行緒收工
         self._jog_stop = threading.Event()
@@ -1143,7 +1292,7 @@ class DS102Controller:
           1. 出發前：已經在該方向的軟體限位上就拒絕啟動
           2. 移動中：背景執行緒監看座標，越界立刻送 STOP
         """
-        if self.ems_active or self.playback_running or self.scanning_active:
+        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
             return
 
         ax = NO_AXIS.get(axis_no)
@@ -1275,7 +1424,7 @@ class DS102Controller:
         自己的移動也一併擋下（`scanning_active` 存在的目的是擋「其他
         來源」，不是擋演算法本身）。
         """
-        if self.ems_active or self.playback_running or self.scanning_active:
+        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
             return False
         return self._do_move_step(axis_no, direction, amount, l_speed, f_speed, rate, s_rate, wait_done)
 
@@ -1354,6 +1503,91 @@ class DS102Controller:
                 return self._wait_axis_stop(axis_no)
             return True
 
+    def _do_origin_ex(
+        self,
+        axis_no: str,
+        org_type: int,
+        l_speed: str,
+        f_speed: str,
+        rate: str,
+        s_rate: str,
+        wait_done: bool = True,
+        abort_event: Optional[threading.Event] = None,
+    ) -> Tuple[bool, str]:
+        """
+        `_do_origin()` 的完整版，回傳 (是否成功, 原因代碼)。
+
+        原因代碼直接來自 `_wait_origin_done_ex()`（`"ok"`／
+        `"ok_no_driving_seen"`／`"not_executed"`／`"timeout"`／`"ems"`／
+        `"aborted"`），呼叫端據此寫出能分辨成因的訊息——把「復歸沒有實際
+        執行」（該去查 MEMSW0 樣式）誤報成「逾時」（會讓人去查通訊或速度）
+        會把事後判讀導向完全錯誤的方向。
+
+        🔴 送出 `GO ORG` 之後補了 `time.sleep(0.1)`，比照 `origin_all()`
+        既有的做法。改動前 `_do_origin()` 少了這一步，是它比 `origin_all()`
+        更容易踩到「Driving 尚未 assert」競態的直接原因（實測 assert 延遲
+        ~96ms，而少了這個 sleep 時第一次 `SB1?` 只要 ~56ms 就回來了）。
+
+        🔴 `wait_done=False` 這條路徑**無從驗證**復歸有沒有真的發生——
+        沒有等待就沒有任何證據可收集。呼叫端自負，量測路徑一律用
+        `wait_done=True`。
+        """
+        with self._motion_scope():
+            raw = self._serial_write_read(f"AXI{axis_no}:POS?")
+            try:
+                pos_before: Optional[float] = float(raw)
+            except (ValueError, TypeError):
+                pos_before = None
+
+            self._serial_write(f"AXI{axis_no}:MEMSW0 {org_type}")
+            time.sleep(0.1)
+            cmd = (
+                f"AXI{axis_no}:L0 {l_speed}:R0 {rate}"
+                f":S0 {s_rate}:F0 {f_speed}:GO ORG"
+            )
+            self._serial_write(cmd)
+            self._log("INFO", f"原點返回 軸{axis_no} ORG{org_type}", tx=cmd)
+            time.sleep(0.1)  # 比照 origin_all，給控制器啟動時間
+            if not wait_done:
+                return True, "not_waited"
+            return self._wait_origin_done_ex(
+                axis_no, abort_event=abort_event, pos_before=pos_before
+            )
+
+    def _do_origin(
+        self,
+        axis_no: str,
+        org_type: int,
+        l_speed: str,
+        f_speed: str,
+        rate: str,
+        s_rate: str,
+        wait_done: bool = True,
+        abort_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """
+        `_do_origin_ex()` 的薄 bool wrapper（既有呼叫點不必改簽章）。
+
+        原點復歸核心動作的無守衛實作：送出 MEMSW0 + GO ORG，
+        wait_done=True 時等待復歸完成。
+
+        不讀 POS、不做「復歸後未歸零就強制寫 0」的判斷——那是
+        `move_origin()` 自己的收尾邏輯。守衛（ems_active/playback_running/
+        scanning_active/measuring_active）一律交給呼叫端：這是
+        CLAUDE.md 記載過兩次的陷阱翻版（`scanning_active` 進 `move_step`
+        守衛曾讓演算法自己的移動被自己設的旗標擋住），
+        `measure_homing_repeatability()` 需要直接呼叫這個無守衛版本，
+        不能被自己設的 `measuring_active` 擋住。
+
+        `abort_event`：供量測方法用，讓使用者中止量測時能讓這裡的等待
+        提前結束，不必等滿 180s 逾時；為 None 時完全不檢查，
+        行為與改動前的 `move_origin()` 一致。
+        """
+        return self._do_origin_ex(
+            axis_no, org_type, l_speed, f_speed, rate, s_rate,
+            wait_done=wait_done, abort_event=abort_event,
+        )[0]
+
     def move_origin(
         self,
         axis_no: str,
@@ -1378,26 +1612,35 @@ class DS102Controller:
         另外實測（2026-08-05，COM2）：**即使 MEMSW7 讀回是 0，GO ORG
         完成後 POS 也不會自動歸零**——所以復歸後一律確認並強制寫入 0，
         這正是「歸位後 0 點不固定」的成因。
+
+        核心的「送出 MEMSW0+GO ORG 並等待」抽到 `_do_origin()`（無守衛層，
+        `measure_homing_repeatability()` 直接呼叫它），這裡維持原本
+        「復歸後檢查 POS、視情況強制歸零」的收尾邏輯逐字不變。
         """
-        if self.ems_active or self.playback_running or self.scanning_active:
+        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
             return False
         # 用 _motion_scope 標記移動期間（見 _do_move_step 同一段註解）。
         # origin_all 會巢狀呼叫本方法，_motion_scope 用計數器正確處理巢狀。
         with self._motion_scope():
-            self._serial_write(f"AXI{axis_no}:MEMSW0 {org_type}")
-            time.sleep(0.1)
-            cmd = f"AXI{axis_no}:L0 {l_speed}:R0 {rate}" f":S0 {s_rate}:F0 {f_speed}:GO ORG"
-            self._serial_write(cmd)
-            self._log("INFO", f"原點返回 軸{axis_no} ORG{org_type}", tx=cmd)
+            ax = NO_AXIS.get(axis_no, axis_no)
+            ok, reason = self._do_origin_ex(
+                axis_no, org_type, l_speed, f_speed, rate, s_rate, wait_done=wait_done
+            )
+            if not ok:
+                # 分辨「逾時」與「復歸未實際執行」：前者會讓人去查通訊或
+                # 速度，後者才會讓人去查 MEMSW0 樣式（2026-08-21 實機驗證
+                # 抓到 Z 軸 MEMSW0=1 時 GO ORG 完全無作用）。
+                if reason == "not_executed":
+                    detail = "復歸未實際執行，請確認 MEMSW0 樣式是否適用該軸"
+                    self._log("ERROR", f"軸 {ax} {detail}")
+                else:
+                    detail = "原點復歸未在時限內完成"
+                    self._log("ERROR", f"軸 {ax} 原點復歸未完成（{reason}）")
+                if self._alarm_cb:
+                    self._alarm_cb(f"軸 {ax} 復歸未完成", detail)
+                return False
             if not wait_done:
                 return True
-
-            ax = NO_AXIS.get(axis_no, axis_no)
-            if not self._wait_origin_done(axis_no):
-                self._log("ERROR", f"軸 {ax} 原點復歸逾時")
-                if self._alarm_cb:
-                    self._alarm_cb(f"軸 {ax} 復歸逾時", "原點復歸未在時限內完成")
-                return False
 
             _, pos = self.query_status(axis_no)
             try:
@@ -1405,6 +1648,16 @@ class DS102Controller:
                     return True
             except (ValueError, TypeError):
                 pass
+            # 🔴 寫 POS 0 之前先確認軸真的停穩了，不能只信上面的等待函式
+            # 回報完成（見 _confirm_stopped 的 docstring）。
+            stopped, _ = self._confirm_stopped(axis_no)
+            if not stopped:
+                self._log(
+                    "ERROR",
+                    f"軸 {ax} 復歸回報完成但軸仍在移動，未強制歸零——"
+                    f"座標系可能不準確，請重新執行原點復歸",
+                )
+                return False
             self._log("WARN", f"軸 {ax} 復歸後 POS={pos} 未自動歸零，強制設為 0")
             self.set_position(axis_no, "0")
             return True
@@ -1439,27 +1692,191 @@ class DS102Controller:
             self._serial_write_read(f"AXI{axis_no}:CCWSLE?"),
         )
 
-    def _wait_origin_done(self, axis_no: str, timeout: float = 180.0) -> bool:
+    def _wait_origin_done_ex(
+        self,
+        axis_no: str,
+        timeout: float = 180.0,
+        abort_event: Optional[threading.Event] = None,
+        pos_before: Optional[float] = None,
+    ) -> Tuple[bool, str]:
         """
-        等待原點復歸結束——只看 Driving 旗標清除，不把限位當失敗。
+        等待原點復歸結束，回傳 (是否視為完成, 原因代碼)。
 
         不能沿用 _wait_axis_stop()：復歸樣式 5/6 本來就是靠偵測限位感測器
-        的邊緣來定位，途中壓到限位是正常流程而非異常。
-        復歸可能橫跨整個行程，所以逾時比一般移動寬鬆得多。
+        的邊緣來定位，途中壓到限位是正常流程而非異常。復歸可能橫跨整個
+        行程，所以逾時比一般移動寬鬆得多。
+
+        2026-08-21 COM2 實機驗證抓到：Z 軸送出 `GO ORG` 後第一次 `SB1?`
+        往返約 56ms，但 Driving 位元要 +96ms 才真正 assert。舊版「非
+        Driving 即完成」的語意會在復歸根本還沒開始時就回報成功——實測
+        序列：`GO ORG` 送出 → 第一次 `SB1?` 回 `10`（bit6 未 set）→ 立刻
+        `return True` → 下游 `set_position(axis_no, "0")` 把座標系原點
+        寫在滑台正要開始飛的那一刻 → 下一次 `SB1?` 才回 `66`（0x42，
+        Driving+limit，復歸這時才真的開始）。
+
+        🔴 決定會不會踩到這個競態的是**呼叫端第一次查詢有多快**，不是
+        指令種類（實測三種起始條件的 assert 延遲都是 80～96ms，見模組
+        頂端 ORIGIN_START_GRACE 附近的數據）：
+          - `_do_origin()` 送出後只打一次 `SB1?`（~56ms）→ 穩定落在
+            96ms 之前 → **必然**踩中。
+          - `_wait_axis_stop()` 第一次走 `query_status()`，要 `SB3?`+
+            `SB1?` 兩次往返（~112ms）→ 剛好越過 96ms → 大多數時候僥倖
+            避開，餘裕只有約 16ms。那是同一個競態的孿生體，尚未修，
+            見 CLAUDE.md 的技術債紀錄。
+
+        判定改成**三重證據**：
+          1. `saw_driving`——輪詢期間看過 Driving 位元 assert 過，是唯一
+             正常路徑（`return True, "ok"`）。
+          2. 若從未看過 Driving，先給 `ORIGIN_START_GRACE` 秒的寬限期，
+             容許「還沒來得及 assert」這個已知的實測延遲（避免用單一
+             0.5s 輪詢節奏就誤判成沒動）。
+          3. 寬限期過後仍沒看過 Driving，才退而求其次比對 POS：位移超過
+             `ORIGIN_MOTION_EPS` 視為「復歸極短、輪詢真的漏接」
+             （`return True, "ok_no_driving_seen"`，記 WARN）；位移也沒有
+             就是「復歸根本沒有實際執行」（`return False, "not_executed"`，
+             記 ERROR——這才是本次實機問題的真正根因，常見原因是 MEMSW0
+             樣式對這顆感測器配置不適用）。
+
+        兩種證據用 OR 而非各自獨立判斷：只看 Driving 會被 0.5s 輪詢節奏
+        漏掉極短的復歸；只看 POS 位移會把「本來就在原點、復歸原地不動」
+        誤判成失敗。兩者 OR 之後，只有「Driving 從沒 assert 且 POS 完全
+        沒動」才判失敗——物理上就是什麼都沒發生。寬限期只在「從未看過
+        Driving」這條路徑上才會多付出一次 POS? 查詢的成本，正常復歸的
+        輪詢節奏與通訊量完全不變。
+
+        `pos_before`：呼叫端已經讀過一次起始位置時可以直接傳入，省一次
+        查詢；為 None 時在這裡自己讀一次，讓 `origin_all()` 這類不方便
+        先讀 POS 的呼叫端也能自動受益。讀不到（通訊失敗）時位移證據這
+        條路徑會直接失效，只能靠 Driving 證據——不會因此誤報成功。
+
+        `abort_event`：供 measure_homing_repeatability() 用，讓使用者按
+        「停止量測」時能提前結束等待，不必空等到 180s 逾時。為 None 時
+        完全不檢查，行為與改動前一致。
         """
-        deadline = time.time() + timeout
+        if pos_before is None:
+            raw = self._serial_write_read(f"AXI{axis_no}:POS?")
+            try:
+                pos_before = float(raw)
+            except (ValueError, TypeError):
+                pos_before = None  # 讀不到起始位置，位移證據那條路徑會直接失效
+
+        start_time = time.time()
+        deadline = start_time + timeout
+        saw_driving = False
         while time.time() < deadline:
             if self.ems_active:
-                return False
+                return False, "ems"
+            if abort_event is not None and abort_event.is_set():
+                return False, "aborted"
+
             sb1 = self._serial_write_read(f"AXI{axis_no}:SB1?")
             try:
-                if not (int(sb1) & 0x40):  # bit6 Driving 清除
-                    return True
+                driving = bool(int(sb1) & 0x40)  # bit6
             except (ValueError, TypeError):
-                pass
-            time.sleep(WAIT_INTERVAL)
+                driving = False
+
+            if driving:
+                saw_driving = True
+                time.sleep(WAIT_INTERVAL)
+                continue
+
+            if saw_driving:
+                return True, "ok"
+
+            if time.time() - start_time < ORIGIN_START_GRACE:
+                # 還在寬限期內，Driving 可能只是尚未 assert——繼續等，
+                # 不要在這裡就下任何結論。這裡用 ORIGIN_START_POLL 而非
+                # WAIT_INTERVAL：實測 assert 延遲只有 ~96ms，0.5s 的節奏
+                # 在 2 秒寬限期內只取樣 4 次，解析度不足。
+                time.sleep(ORIGIN_START_POLL)
+                continue
+
+            # 寬限期已過仍沒看過 Driving，退而求其次比對 POS 是否變化過。
+            raw = self._serial_write_read(f"AXI{axis_no}:POS?")
+            try:
+                pos_now = float(raw)
+            except (ValueError, TypeError):
+                pos_now = None
+
+            if (
+                pos_before is not None
+                and pos_now is not None
+                and abs(pos_now - pos_before) > ORIGIN_MOTION_EPS
+            ):
+                self._log(
+                    "WARN",
+                    f"軸{axis_no} 復歸期間未偵測到 Driving 旗標，但 POS 有"
+                    f"變化（{pos_before}→{pos_now}），視為已完成",
+                )
+                return True, "ok_no_driving_seen"
+
+            self._log(
+                "ERROR",
+                f"軸{axis_no} 復歸未實際執行——Driving 未 assert 且 POS 未"
+                f"變化，請確認 MEMSW0 樣式是否適用該軸",
+            )
+            return False, "not_executed"
+
         self._log("WARN", f"軸{axis_no} 原點復歸逾時（{timeout}s）")
-        return False
+        return False, "timeout"
+
+    def _wait_origin_done(
+        self,
+        axis_no: str,
+        timeout: float = 180.0,
+        abort_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """`_wait_origin_done_ex()` 的薄 bool wrapper，既有呼叫點不必改簽章。"""
+        return self._wait_origin_done_ex(axis_no, timeout, abort_event)[0]
+
+    def _confirm_stopped(
+        self,
+        axis_no: str,
+        checks: int = 3,
+        interval: float = 0.1,
+    ) -> Tuple[bool, Optional[float]]:
+        """
+        連續 `checks` 次確認：狀態非 Driving，且 POS 在這段期間完全沒變。
+        回傳 (是否確認靜止, 最後讀到的 POS)。
+
+        🔴 專門守在任何 `set_position(axis_no, "0")` 之前。2026-08-21 COM2
+        指令追蹤證實 `_wait_origin_done()` 會在軸尚未起步時回報完成，導致
+        `POS 0` 被寫在飛行途中——把座標系原點悄悄搬到滑台當下的位置，之後
+        goto 教點、`sw_limits` 比對、`estimate_um()` 全部跟著偏移且零警告。
+
+        `_wait_origin_done_ex()` 的三重證據已經把根因堵住了，但那仍然是
+        「相信上游」的架構：任何一條新的呼叫路徑、或未來對等待函式的改動，
+        都可能繞過它。把確認放在**危險動作本身**才是機制性保證，這是本專案
+        第三次在同一個模式上出事後（`_wait_axis_stop` 誤判、`_wait_origin_done`
+        誤判、`POS 0` 寫在飛行中）該有的防線。
+
+        用「POS 連續不變」而非只看 Driving 位元，理由同 `_wait_origin_done_ex`：
+        Driving 有 ~96ms 的 assert 延遲，單看它會把「還沒起步」讀成「已停好」。
+        POS 是實際位移的直接證據，沒有這個延遲。
+        """
+        last: Optional[float] = None
+        stable = 0
+        for _ in range(max(1, checks) * 4):   # 上限：避免軸持續移動時無限等待
+            status, pos_s = self.query_status(axis_no)
+            try:
+                pos = float(pos_s)
+            except (ValueError, TypeError):
+                # 讀不到位置就無從確認靜止——寧可判失敗也不要放行寫入
+                return False, last
+            if status == "Driving":
+                stable = 0
+                last = pos
+                time.sleep(interval)
+                continue
+            if last is not None and pos == last:
+                stable += 1
+                if stable >= checks:
+                    return True, pos
+            else:
+                stable = 0
+            last = pos
+            time.sleep(interval)
+        return False, last
 
     def origin_all(
         self,
@@ -1481,8 +1898,8 @@ class DS102Controller:
         某一軸失敗不中止整批，繼續跑其餘各軸。
         回傳 (全部成功?, 摘要訊息)。
         """
-        if self.ems_active or self.playback_running or self.scanning_active:
-            return False, "EMS 作用中／重播進行中／尋光進行中，已略過"
+        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
+            return False, "EMS 作用中／重播進行中／尋光進行中／量測進行中，已略過"
 
         done, skipped, failed = [], [], []
         saved: Dict[str, Tuple[str, str]] = {}
@@ -1536,8 +1953,14 @@ class DS102Controller:
                     self._log("INFO", f"原點復歸 軸{ax} Type{org_type}", tx=cmd)
                     time.sleep(0.1)  # 給控制器一點時間啟動復歸
 
-                    if not self._wait_origin_done(axis_no):
-                        failed.append(f"{ax}(復歸逾時)")
+                    ok_org, reason_org = self._wait_origin_done_ex(axis_no)
+                    if not ok_org:
+                        # 分辨兩種成因：「逾時」讓人去查通訊/速度，
+                        # 「未實際執行」才會讓人去查 MEMSW0 樣式。
+                        if reason_org == "not_executed":
+                            failed.append(f"{ax}(復歸未實際執行)")
+                        else:
+                            failed.append(f"{ax}(復歸逾時)")
                         continue
 
                     _, pos2 = self.query_status(axis_no)
@@ -1551,6 +1974,15 @@ class DS102Controller:
                         # 已經先設過 MEMSW7=0 還是沒歸零 → 直接強制寫入 POS 0。
                         # 「原點復歸後座標必為 0」是後續所有教點與限位的共同前提，
                         # 讓它停在任意值等於整組座標系失準。
+                        # 🔴 寫入前先確認軸真的停穩（見 _confirm_stopped）。
+                        stopped, _ = self._confirm_stopped(axis_no)
+                        if not stopped:
+                            self._log(
+                                "ERROR",
+                                f"軸 {ax} 復歸回報完成但軸仍在移動，未強制歸零",
+                            )
+                            failed.append(f"{ax}(復歸後仍在移動，未歸零)")
+                            continue
                         self._log(
                             "WARN",
                             f"軸 {ax} 復歸後 POS={pos2} 未自動歸零，強制設為 0",
@@ -1612,6 +2044,671 @@ class DS102Controller:
 
         self._log("INFO" if not failed else "ERROR", f"全軸原點復歸 — {msg}")
         return (not failed), msg
+
+    # =========================================================================
+    # 原點復歸重現性量測（2026-08-21）
+    #
+    # 自動化原本要人工用碼表做的量測：讓軸離開原點固定 pulse 數、送
+    # GO ORG 復歸、讀取復歸後 POS 殘差，重複多輪並掃描多個離開距離，
+    # 統計殘差離散程度——用來評估「軟體座標原點」能否當作光纖對準的
+    # 可信基準。純量測，不寫檔；落地存檔交給 save_homing_repeat_result()
+    # （模組層級函式，GUI 端量測結束後另外呼叫）。
+    # =========================================================================
+    def measure_homing_repeatability(
+        self,
+        axes: List[str],
+        offsets: List[int],
+        trials: int,
+        l_speed: str,
+        f_speed: str,
+        rate: str,
+        s_rate: str,
+        directions: Optional[Dict[str, str]] = None,
+        progress_cb: Optional[Callable] = None,
+        combo_done_cb: Optional[Callable] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> dict:
+        """
+        對每個軸、每個離開距離（offset）重複 trials 輪「離開→復歸→讀殘差」，
+        回傳整體結果 dict（GUI 端據此存檔、畫摘要）。
+
+        directions 缺該軸 key 表示要自動判定：查一次 query_status()，若
+        當下正壓在某側限位（limit_direction() 判得出來），departure 方向
+        取相反方向——原點復歸後座標幾乎必然停在某一側限位附近（見
+        CLAUDE.md〈座標 0 幾乎就落在限位開關上〉），這是唯一站得住腳的
+        自動判定依據；判不出來（此刻沒有壓在任何限位上）就整批跳過該軸，
+        改由 GUI 提示使用者手動指定。
+
+        🔴 stop_event 被 set 時，不論卡在哪個階段，都保證會執行到
+        _measure_one_combo 的 try/finally 收尾判斷，但收尾**不是**無條件
+        歸零：只有滑台確定在原點（`at_origin`）才寫 `POS 0`，否則不歸零、
+        記 ERROR 並回傳 `origin_lost=True`。中止時把 `POS 0` 寫在滑台當下
+        的任意位置，比不歸零更危險——見 _measure_one_combo 的 docstring。
+        """
+        if directions is None:
+            directions = {}
+
+        result: dict = {
+            "axes_requested": list(axes),
+            "offsets": list(offsets),
+            "trials": trials,
+            "speed": {"l_speed": l_speed, "f_speed": f_speed, "rate": rate, "s_rate": s_rate},
+            "started_ts": datetime.now().isoformat(timespec="seconds"),
+            "finished_ts": None,
+            "aborted": False,
+            "skipped_axes": [],
+            "combos": [],
+        }
+
+        self.measuring_active = True
+        try:
+            for axis in axes:
+                if self._homing_repeat_abort(stop_event):
+                    break
+
+                axis_no = AXIS_NO.get(axis)
+                if not axis_no:
+                    result["skipped_axes"].append({"axis": axis, "reason": "未知軸名"})
+                    continue
+
+                st, _ = self.query_status(axis_no)
+                if st == "Stage not connected":
+                    result["skipped_axes"].append({"axis": axis, "reason": "未接滑台"})
+                    continue
+
+                org_type_raw = self._serial_write_read(f"AXI{axis_no}:MEMSW0?").strip()
+                if not org_type_raw or org_type_raw == "0":
+                    result["skipped_axes"].append(
+                        {"axis": axis, "reason": "復歸樣式未設定（MEMSW0=0 或讀取失敗）"}
+                    )
+                    continue
+                try:
+                    org_type = int(org_type_raw)
+                except ValueError:
+                    result["skipped_axes"].append(
+                        {"axis": axis, "reason": f"MEMSW0 回應格式錯誤: {org_type_raw!r}"}
+                    )
+                    continue
+
+                ax_name = NO_AXIS.get(axis_no, axis)
+                # 只記錄、不改寫：MEMSW7=0 才會讓控制器在復歸完成後自動把
+                # POS 歸零（見 origin_all 的同一段說明），殘差數字的物理
+                # 意義跟這個值是否為 0 有關，附進每組合的 metadata 供事後
+                # 判讀，不影響任何量測邏輯。
+                axis_memsw7 = self._serial_write_read(f"AXI{axis_no}:MEMSW7?").strip()
+
+                # 暫停該軸的韌體軟體限位——offset 可能把軸推到韌體限位以外
+                # （比照 origin_all 的既有規則：讀不到一律還原成 1／啟用，
+                # 不可 fail-unsafe，見下方 finally）。
+                saved_limits = self._soft_limits_enabled(axis_no)
+                self._set_soft_limits_enabled(axis_no, False)
+                try:
+                    # 基準復歸：不能假設「進場時 POS≈0」。使用者可能剛手動
+                    # 點動過，或方向是手動指定（代表當下沒有壓在任何限位，
+                    # 也就是判不出來自動方向的那種情況——本來就不在原點）。
+                    # 沒有這一步，第一組 offset 的殘差會混進「進場時離原點
+                    # 多遠」的誤差：offset=100 但起點離原點 3000 pulse，
+                    # 復歸後殘差 ≈3000 遠超漂移門檻（0.25×100=25），會被
+                    # 誤判成「偵測到累積漂移」，樣本只有 1 筆、統計整欄
+                    # 變 None，顯示的失敗原因本身就是錯的（architect
+                    # 2026-08-21 審查抓到）。
+                    #
+                    # 🔴 這次歸零定義了整組量測的座標框架，是全流程最重要
+                    # 的一次寫入，所以走四步驗證（architect 2026-08-21 第二
+                    # 輪追加）：驗證復歸真的執行過 → 確認軸已停穩 → 寫 0 →
+                    # 回讀確認。實機驗證證實，少了這幾步時基準復歸會踩到
+                    # 「Driving 尚未 assert」競態、把 POS 0 寫在飛行途中，
+                    # 整軸資料靜默作廢且沒有任何 origin_lost 標記（實測 Y 軸
+                    # 因此多出 83 pulse 的假性系統偏移）。
+                    base_ok, base_reason = self._do_origin_ex(
+                        axis_no, org_type, l_speed, f_speed, rate, s_rate,
+                        abort_event=stop_event,
+                    )
+                    if not base_ok:
+                        txt = (
+                            f"基準復歸未實際執行（MEMSW0={org_type} 對本軸可能不適用）"
+                            if base_reason == "not_executed"
+                            else "基準復歸失敗"
+                        )
+                        result["skipped_axes"].append(
+                            {"axis": axis, "reason": txt + "，未進行量測"}
+                        )
+                        continue
+                    base_stopped, _ = self._confirm_stopped(axis_no)
+                    if not base_stopped:
+                        result["skipped_axes"].append(
+                            {
+                                "axis": axis,
+                                "reason": "基準復歸後軸仍在移動，未寫入 POS 0，未進行量測",
+                            }
+                        )
+                        continue
+                    self.set_position(axis_no, "0")
+                    p_back, _ = self._read_pos_consistent(axis_no)
+                    if p_back is None or abs(p_back) > 1:
+                        result["skipped_axes"].append(
+                            {
+                                "axis": axis,
+                                "reason": f"基準歸零回讀失敗（POS={p_back}），未進行量測",
+                            }
+                        )
+                        continue
+
+                    # 方向自動判定搬到基準復歸之後（architect 2026-08-21
+                    # 建議改善 N1）：判定依賴「當下正壓在某側限位」，剛做完
+                    # 基準復歸的軸必然回到原點、也就必然壓在某側限位上，
+                    # 判定幾乎必定成功。放在復歸之前的舊寫法，使用者若剛
+                    # 手動點動停在行程中間、又沒手動指定方向，會被誤判成
+                    # 「無法自動判定」而整軸跳過——其實只要先復歸一次就
+                    # 能判出來。`_do_origin()` 不需要 `direction` 參數，
+                    # 兩者沒有相依，搬動不影響基準復歸本身。
+                    direction = directions.get(axis)
+                    if direction not in ("CW", "CCW"):
+                        st2, _ = self.query_status(axis_no)
+                        limit_side = self.limit_direction(st2)
+                        if limit_side not in ("CW", "CCW"):
+                            result["skipped_axes"].append(
+                                {"axis": axis, "reason": "無法自動判定方向且未手動指定"}
+                            )
+                            continue
+                        # 離開方向＝目前所壓限位的反方向
+                        direction = "CCW" if limit_side == "CW" else "CW"
+
+                    self._log(
+                        "INFO", f"[復歸重現性量測] 軸 {ax_name} 開始，方向 {direction}"
+                    )
+
+                    for offset in offsets:
+                        if self._homing_repeat_abort(stop_event):
+                            break
+                        combo_result = self._measure_one_combo(
+                            axis, axis_no, direction, org_type, offset, trials,
+                            l_speed, f_speed, rate, s_rate, progress_cb, stop_event,
+                        )
+                        combo_result["memsw7"] = axis_memsw7
+                        result["combos"].append(combo_result)
+                        if combo_done_cb:
+                            combo_done_cb(axis, offset, combo_result)
+                        if combo_result.get("origin_lost"):
+                            # 座標系已失準：這一軸剩下的 offset 既不可信
+                            # （殘差是在未歸零的參考框裡量的，會誤報成
+                            # 「累積漂移」——M4 修掉的問題用另一種路徑
+                            # 復發），也不安全（下一個組合的 at_origin
+                            # 初始值恆為 True，若它在第一輪之前就被中止，
+                            # finally 會把 POS 0 寫在滑台當下的任意位置）。
+                            # 整軸收手，讓使用者先手動復歸——只中止這一軸，
+                            # 不中止整批，其他軸各自有自己的基準復歸不受
+                            # 影響（architect 2026-08-21 第二輪審查抓到）。
+                            result["skipped_axes"].append(
+                                {
+                                    "axis": axis,
+                                    "reason": (
+                                        f"offset={offset} 組合在非原點狀態中止，"
+                                        f"座標系已失準，該軸剩餘 offset 已略過"
+                                    ),
+                                }
+                            )
+                            break
+                        if self._homing_repeat_abort(stop_event):
+                            break
+                finally:
+                    cw, ccw = saved_limits
+                    for cmd, val in (("CWSLE", cw), ("CCWSLE", ccw)):
+                        v = (val or "").strip()
+                        if v not in ("0", "1"):
+                            self._log(
+                                "ERROR",
+                                f"軸 {ax_name} {cmd} 原始值讀不到（收到 {val!r}），"
+                                f"改以啟用(1)還原——請確認限位設定是否符合預期",
+                            )
+                            v = "1"
+                        self._serial_write(f"AXI{axis_no}:{cmd} {v}")
+
+                if self._homing_repeat_abort(stop_event):
+                    break
+        finally:
+            self.measuring_active = False
+
+        # 中止跟正常跑完不是同一回事：中止時已存的資料通常只涵蓋部分
+        # 軸／offset，GUI 端要能分辨「完成」與「已中止，部分資料已存檔」，
+        # 不能一律顯示「完成」（architect 2026-08-21 審查建議）。這裡直接
+        # 讀 stop_event/ems_active 的目前狀態——兩者在中止路徑上都不會被
+        # 這個函式自己清掉，能正確反映「是不是因為這兩個原因而提前結束」。
+        result["aborted"] = self._homing_repeat_abort(stop_event)
+        result["finished_ts"] = datetime.now().isoformat(timespec="seconds")
+        self._log(
+            "INFO" if not result["aborted"] else "WARN",
+            "[復歸重現性量測] 已中止（部分資料）" if result["aborted"] else "[復歸重現性量測] 全部完成",
+        )
+        return result
+
+    def _homing_repeat_abort(self, stop_event: Optional[threading.Event]) -> bool:
+        """
+        量測是否該立刻收手：使用者主動停止（stop_event）或 EMS 觸發，
+        兩者都要讓迴圈立刻停手，缺一不可。
+
+        🔴 EMS 觸發時 `_wait_axis_stop()`/`_wait_origin_done()` 會因
+        `self.ems_active` 回 False，讓當下那個 (軸, offset) 組合中止，
+        但這只影響 `_measure_one_combo()` 內部的 trial 迴圈——外層的
+        axes／offsets 迴圈以前只認 `stop_event`，於是會繼續處理下一個
+        組合／下一軸，重新呼叫 `_do_move_step()`/`_do_origin()` 送出新的
+        移動指令，等於「使用者按下緊急停止後，滑台又動了起來」
+        （architect 2026-08-21 審查抓到的安全問題）。
+
+        ⚠ 這個方法只給**外層** `measure_homing_repeatability()` 的
+        axes／offsets 迴圈入口用（回傳單純 bool 就夠判斷要不要 break）。
+        `_measure_one_combo()` 內部**刻意不呼叫這個方法**、手動分開檢查
+        `stop_event`／`self.ems_active`——因為它還要分辨兩者才能寫出
+        正確的 `note`（「使用者中止」vs「EMS 觸發，中止量測」），合併成
+        一個回 bool 的判斷式會弄丟這個區分能力。這是刻意的設計差異，
+        不是遺漏，不要「順手統一」成都呼叫這個方法。
+        """
+        return bool(stop_event and stop_event.is_set()) or self.ems_active
+
+    def _measure_one_combo(
+        self,
+        axis: str,
+        axis_no: str,
+        direction: str,
+        org_type: int,
+        offset: int,
+        trials: int,
+        l_speed: str,
+        f_speed: str,
+        rate: str,
+        s_rate: str,
+        progress_cb: Optional[Callable],
+        stop_event: Optional[threading.Event],
+    ) -> dict:
+        """
+        單一 (軸, offset) 組合：重複 trials 輪「離開→復歸→讀殘差」。
+
+        呼叫端前提（由 measure_homing_repeatability() 保證，不在這裡重新
+        驗證）：進入這個組合時滑台已確定在原點——來自呼叫端的基準復歸，
+        或上一個 offset 組合自己歸零留下的結果。呼叫端同時保證：一旦
+        某個組合回傳 `origin_lost=True`，該軸後續的 offset 就不會再呼叫
+        這個方法（見 measure_homing_repeatability() 的 offsets 迴圈，
+        `origin_lost` 為真時整軸收手），所以這裡不需要、也無法自行驗證
+        這個前提是否成立。
+
+        🔴 用 try/finally 包整段（而非提前 return）確保無論正常跑完、
+        偵測到漂移提前收工、移動/復歸失敗、EMS 觸發、還是被 stop_event
+        中止，都會執行到收尾判斷——但收尾**不是**無條件歸零。只有滑台
+        「確定在原點」時才把座標寫回 0；離開移動失敗、`_do_origin`
+        失敗或逾時、或被 EMS 中止時，滑台可能停在行程中的任意點，此時
+        寫 `POS 0` 等於把座標系原點偷偷改到滑台當下位置——這比不歸零
+        更危險（之後 goto 教點、限位比對全部跟著偏移，且沒有任何警告），
+        是 architect 2026-08-21 審查抓到的問題。`at_origin` 這個旗標就是
+        用來追蹤這件事：初始值 True（沿用呼叫端前提），只要移動/復歸/EMS
+        任一步驟出狀況就設回 False，且一路維持到下一次 `_do_origin`
+        再次成功為止。
+
+        🔴 ems_active 檢查獨立於 stop_event 之外，且比 `_wait_axis_stop_
+        leaving_limit()`/`_do_origin()` 內部既有的檢查更早、更完整——這
+        兩個是無守衛層，`measuring_active` 只擋得住「其他來源啟動量測」，
+        擋不住「量測進行中途 EMS 被觸發」，那必須由這個迴圈自己攔。EMS
+        觸發後絕對不能再送出新的移動指令（哪怕是回原點的復歸），這是與
+        外層 `_homing_repeat_abort()` 同一類問題的組合內版本。
+
+        🔴 離開移動改用 `_do_move_step(..., wait_done=False)` +
+        `_wait_axis_stop_leaving_limit()`，不能沿用 `_do_move_step(...,
+        wait_done=True)`（等於內部呼叫 `_wait_axis_stop()`）——2026-08-21
+        COM2 實機驗證：原點就落在限位開關上，限位開關有實體作用寬度
+        （實測 X 軸 POS=100 時仍壓著 CCW 硬體限位，POS=150 才解除），
+        offset 不夠大時離開移動走完仍會壓在出發側限位上，`_wait_axis_
+        stop()` 依既有語意（非 Driving 就視為異常）會把這個正常起始
+        條件誤判成撞限位失敗，導致量測一輪都跑不完——這跟 CLAUDE.md
+        記載「原點復歸必須用 `_wait_origin_done()` 不能沿用 `_wait_axis_
+        stop()`」是同一類問題。`_wait_axis_stop_leaving_limit()` 只給
+        這條量測路徑用，`_do_move_step()`/`_wait_axis_stop()` 本身完全
+        沒有改動——一般步進移動撞到限位永遠要是失敗，不能因為量測需要
+        容忍就連帶放寬。
+        """
+        samples: List[dict] = []
+        note = ""
+        at_origin = True
+        try:
+            for trial in range(trials):
+                if stop_event and stop_event.is_set():
+                    note = "使用者中止"
+                    break
+                if self.ems_active:
+                    note = "EMS 觸發，中止量測"
+                    break
+
+                # 出發位置不能假設是 0：第 2 輪以後的起點是上一輪的殘差
+                # （只有第一輪才緊接在基準復歸之後）。
+                p_start, _ = self._read_pos_consistent(axis_no)
+                if p_start is None:
+                    note = "讀不到出發位置（通訊異常），中止量測"
+                    break  # 尚未送出移動 → at_origin 維持 True，finally 歸零正確
+
+                leaving_side = "CCW" if direction == "CW" else "CW"
+                # wait_done=False 會讓 _do_move_step 內部的 _motion_scope
+                # 立刻退出，等待期間 motion_active 會變 False、光功率背景
+                # 輪詢會在馬達還在動時恢復（2026-08-20 那項修正的回歸）。
+                # 這裡自己在外層補一層 _motion_scope，計數器設計本來就
+                # 支援巢狀，涵蓋整段「送出＋等待」。
+                with self._motion_scope():
+                    started = self._do_move_step(
+                        axis_no, direction, str(offset), l_speed, f_speed, rate, s_rate, False
+                    )
+                    if not started:
+                        # wait_done=False 時 _do_move_step 只會因為「格式
+                        # 錯誤」或「Python 端軟體限位攔截」回 False，兩者
+                        # 都發生在送出指令之前，滑台沒動過——at_origin
+                        # 不動，不能跟「送出後失敗」混為一談去觸發整軸
+                        # 收手、宣告座標系已失準。
+                        note = "移動指令未送出（格式錯誤或軟體限位攔截）"
+                        break
+                    moved, still_on_switch = self._wait_axis_stop_leaving_limit(
+                        axis_no, leaving_side, p_start, offset - 1, abort_event=stop_event
+                    )
+                if not moved:
+                    at_origin = False
+                    if self.ems_active:
+                        note = "EMS 觸發，中止量測"
+                    elif stop_event and stop_event.is_set():
+                        note = "使用者中止（離開移動中）"
+                    else:
+                        note = "離開移動失敗（撞對向限位或逾時）"
+                    break
+
+                # M2：軸從未真正脫離出發側限位開關作用區，GO ORG 沒有從
+                # 外側重新掃過感測器邊緣，量到的不是其他 offset 在量的
+                # 同一個量——留給組合層級彙整成 note，不在這裡處理。
+                left_switch = not still_on_switch
+
+                if self.ems_active:
+                    # 離開移動完成後、送出 GO ORG 之前再檢查一次：EMS 有
+                    # 可能恰好在這段空檔被觸發，此時滑台已經不在原點，
+                    # 不能再送一個「回原點」的移動指令——使用者剛按緊急
+                    # 停止，程式不該又讓滑台動起來。
+                    at_origin = False
+                    note = "EMS 觸發，中止量測"
+                    break
+
+                homed, home_reason = self._do_origin_ex(
+                    axis_no, org_type, l_speed, f_speed, rate, s_rate,
+                    wait_done=True, abort_event=stop_event,
+                )
+                if not homed:
+                    at_origin = False
+                    # 同上：等待函式對 EMS／使用者中止／真正逾時／復歸未
+                    # 實際執行都回 False，這裡分開標記，不要讓「有人按了
+                    # 緊急停止」或「MEMSW0 樣式不適用」被誤讀成「復歸真的
+                    # 逾時了」——三者要查的方向完全不同。
+                    if self.ems_active:
+                        note = "EMS 觸發，中止量測"
+                    elif stop_event and stop_event.is_set():
+                        note = "使用者中止（復歸中）"
+                    elif home_reason == "not_executed":
+                        note = (
+                            f"GO ORG 未實際執行（Driving 未 assert 且 POS 未變化）"
+                            f"——MEMSW0={org_type} 對本軸可能不適用，非累積漂移"
+                        )
+                    else:
+                        note = "原點復歸逾時"
+                    break
+                at_origin = True
+
+                time.sleep(0.05)
+                p_i, inconsistent = self._read_pos_consistent(axis_no)
+                status_str, _ = self.query_status(axis_no)
+
+                # 🔴 讀值不一致在量測情境下，最可能的成因是「軸還在動」而
+                # 不是通訊雜訊（兩次 POS? 相隔約 56ms，軸以 F0 飛行時會差
+                # 數十 pulse）。這是對「復歸回報完成但實際還在跑」那個
+                # bug 的直接回歸鎖：即使將來等待函式又出現新的漏網路徑，
+                # 這裡會攔下來，而且**不歸零**。
+                if inconsistent and status_str == "Driving":
+                    at_origin = False
+                    note = "復歸回報完成但軸仍在移動，殘差不可信，中止量測"
+                    break
+
+                # 復歸後是否停在原點/限位感測器上。只在下方失控門檻那個
+                # 「已知異常」的分支拿來判斷該不該歸零——不可當成一般路徑
+                # 的歸零閘門：有些 ORG 樣式會在找到感測器後退出作用區停下，
+                # 那時 on_sensor 是 False 但復歸完全正常。
+                on_sensor = (
+                    status_str == "Detect origin"
+                    or self.limit_direction(status_str) is not None
+                )
+                residual_um = self.estimate_um(axis, p_i) if p_i is not None else None
+                samples.append(
+                    {
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "trial": trial + 1,
+                        "residual_pulse": p_i,
+                        "residual_um": residual_um,
+                        "status": status_str,
+                        "left_switch": left_switch,
+                        "on_sensor": on_sensor,
+                        "note": "讀值不一致，已取多數/最後值" if inconsistent else "",
+                    }
+                )
+                if progress_cb:
+                    progress_cb(axis, offset, trial + 1, trials, p_i, status_str)
+
+                # 這是失控保護（防止量測在明顯異常的情況下無止盡跑下去），
+                # **不是漂移判定**——真正的漂移判定在事後統計（drift_rate／
+                # σ(diff)，見 _compute_homing_stats）。變數名刻意叫
+                # runaway 而非 drift，避免下一個人從變數名推回錯誤結論。
+                # 門檻加絕對下限 30 pulse：offset 一小（例如 100）時純比例
+                # 門檻只有 25 pulse，會把正常的系統性偏移誤判成失控。
+                runaway_threshold = max(0.25 * offset, 30.0)
+                if p_i is not None and abs(p_i) > runaway_threshold:
+                    if abs(abs(p_i) - offset) <= max(0.1 * offset, 5.0):
+                        # 殘差 ≈ 離開距離，是「軸根本沒回來」的簽名——真正的
+                        # 累積漂移是小量逐輪累加，不會一次就落在 offset 附近。
+                        note = (
+                            f"殘差({p_i:.0f}) ≈ 離開距離({offset})，軸幾乎沒有回到"
+                            f"原點——復歸未生效或樣式不適用，非累積漂移"
+                        )
+                    else:
+                        note = (
+                            f"殘差({p_i:.0f}) 超出失控保護門檻"
+                            f"({runaway_threshold:.0f})，提前收工——可能是復歸未"
+                            f"生效、樣式不適用或座標系已偏移，是否為累積漂移"
+                            f"須看事後統計的 drift_rate"
+                        )
+                    # M3 的第二種復發路徑：復歸確實執行過、但滑台沒回到
+                    # 原點附近（樣式不適用／機械卡住／感測器接觸不良）。
+                    # 既沒回到原點、也沒壓在任何感測器上時不可歸零。
+                    if not on_sensor:
+                        at_origin = False
+                    break
+        finally:
+            if at_origin:
+                # 🔴 寫入前最後一道閘門：確認軸真的停穩了。等待函式的判定
+                # 再嚴格都只是「相信上游」，把確認放在危險動作本身才是機制
+                # 性保證（見 _confirm_stopped 的 docstring）。
+                try:
+                    at_origin, _ = self._confirm_stopped(axis_no)
+                except Exception as e:
+                    at_origin = False
+                    self._log(
+                        "ERROR", f"[復歸重現性量測] 軸 {axis} 停止確認失敗: {e}"
+                    )
+                if not at_origin:
+                    self._log(
+                        "ERROR",
+                        f"軸 {axis} 收尾時仍在移動或無法確認靜止，未強制歸零",
+                    )
+
+            if at_origin:
+                try:
+                    self.set_position(axis_no, "0")
+                except Exception as e:  # 歸零本身不可讓例外逃逸、蓋掉已收集的樣本資料
+                    at_origin = False
+                    self._log("ERROR", f"[復歸重現性量測] 軸 {axis} 強制歸零失敗: {e}")
+
+            if not at_origin:
+                msg = (
+                    f"軸 {axis} 在非原點狀態下中止，未強制歸零——"
+                    f"座標系已失準，請重新執行原點復歸後再操作"
+                )
+                self._log("ERROR", msg)
+                note = (note + "；" if note else "") + "座標系已失準，需重新復歸"
+
+        # M2：offset 太小、軸從未脫離出發側限位開關作用區的組合，數據
+        # 跟其他 offset 不可直接比較——GUI 三個預設 offset 全部預勾，
+        # 使用者拿到這種資料混在正常資料裡外觀完全看不出來，note 必須
+        # 明講。`still_on_switch`／`left_switch` 是 M1 的免費副產品，
+        # 不需要額外移動或查詢。
+        offset_below_switch = any(s.get("left_switch") is False for s in samples)
+        if offset_below_switch:
+            note = (
+                (note + "；" if note else "")
+                + "offset 未脫離出發側限位開關作用區，本組數據與其他 offset 不可直接比較"
+            )
+
+        # 復歸後沒停在原點/限位感測器上的輪次：殘差的物理意義存疑。
+        # 跟 left_switch 一樣是免費副產品（query_status 本來就要呼叫）。
+        # 有了這一欄，CSV 本身就看得出「復歸後 status=Stop」這種異常，
+        # 事後判讀不必再回頭下原始指令重現。
+        homed_off_sensor = any(s.get("on_sensor") is False for s in samples)
+        if homed_off_sensor:
+            note = (
+                (note + "；" if note else "")
+                + "部分輪次復歸後未偵測到原點/限位感測器，殘差意義存疑"
+            )
+
+        stats = self._compute_homing_stats(axis, samples)
+        return {
+            "axis": axis,
+            "offset": offset,
+            "direction": direction,
+            "org_type": org_type,
+            "n_samples": len(samples),
+            "note": note,
+            "origin_lost": not at_origin,
+            "offset_below_switch": offset_below_switch,
+            "homed_off_sensor": homed_off_sensor,
+            "samples": samples,
+            "stats": stats,
+        }
+
+    def _read_pos_consistent(self, axis_no: str) -> Tuple[Optional[float], bool]:
+        """
+        連讀兩次 POS? 要求一致；不一致就再讀第三次，三筆裡有兩筆相同就用
+        多數值，否則保守地退回最後一次讀到的值（寧可留一個可能有雜訊的
+        值並標記，也不要讓這筆量測資料整筆開天窗）。
+
+        回傳 (數值或 None, 是否曾經讀值不一致)。POS? 讀取失敗（空字串／
+        非數字）視為不一致。
+        """
+
+        def _read() -> Optional[float]:
+            raw = self._serial_write_read(f"AXI{axis_no}:POS?")
+            try:
+                return float(raw)
+            except (ValueError, TypeError):
+                return None
+
+        p1 = _read()
+        p2 = _read()
+        if p1 is not None and p2 is not None and p1 == p2:
+            return p1, False
+
+        p3 = _read()
+        candidates = [p1, p2, p3]
+        for v in candidates:
+            if v is not None and candidates.count(v) >= 2:
+                return v, True
+        return p3, True
+
+    def _compute_homing_stats(self, axis: str, samples: List[dict]) -> dict:
+        """
+        對單一 (軸, offset) 組合的殘差序列算統計量。
+
+        先用線性回歸判斷有沒有系統性漂移；有漂移時 range/sigma(p) 這種
+        數字會隨 N 成長沒有意義，改報漂移率／輪間差的標準差。沒有漂移
+        才報 range/median/sigma/MAD。N<2（組合失敗提早中止）一律回 None，
+        不嘗試除以零。
+
+        有校正參數的軸額外換算一份 μm 版本，並附上當下的校正參數快照
+        （比照〈存檔時的 μm 快照〉：存完整參數而非只存算出來的 μm，
+        參數本身之後可能被使用者改掉或用 clear_axis_calib() 清除）。
+        """
+        p_series = [s["residual_pulse"] for s in samples if s["residual_pulse"] is not None]
+        n = len(p_series)
+
+        stats: dict = {
+            "n": n,
+            "drift_detected": None,
+            "range": None,
+            "median": None,
+            "sigma": None,
+            "mad_scaled": None,
+            "drift_rate": None,
+            "sigma_diff": None,
+        }
+        if n < 2:
+            stats["um"] = None
+            stats["axis_calib_snapshot"] = None
+            return stats
+
+        b, se_b = self._linear_regress_slope(p_series)
+        drift_detected = abs(b) > max(3 * se_b, 0.3)
+        stats["drift_detected"] = drift_detected
+
+        if drift_detected:
+            diffs = [p_series[i + 1] - p_series[i] for i in range(n - 1)]
+            stats["drift_rate"] = statistics.mean(diffs) if diffs else None
+            stats["sigma_diff"] = statistics.stdev(diffs) if len(diffs) >= 2 else None
+        else:
+            med = statistics.median(p_series)
+            stats["range"] = max(p_series) - min(p_series)
+            stats["median"] = med
+            stats["sigma"] = statistics.stdev(p_series) if n >= 2 else None
+            stats["mad_scaled"] = 1.4826 * statistics.median([abs(v - med) for v in p_series])
+
+        params = self.axis_calib.get(axis)
+        if params:
+            stats["axis_calib_snapshot"] = dict(params)
+            um_fields = {}
+            for key in ("range", "median", "sigma", "mad_scaled", "drift_rate", "sigma_diff"):
+                v = stats.get(key)
+                if v is not None:
+                    um = self.estimate_um(axis, v)
+                    if um is not None:
+                        um_fields[key] = um
+            stats["um"] = um_fields
+        else:
+            stats["axis_calib_snapshot"] = None
+            stats["um"] = None
+
+        return stats
+
+    @staticmethod
+    def _linear_regress_slope(y: List[float]) -> Tuple[float, float]:
+        """
+        簡單最小平方法算 y 對「輪數索引」(0..n-1) 的斜率與標準誤。
+        輪與輪之間本來就是等間隔的重複量測，不需要真實時間戳當 x 軸。
+
+        n<=2 時自由度不足以估殘差標準差（n=2 時 dof=0，直接除會是
+        ZeroDivisionError），回傳極大的標準誤，讓呼叫端的漂移顯著性
+        判斷式保守地偏向「非顯著」，而不是讓程式崩潰。
+        """
+        n = len(y)
+        if n < 2:
+            return 0.0, float("inf")
+        xs = list(range(n))
+        x_mean = statistics.mean(xs)
+        y_mean = statistics.mean(y)
+        sxx = sum((x - x_mean) ** 2 for x in xs)
+        if sxx == 0:
+            return 0.0, float("inf")
+        sxy = sum((x - x_mean) * (yy - y_mean) for x, yy in zip(xs, y))
+        b = sxy / sxx
+        if n <= 2:
+            return b, float("inf")
+        residuals = [yy - (y_mean + b * (x - x_mean)) for x, yy in zip(xs, y)]
+        sse = sum(r ** 2 for r in residuals)
+        mse = sse / (n - 2)
+        se_b = math.sqrt(mse / sxx)
+        return b, se_b
 
     def stop(self) -> None:
         """
@@ -1709,6 +2806,83 @@ class DS102Controller:
 
         self._log("WARN", f"軸{axis_no} 等待到位逾時（{timeout}s）")
         return False
+
+    def _wait_axis_stop_leaving_limit(
+        self,
+        axis_no: str,
+        leaving_side: str,
+        start_pos: float,
+        min_travel: float,
+        timeout: float = WAIT_TIMEOUT,
+        abort_event: Optional[threading.Event] = None,
+    ) -> Tuple[bool, bool]:
+        """
+        量測專用的到位等待：容忍「出發時就壓著的那一側」限位。
+
+        🔴 只給 measure_homing_repeatability()/_measure_one_combo() 這條
+        量測路徑使用，絕對不可放進 _do_move_step()——一般步進移動撞到限位
+        永遠是失敗，這是 2026-08-05 那批安全修正的核心結論之一。這裡容忍
+        的只有「出發那一側」限位，且只在這個特定情境下成立，不是放寬一般
+        撞限位的判定。
+
+        背景（2026-08-21 COM2 實機驗證）：原點就落在限位開關上，而限位
+        開關有實體作用寬度——實測 X 軸 POS=100 時 SB2=2（CCW 硬體限位
+        仍壓著），POS=150 時 SB2=0（解除）。離開移動走完一個較小的
+        offset（例如 100）之後，軸有可能還壓在「出發時那一顆」限位上，
+        `_wait_axis_stop()` 依既有語意（非 Driving 就視為異常）會把這個
+        正常起始條件誤判成撞限位失敗——這跟 CLAUDE.md 記載「原點復歸
+        必須用 `_wait_origin_done()`、不能沿用 `_wait_axis_stop()`」是
+        同一類問題：量測起點必然在限位上，壓著它不是異常。
+
+        🔴 只看「非 Driving + 出發側限位/Stop」還不夠：`GO` 指令剛送出、
+        Driving 位元根本還沒 assert 時，軸一步都還沒動也會符合這個條件，
+        若因此判成「到位」，會接著送出 `GO ORG`、量到一組殘差≈0 的假
+        資料存進 CSV——比大聲失敗危險得多。所以再疊一層位移判準：只有
+        實際位移達到 `min_travel`（呼叫端傳 `offset - 1`，容 1 pulse）
+        才真的算到位，否則視為「GO 尚未生效」，繼續等，最終交給逾時
+        判失敗。這道判準同時讓行為與 offset 大小、與輪詢時機都無關，
+        不必再擔心「offset 夠不夠大」這類競態問題。
+
+        回傳 (是否正常到位, 停止時是否仍壓在出發側限位)。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.ems_active:
+                return False, False
+            if abort_event is not None and abort_event.is_set():
+                return False, False
+
+            status, pos = self.query_status(axis_no)
+            if status == "Driving":
+                time.sleep(WAIT_INTERVAL)
+                continue
+
+            try:
+                travelled = abs(float(pos) - start_pos)
+            except (ValueError, TypeError):
+                # 讀不到位置，無法確認是否已到位——續輪，最終由逾時判失敗，
+                # 不要在這裡就直接放行或直接失敗。
+                travelled = -1.0
+
+            side = self.limit_direction(status)
+            if status == "Stop" or side == leaving_side:
+                if travelled >= min_travel:
+                    return True, side == leaving_side
+                # GO 尚未生效（Driving 位元還沒 assert）或真的卡住不動，
+                # 兩者都繼續等，交給上面的 deadline 逾時判失敗。
+                time.sleep(WAIT_INTERVAL)
+                continue
+
+            # 其他狀態（行進方向那一側限位、或其他異常）才是真正的失敗——
+            # 這才是應該攔下來的情境，跟出發側限位不是同一回事。
+            ax = NO_AXIS.get(axis_no, axis_no)
+            self._log("WARN", f"軸 {ax} 離開移動時進入異常狀態: {status}")
+            if self._alarm_cb:
+                self._alarm_cb(f"軸 {ax} 異常", status)
+            return False, False
+
+        self._log("WARN", f"軸{axis_no} 離開移動等待逾時（{timeout}s）")
+        return False, False
 
     def wait_axis_stop(self, axis_no: str, timeout: float = WAIT_TIMEOUT) -> bool:
         """
@@ -1897,7 +3071,7 @@ class DS102Controller:
         if name not in self.saved_points:
             self._log("ERROR", f"Teaching Point [{name}] 不存在")
             return False
-        if self.ems_active or self.playback_running or self.scanning_active:
+        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
             return False
 
         pt = self.saved_points[name]

@@ -72,6 +72,7 @@ from ds102_ctrl import (
     _app_settings,
     _app_setting_num,
     _safety_setting_rejections,
+    save_homing_repeat_result,
 )
 
 # matplotlib 是尋光分頁的即時軌跡圖用的，非本程式核心相依（序列通訊與其餘
@@ -553,6 +554,15 @@ class DS102GUI:
         # 沒有這個旗標的話它會在 100ms 後把復歸期間的鎖定解掉。
         self._homing = threading.Event()
 
+        # 原點復歸重現性量測進行中（見 _build_card_origin_repeatability）。
+        # 比照 _homing/_scanning 的既有模式：_update_stat_ui 靠這個旗標
+        # 判斷要不要鎖定驅動按鈕。獨立的 stop_event 是因為量測迴圈跑在
+        # 自己的背景執行緒、沒有現成旗標可用（跟 _stop_playback 是同一類，
+        # 不是跟 _homing 共用）。
+        self._org_repeat_running = threading.Event()
+        self._org_repeat_stop_event = threading.Event()
+        self._org_repeat_start_time = 0.0
+
         # 按鈕組（多分頁同步更新）
         self._all_axis_btn_groups: List[Dict[str, tk.Button]] = []
 
@@ -568,6 +578,13 @@ class DS102GUI:
         # 移動控制 UI 參考
         self._ctrl_status_var = tk.StringVar(value="Stop")
         self._ctrl_pos_var = tk.StringVar(value="0")
+        # 移動控制分頁「Position:」旁的 um 估算附加顯示，見 _update_ctrl_pos_um()。
+        # 用 trace 掛在 _ctrl_pos_var 上——它的兩個寫入點（_poll_status／
+        # _async_query）都已經是 root.after 回主執行緒的寫入，切軸時
+        # _select_axis() 也會呼叫 _async_query() 觸發一次 set，因此不需要
+        # 額外再監聽軸切換事件。
+        self._ctrl_pos_um_var = tk.StringVar(value="")
+        self._ctrl_pos_var.trace_add("write", self._update_ctrl_pos_um)
         self._drive_mode_var = tk.IntVar(value=MODE_CONTINUE)
 
         # 驅動按鈕參考（連線前 disable）
@@ -660,9 +677,9 @@ class DS102GUI:
         )
         self._banner_close.pack(side="right", padx=(0, 10))
         # 待顯示的訊息佇列（見 _flash_banner）
-        self._banner_queue: List[Tuple[str, int]] = []
+        self._banner_queue: List[Tuple[str, int, str]] = []
 
-    def _flash_banner(self, msg: str, ms: int = 8000):
+    def _flash_banner(self, msg: str, ms: int = 8000, color: str = CLR_WARN):
         """
         顯示提醒，ms 毫秒後自動收起。
 
@@ -670,31 +687,36 @@ class DS102GUI:
         以前是直接覆寫同一個變數並重設倒數——連線成功時若同時有
         「已從設定檔還原」與「復歸樣式未設定」兩則，第一則會在顯示 0ms
         後被蓋掉，實質上永遠看不到。
+
+        `color` 預設 `CLR_WARN`（與改動前所有既有呼叫點行為一致）。
+        2026-08-21 為「原點復歸重現性量測中止在非原點狀態」這種比一般
+        警告更嚴重的情境新增——呼叫端可傳 `CLR_DANGER` 拉高視覺急迫性，
+        不需要另外新增一套獨立的橫幅機制。
         """
         try:
             if self._banner_after_id:
                 # 只有「幾乎同時」湧入的訊息才排隊。這正是佇列要解決的情境：
-                # 連線成功時「已從設定檔還原」與「復歸樣式未設定」在同一個
+                # 連線成功時「已從設定檔還原」與「復歸樣式未設定」兩則在同一個
                 # 事件裡連續觸發，舊寫法會讓第一則顯示 0ms 就被蓋掉。
                 #
                 # 但若目前這則已經顯示一段時間，新訊息多半是使用者剛按下
                 # 某個按鈕的回饋——那不該排隊等好幾秒才出現，直接換掉。
                 if time.time() - self._banner_shown_at < BANNER_COALESCE_SEC:
-                    if (msg, ms) not in self._banner_queue:
-                        self._banner_queue.append((msg, ms))
+                    if (msg, ms, color) not in self._banner_queue:
+                        self._banner_queue.append((msg, ms, color))
                     return
                 self.root.after_cancel(self._banner_after_id)
                 self._banner_after_id = None
-            self._show_banner_now(msg, ms)
+            self._show_banner_now(msg, ms, color)
         except tk.TclError:
             pass  # 關閉流程中 widget 可能已銷毀
 
-    def _show_banner_now(self, msg: str, ms: int):
+    def _show_banner_now(self, msg: str, ms: int, color: str = CLR_WARN):
         self._banner_shown_at = time.time()
         self._banner_var.set(msg)
-        self._banner.config(bg=CLR_WARN)
-        self._banner_lbl.config(bg=CLR_WARN, fg="white")
-        self._banner_close.config(bg=CLR_WARN, fg="white")
+        self._banner.config(bg=color)
+        self._banner_lbl.config(bg=color, fg="white")
+        self._banner_close.config(bg=color, fg="white")
         self._banner_after_id = self.root.after(ms, self._hide_banner)
 
     def _hide_banner(self):
@@ -704,8 +726,8 @@ class DS102GUI:
                 self.root.after_cancel(self._banner_after_id)
                 self._banner_after_id = None
             if self._banner_queue:
-                nxt_msg, nxt_ms = self._banner_queue.pop(0)
-                self._show_banner_now(nxt_msg, nxt_ms)
+                nxt_msg, nxt_ms, nxt_color = self._banner_queue.pop(0)
+                self._show_banner_now(nxt_msg, nxt_ms, nxt_color)
                 return
             # 不 pack_forget，只是變回背景色——版面高度永遠不變
             self._banner_var.set("")
@@ -1541,6 +1563,556 @@ class DS102GUI:
             self._refresh_calib_display()
             self._flash_banner(f"✔ {ax} 軸機械校正參數已清除", 5000)
 
+    # =========================================================================
+    # 原點復歸重現性量測（2026-08-21）
+    #
+    # 自動化「離開原點固定 pulse 數 → GO ORG 復歸 → 讀 POS 殘差」，多輪
+    # 多 offset 掃描，統計殘差離散度，評估「軟體座標原點」能否當作光纖
+    # 對準的可信基準。核心邏輯在 ds102_ctrl.DS102Controller.
+    # measure_homing_repeatability()，這裡只負責蒐集輸入、跑背景執行緒、
+    # 把回呼結果畫出來。
+    # =========================================================================
+    def _build_card_origin_repeatability(self, scr):
+        card = self._card(scr, "原點復歸重現性量測")
+        tk.Label(
+            card,
+            text="讓軸離開原點固定距離後送出原點復歸，重複多輪並掃描多個離開\n"
+                 "距離，統計復歸後 POS 殘差的離散程度——用來評估軟體座標原點\n"
+                 "能不能當作光纖對準的可信基準。每個軸開始量測前會先執行一次\n"
+                 "原點復歸建立基準（不假設目前位置就是原點）。",
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 8),
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(2, 4))
+        tk.Label(
+            card,
+            text="⚠ 量測期間會暫停該軸的韌體軟體限位（結束後自動還原）。過程中\n"
+                 "請勿手動點動同一軸。只有成功完成原點復歸的組合才會把座標\n"
+                 "強制寫回 0；中途失敗、逾時或被緊急停止中斷則不會歸零，畫面\n"
+                 "會明確警示，需重新執行原點復歸後才能繼續其他操作。",
+            bg=CLR_CARD,
+            fg=CLR_WARN,
+            font=("Segoe UI", 8),
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        # ── 量測軸 ──
+        axis_head = tk.Frame(card, bg=CLR_CARD)
+        axis_head.pack(fill="x", padx=12, pady=(0, 2))
+        tk.Label(
+            axis_head, text="量測軸", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(side="left")
+        ttk.Button(
+            axis_head, text="全不選", style="Flat.TButton",
+            command=lambda: self._set_org_repeat_axis_selection(False),
+        ).pack(side="right")
+        ttk.Button(
+            axis_head, text="全選", style="Flat.TButton",
+            command=lambda: self._set_org_repeat_axis_selection(True),
+        ).pack(side="right", padx=(0, 4))
+
+        # 固定六軸版面、連線後依 axis_count 動態 enable/disable，停用軸
+        # 強制 BooleanVar 設回 False——完全比照尋光分頁 _scan_axis_
+        # checkbuttons 的既有邏輯（見 _on_connect_result／_set_axis_btns_state）。
+        self._org_repeat_axis_vars: Dict[str, tk.BooleanVar] = {}
+        self._org_repeat_axis_checkbuttons: Dict[str, ttk.Checkbutton] = {}
+        for row_axes in (("X", "Y", "Z"), ("U", "V", "W")):
+            row_f = tk.Frame(card, bg=CLR_CARD)
+            row_f.pack(fill="x", padx=12, pady=(2, 0))
+            for ax in row_axes:
+                var = tk.BooleanVar(value=False)
+                self._org_repeat_axis_vars[ax] = var
+                cb = ttk.Checkbutton(row_f, text=ax, variable=var)
+                cb.pack(side="left", padx=(0, 10))
+                self._org_repeat_axis_checkbuttons[ax] = cb
+
+        ttk.Separator(card, orient="horizontal").pack(fill="x", padx=12, pady=(8, 6))
+
+        # ── 測試 offset ──
+        off_f = tk.Frame(card, bg=CLR_CARD)
+        off_f.pack(fill="x", padx=12, pady=(0, 2))
+        tk.Label(
+            off_f, text="測試 Offset（pulse）", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w")
+        preset_row = tk.Frame(off_f, bg=CLR_CARD)
+        preset_row.pack(fill="x", pady=(4, 0))
+        # 三顆常用值列在清單上，刻意避開 0——0 幾乎等於「原地不動」，對
+        # 重現性量測沒有意義（跟尋光分頁起始步長預設值同一個理由）。
+        # 🔴 100 不預設勾選（2026-08-21 COM2 實機驗證後改）：原點就落在
+        # 限位開關上，開關本身有實體作用寬度（實測 X 軸約 100～150
+        # pulse），offset=100 量到的數據「軸從未真正脫離開關作用區」，
+        # 跟其他 offset 不是同一種量、不可直接比較——雖然程式現在會在
+        # note／CLR_WARN 標記出來，但不該讓使用者第一次使用就預設勾選
+        # 一組先天不具代表性的資料。想量開關寬度本身的人仍可自己勾選。
+        self._org_repeat_offset_preset_vars: Dict[int, tk.BooleanVar] = {}
+        for val, default_checked in ((100, False), (1000, True), (5000, True)):
+            var = tk.BooleanVar(value=default_checked)
+            self._org_repeat_offset_preset_vars[val] = var
+            ttk.Checkbutton(preset_row, text=str(val), variable=var).pack(
+                side="left", padx=(0, 14)
+            )
+        custom_row = tk.Frame(off_f, bg=CLR_CARD)
+        custom_row.pack(fill="x", pady=(4, 0))
+        tk.Label(
+            custom_row, text="自訂（逗號分隔）:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        ).pack(side="left")
+        self._org_repeat_offset_custom_var = tk.StringVar(value="")
+        ttk.Entry(custom_row, textvariable=self._org_repeat_offset_custom_var, width=22).pack(
+            side="left", padx=(4, 0)
+        )
+        tk.Label(
+            off_f,
+            text="offset 需大於限位開關作用區（本機 X 軸實測約 100～150 pulse）"
+                 "才具代表性，太小的 offset 會被標記為不可比較。",
+            bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=340,
+        ).pack(anchor="w", pady=(4, 0))
+
+        # ── 每組輪數 ──
+        trials_row = tk.Frame(card, bg=CLR_CARD)
+        trials_row.pack(fill="x", padx=12, pady=(10, 2))
+        tk.Label(
+            trials_row, text="每組輪數 N:", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(side="left")
+        self._org_repeat_trials_var = tk.StringVar(value="10")
+        ttk.Entry(trials_row, textvariable=self._org_repeat_trials_var, width=8).pack(
+            side="left", padx=(4, 0)
+        )
+
+        # ── 開始/停止 + 狀態 + 已耗時 ──
+        ctrl_row = tk.Frame(card, bg=CLR_CARD)
+        ctrl_row.pack(fill="x", padx=12, pady=(10, 2))
+        self._org_repeat_start_btn = ttk.Button(
+            ctrl_row, text="▶ 開始量測", style="Accent.TButton",
+            command=self._do_start_org_repeat,
+        )
+        self._org_repeat_start_btn.pack(side="left")
+        # 停止鍵獨立管理，不放進 _drive_buttons（比照 _scan_stop_btn 的
+        # 既有先例）——CLAUDE.md 明載這是曾經真實發生的 bug：作業進行中
+        # 最需要停止時，停止鍵被整批 disabled 按鈕鎖住。
+        self._org_repeat_stop_btn = ttk.Button(
+            ctrl_row, text="■ 停止量測", style="Danger.TButton",
+            command=self._do_stop_org_repeat, state="disabled",
+        )
+        self._org_repeat_stop_btn.pack(side="left", padx=(6, 0))
+        self._org_repeat_status_var = tk.StringVar(value="尚未開始")
+        tk.Label(
+            ctrl_row, textvariable=self._org_repeat_status_var, bg=CLR_CARD, fg=CLR_TEXT,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side="left", padx=(14, 4))
+        tk.Label(
+            ctrl_row, text="已耗時", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        ).pack(side="left", padx=(14, 2))
+        self._org_repeat_elapsed_var = tk.StringVar(value="00:00")
+        tk.Label(
+            ctrl_row, textvariable=self._org_repeat_elapsed_var, bg=CLR_CARD, fg=CLR_TEXT,
+            font=("Consolas", 9, "bold"),
+        ).pack(side="left")
+
+        # ── 進度列：目前軸/offset/第幾輪 + 最新殘差 ──
+        self._org_repeat_progress_var = tk.StringVar(value="—")
+        tk.Label(
+            card, textvariable=self._org_repeat_progress_var, bg=CLR_CARD, fg=CLR_MUTED,
+            font=("Consolas", 8), anchor="w", justify="left",
+        ).pack(fill="x", padx=12, pady=(6, 6))
+
+        # ── 結果摘要：逐組合附加一列，不等全部跑完才顯示 ──
+        result_cols = ("axis", "offset", "n", "range", "stdev", "median", "drift", "note")
+        result_headers = {
+            "axis": "軸", "offset": "Offset", "n": "N", "range": "Range",
+            "stdev": "StdDev", "median": "中位數", "drift": "漂移判定", "note": "備註",
+        }
+        result_widths = {
+            "axis": 40, "offset": 60, "n": 40, "range": 70,
+            "stdev": 70, "median": 70, "drift": 90, "note": 180,
+        }
+        self._org_repeat_tree = ttk.Treeview(
+            card, columns=result_cols, show="headings", height=6,
+        )
+        for c in result_cols:
+            self._org_repeat_tree.heading(c, text=result_headers[c])
+            self._org_repeat_tree.column(c, width=result_widths[c], anchor="center")
+        # 標記「offset 未脫離出發側限位開關作用區」的組合——資料本身有效
+        # （量得到、統計算得出來），只是跟其他 offset 不可直接比較，用
+        # CLR_WARN（不是 CLR_DANGER，那是保留給 origin_lost 這種真正的
+        # 失敗／座標系失準情境）。
+        self._org_repeat_tree.tag_configure("below_switch", foreground=CLR_WARN)
+        self._org_repeat_tree.pack(fill="x", padx=12, pady=(0, 8))
+
+        # ── 存檔路徑：灰字、可選取文字，不彈檔案總管 ──
+        path_f = tk.Frame(card, bg=CLR_CARD)
+        path_f.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(
+            path_f, text="CSV:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        ).pack(anchor="w")
+        self._org_repeat_csv_path_var = tk.StringVar(value="—")
+        ttk.Entry(
+            path_f, textvariable=self._org_repeat_csv_path_var, state="readonly",
+            font=("Consolas", 8),
+        ).pack(fill="x", pady=(0, 4))
+        tk.Label(
+            path_f, text="JSON:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        ).pack(anchor="w")
+        self._org_repeat_json_path_var = tk.StringVar(value="—")
+        ttk.Entry(
+            path_f, textvariable=self._org_repeat_json_path_var, state="readonly",
+            font=("Consolas", 8),
+        ).pack(fill="x")
+
+    def _set_org_repeat_axis_selection(self, value: bool):
+        """全選／全不選——只動未被停用（有實際偵測到）的軸勾選框。"""
+        for ax in AXES:
+            cb = self._org_repeat_axis_checkbuttons.get(ax)
+            if cb is None or cb.instate(["disabled"]):
+                continue
+            self._org_repeat_axis_vars[ax].set(value)
+
+    def _collect_org_repeat_offsets(self) -> List[int]:
+        """
+        收集勾選的常用 offset + 自訂欄位（逗號分隔），去重、只留正整數、
+        格式錯的片段直接忽略（不因為使用者手滑打錯一個逗號就整批擋下，
+        跟尋光分頁「格式錯就讓函式庫走預設」同一種寬容原則）。
+
+        🔴 排除的是「非正數」，不是只排除 0——負的 offset 一樣沒有物理
+        意義（方向已經由 direction 決定），而且會讓漂移門檻
+        `abs(p_i) > 0.25 * offset` 因為 offset<0 恆成立，每一輪都被
+        誤判成「偵測到累積漂移」（architect 2026-08-21 審查建議）。
+        """
+        offsets: List[int] = []
+        for val, var in self._org_repeat_offset_preset_vars.items():
+            if var.get():
+                offsets.append(val)
+        extra_raw = self._org_repeat_offset_custom_var.get().strip()
+        if extra_raw:
+            for part in extra_raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    v = int(part)
+                except ValueError:
+                    continue
+                if v > 0 and v not in offsets:
+                    offsets.append(v)
+        return offsets
+
+    def _ask_org_repeat_directions(self, axes: List[str]) -> Optional[Dict[str, str]]:
+        """
+        方向預檢判不出來的軸，彈一個小 modal 要求使用者手動指定
+        CW/CCW（radiobutton）。取消回傳 None，呼叫端據此整個放棄量測。
+
+        純 UI 互動、不牽涉序列通訊，直接跑在主執行緒、用 wait_window()
+        阻塞等待使用者操作即可，不需要另開背景執行緒。
+        """
+        win = tk.Toplevel(self.root)
+        win.title("指定量測方向")
+        win.configure(bg=CLR_BG)
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+
+        tk.Label(
+            win,
+            text="下列軸目前未壓在任何限位上，無法自動判定「離開原點」的方向，\n"
+                 "請手動指定（該軸離開原點時應該往哪個方向走）：",
+            bg=CLR_BG, fg=CLR_TEXT, font=("Segoe UI", 9), justify="left",
+        ).pack(padx=16, pady=(14, 8), anchor="w")
+
+        dir_vars: Dict[str, tk.StringVar] = {}
+        for ax in axes:
+            row = tk.Frame(win, bg=CLR_BG)
+            row.pack(fill="x", padx=16, pady=2)
+            tk.Label(
+                row, text=f"{ax} 軸:", bg=CLR_BG, fg=CLR_TEXT, width=6, anchor="w",
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+            var = tk.StringVar(value="CW")
+            dir_vars[ax] = var
+            ttk.Radiobutton(row, text="CW", variable=var, value="CW").pack(
+                side="left", padx=(0, 8)
+            )
+            ttk.Radiobutton(row, text="CCW", variable=var, value="CCW").pack(side="left")
+
+        outcome: Dict[str, Optional[Dict[str, str]]] = {"value": None}
+
+        def _ok():
+            outcome["value"] = {ax: v.get() for ax, v in dir_vars.items()}
+            win.destroy()
+
+        def _cancel():
+            outcome["value"] = None
+            win.destroy()
+
+        btn_row = tk.Frame(win, bg=CLR_BG)
+        btn_row.pack(fill="x", padx=16, pady=(10, 14))
+        ttk.Button(btn_row, text="取消", style="Flat.TButton", command=_cancel).pack(
+            side="right"
+        )
+        ttk.Button(btn_row, text="確定", style="Accent.TButton", command=_ok).pack(
+            side="right", padx=(0, 8)
+        )
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        win.wait_window()
+        return outcome["value"]
+
+    def _do_start_org_repeat(self):
+        if not self.ctrl.connected:
+            self._flash_banner("原點復歸重現性量測需要先連線 DS102")
+            return
+        if self.ctrl.ems_active:
+            self._flash_banner("緊急停止中，請先解除後再開始量測")
+            return
+        if (
+            self.ctrl.measuring_active
+            or self._org_repeat_running.is_set()
+            or self.ctrl.playback_running
+            or self.ctrl.scanning_active
+            or self._homing.is_set()
+            or self._scanning.is_set()
+        ):
+            self._flash_banner("已有其他作業（重播／尋光／復歸／量測）進行中，請稍後再試")
+            return
+
+        selected_axes = [ax for ax in AXES if self._org_repeat_axis_vars[ax].get()]
+        if not selected_axes:
+            self._flash_banner("量測需要至少選擇一個軸")
+            return
+
+        offsets = self._collect_org_repeat_offsets()
+        if not offsets:
+            self._flash_banner("量測需要至少一個有效的測試 offset")
+            return
+
+        try:
+            trials = int(self._org_repeat_trials_var.get())
+            if trials <= 0:
+                raise ValueError
+        except ValueError:
+            self._flash_banner("每組輪數必須是正整數")
+            return
+
+        self._org_repeat_start_btn.config(state="disabled")
+        self._org_repeat_status_var.set("方向判定中…")
+
+        # 方向預檢會查詢控制器狀態（序列 I/O），依專案既有規則不可在 Tk
+        # 主執行緒做（見 _sync_org_mode 同一類寫法），放到背景執行緒查完
+        # 再用 root.after 回主執行緒繼續後續流程（可能彈出方向指定視窗）。
+        def _precheck():
+            directions: Dict[str, str] = {}
+            unresolved: List[str] = []
+            for ax in selected_axes:
+                axis_no = AXIS_NO[ax]
+                st, _ = self.ctrl.query_status(axis_no)
+                side = self.ctrl.limit_direction(st)
+                if side in ("CW", "CCW"):
+                    # 離開方向＝目前所壓限位的反方向——原點復歸後座標
+                    # 幾乎必然停在某一側限位附近（見 CLAUDE.md〈座標 0
+                    # 幾乎就落在限位開關上〉），這是唯一站得住腳的自動
+                    # 判定依據。
+                    directions[ax] = "CCW" if side == "CW" else "CW"
+                else:
+                    unresolved.append(ax)
+            self.root.after(
+                0,
+                lambda: self._after_org_repeat_precheck(
+                    selected_axes, offsets, trials, directions, unresolved
+                ),
+            )
+
+        threading.Thread(target=_precheck, daemon=True).start()
+
+    def _after_org_repeat_precheck(
+        self, selected_axes, offsets, trials, directions, unresolved
+    ):
+        if unresolved:
+            manual = self._ask_org_repeat_directions(unresolved)
+            if manual is None:
+                self._org_repeat_start_btn.config(state="normal")
+                self._org_repeat_status_var.set("已取消")
+                return
+            directions.update(manual)
+        self._confirm_and_launch_org_repeat(selected_axes, offsets, trials, directions)
+
+    def _confirm_and_launch_org_repeat(self, selected_axes, offsets, trials, directions):
+        axes_txt = "、".join(selected_axes)
+        dir_txt = "、".join(f"{ax}={directions[ax]}" for ax in selected_axes)
+        offsets_txt = "、".join(str(o) for o in offsets)
+        n_combos = len(selected_axes) * len(offsets)
+
+        if not messagebox.askyesno(
+            "確認開始量測",
+            f"量測軸：{axes_txt}\n"
+            f"方向（自動判定或手動指定）：{dir_txt}\n"
+            f"測試 Offset：{offsets_txt}\n"
+            f"每組輪數：{trials}\n"
+            f"組合總數：{n_combos}\n\n"
+            f"預估時間：無法精確預估，視軸數／offset／速度而定，"
+            f"可能長達數十分鐘。\n\n"
+            f"⚠ 每個軸開始量測前，會先執行一次原點復歸建立基準\n"
+            f"　（不假設目前位置就是原點）。\n"
+            f"⚠ 量測期間會暫停該軸的韌體軟體限位，結束後自動還原。\n"
+            f"⚠ 量測進行中請勿手動點動同一軸，避免與量測動作互相干擾。\n"
+            f"⚠ 每個 (軸, offset) 組合只有在成功完成一次原點復歸時才會把\n"
+            f"　座標強制寫回 0；若中途失敗、逾時或被緊急停止中斷，滑台\n"
+            f"　可能停在非原點的任意位置，此時**不會**自動歸零，畫面會\n"
+            f"　明確警示，需重新執行原點復歸後才能繼續其他操作。\n\n"
+            f"確定要開始嗎？",
+            icon="warning", default="no",
+        ):
+            self._org_repeat_start_btn.config(state="normal")
+            self._org_repeat_status_var.set("已取消")
+            return
+
+        l, f_spd, r, s = self._get_spd()
+
+        # 早於執行緒啟動設旗標，避免 _update_stat_ui 的窗口期把按鈕解鎖
+        # （比照 _do_start_scan 的既有寫法）。
+        self._org_repeat_stop_event.clear()
+        self._org_repeat_running.set()
+        self._org_repeat_start_btn.config(state="disabled")
+        self._org_repeat_stop_btn.config(state="normal")
+        self._set_drive_buttons_state("disabled")
+        self._org_repeat_status_var.set("量測中…")
+        self._org_repeat_start_time = time.time()
+        self._org_repeat_progress_var.set("—")
+        for item in self._org_repeat_tree.get_children():
+            self._org_repeat_tree.delete(item)
+        self._org_repeat_csv_path_var.set("—")
+        self._org_repeat_json_path_var.set("—")
+
+        def _progress(axis, offset, trial, total_trials, residual, status):
+            self.root.after(
+                0,
+                lambda: self._on_org_repeat_progress(
+                    axis, offset, trial, total_trials, residual, status
+                ),
+            )
+
+        def _combo_done(axis, offset, result_dict):
+            self.root.after(0, lambda: self._on_org_repeat_combo_done(result_dict))
+
+        def _run():
+            try:
+                result = self.ctrl.measure_homing_repeatability(
+                    axes=selected_axes,
+                    offsets=offsets,
+                    trials=trials,
+                    l_speed=l, f_speed=f_spd, rate=r, s_rate=s,
+                    directions=directions,
+                    progress_cb=_progress,
+                    combo_done_cb=_combo_done,
+                    stop_event=self._org_repeat_stop_event,
+                )
+            except Exception as e:  # 背景執行緒的例外不可讓旗標卡在 set
+                # ⚠ `except X as e` 的 e 會在區塊結束時被自動 del，
+                # root.after(0, ...) 的 lambda 是非同步排程、真正執行時
+                # 區塊早已結束——直接在 lambda 裡引用 e 會是 NameError
+                # （_do_start_scan 的 _run() 已踩過同一個坑）。先轉成字串
+                # 存進區域變數，讓 lambda 捕捉的是它而非 e。
+                logger.exception("原點復歸重現性量測執行緒發生未預期例外")
+                err_msg = f"未預期例外: {e}"
+                self.root.after(0, lambda: self._on_org_repeat_done(None, err_msg))
+                return
+            self.root.after(0, lambda: self._on_org_repeat_done(result, None))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_org_repeat_progress(self, axis, offset, trial, total_trials, residual, status):
+        r_txt = "—" if residual is None else f"{residual:.1f} pulse"
+        self._org_repeat_progress_var.set(
+            f"{axis} 軸 · offset={offset} · 第 {trial}/{total_trials} 輪 · "
+            f"殘差 {r_txt} · {status}"
+        )
+
+    def _on_org_repeat_combo_done(self, result_dict: dict):
+        """每完成一個 (軸, offset) 組合就附加一列，不等全部跑完才顯示。"""
+        stats = result_dict.get("stats") or {}
+
+        def _fmt(v):
+            return "—" if v is None else f"{v:.2f}"
+
+        drift = stats.get("drift_detected")
+        if drift is None:
+            drift_txt = "—"
+        elif drift:
+            drift_txt = f"是（{_fmt(stats.get('drift_rate'))}/輪）"
+        else:
+            drift_txt = "否"
+
+        # offset 未脫離出發側限位開關作用區：資料有效但跟其他 offset
+        # 不可直接比較（M1 的免費副產品 left_switch 彙整而成），用
+        # CLR_WARN 標色而非 CLR_DANGER——那個顏色保留給 origin_lost
+        # 這種真正失敗、座標系已失準的情境，兩者嚴重度不同。
+        row_tags = ("below_switch",) if result_dict.get("offset_below_switch") else ()
+
+        self._org_repeat_tree.insert(
+            "", "end",
+            values=(
+                result_dict.get("axis", ""),
+                result_dict.get("offset", ""),
+                stats.get("n", 0),
+                _fmt(stats.get("range")),
+                _fmt(stats.get("sigma")),
+                _fmt(stats.get("median")),
+                drift_txt,
+                result_dict.get("note", "") or "",
+            ),
+            tags=row_tags,
+        )
+
+        # 🔴 座標系已失準是比一般失敗更嚴重的狀態（之後 goto 教點／限位
+        # 比對全部會跟著偏移），不能只靜靜躺在結果表格的備註欄裡等使用者
+        # 自己發現——跟撞限位同等級的嚴重度，用橫幅＋CLR_DANGER 主動示警
+        # （architect 2026-08-21 審查要求）。
+        if result_dict.get("origin_lost"):
+            ax = result_dict.get("axis", "?")
+            self._flash_banner(
+                f"🔴 {ax} 軸座標系已失準（原點復歸重現性量測中途中止，"
+                f"未強制歸零），請重新執行原點復歸後再操作",
+                20000,
+                color=CLR_DANGER,
+            )
+
+    def _on_org_repeat_done(self, result: Optional[dict], err: Optional[str]):
+        self._org_repeat_running.clear()
+        self._org_repeat_stop_btn.config(state="disabled")
+        self._org_repeat_start_btn.config(state="normal")
+        if self.ctrl.connected and not self.ctrl.ems_active:
+            self._set_drive_buttons_state("normal")
+
+        if err is not None:
+            self._org_repeat_status_var.set("發生例外")
+            self._flash_banner(f"⚠ 原點復歸重現性量測發生例外：{err}", 12000)
+            return
+        if result is None:
+            self._org_repeat_status_var.set("已中止")
+            return
+
+        aborted = bool(result.get("aborted"))
+        try:
+            csv_path, json_path = save_homing_repeat_result(result)
+        except OSError as e:
+            self._org_repeat_status_var.set("完成，但存檔失敗")
+            self._flash_banner(f"⚠ 量測完成，但存檔失敗：{e}", 12000)
+            self.ctrl._log("ERROR", f"[復歸重現性量測] 存檔失敗: {e}")
+            return
+
+        self._org_repeat_csv_path_var.set(csv_path)
+        self._org_repeat_json_path_var.set(json_path)
+        if aborted:
+            self._org_repeat_status_var.set("已中止，部分資料已存檔")
+            self._flash_banner("⚠ 原點復歸重現性量測已中止，部分資料已存檔", 8000)
+        else:
+            self._org_repeat_status_var.set("完成，已存檔")
+            self._flash_banner("✔ 原點復歸重現性量測完成，已存檔", 6000)
+
+    def _do_stop_org_repeat(self):
+        if self.ctrl.connected:
+            self.ctrl.stop()
+        self._org_repeat_stop_event.set()
+        self._org_repeat_status_var.set("停止中…")
+        self._org_repeat_stop_btn.config(state="disabled")
+
     def _build_card_datalog(self, scr):
         """實驗數據記錄（CSV）。屬於「觀測」，留在儀表板。"""
         data_card = self._card(scr, "實驗數據記錄（CSV）")
@@ -1687,6 +2259,15 @@ class DS102GUI:
         ).pack(side="left", padx=6)
         tk.Label(
             pos_row, text="pulse", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
+        ).pack(side="left", padx=(0, 4))
+        # 附加估算顯示，比照儀表板／Teaching 分頁的既有用法：沒有校正參數
+        # 就是空字串，不佔版面也不誤導。
+        tk.Label(
+            pos_row,
+            textvariable=self._ctrl_pos_um_var,
+            bg=CLR_CARD,
+            fg=CLR_MUTED,
+            font=("Segoe UI", 8),
         ).pack(side="left", padx=(0, 16))
 
         # 改寫座標暫存器（不產生任何移動）——預設留空，不可預填 0
@@ -1772,6 +2353,12 @@ class DS102GUI:
         # 調速是靠感覺反覆試出來的，兩者必須在同一個視野內。
         # 以前速度設定在儀表板，每次調整都要來回切兩次分頁。
         self._build_card_speed(scr)
+
+        # ── 原點復歸重現性量測，緊接在驅動按鈕／速度設定之後 ──
+        # 跟下方「連線後設定一次」那些卡片不同類：這是每次都要主動按
+        # 「開始量測」才會動的操作，不是連線後設一次就好的靜態設定，
+        # 所以放在分隔線之前。
+        self._build_card_origin_repeatability(scr)
 
         # ── 以下是「連線後設定一次」的東西，用分隔線與日常操作區隔 ──
         ttk.Separator(scr, orient="horizontal").pack(fill="x", padx=12, pady=(14, 6))
@@ -1860,14 +2447,21 @@ class DS102GUI:
 
     def _do_stop(self):
         self.ctrl.stop()
+        # 原點復歸重現性量測跑在自己的背景迴圈裡，沒有現成旗標可用
+        # （跟 _stop_playback 是同一類）。全域停止鍵理應也能讓它收工，
+        # 否則按下「■ Stop」滑台停了，量測執行緒卻繼續送下一輪指令。
+        if self._org_repeat_running.is_set():
+            self._org_repeat_stop_event.set()
 
     def _on_escape(self, event=None):
-        """Escape：停止所有軸，並中止進行中的重播。"""
+        """Escape：停止所有軸，並中止進行中的重播／量測。"""
         if not self.ctrl.connected:
             return
         self.ctrl.stop()
         if self.ctrl.playback_running:
             self._stop_playback.set()
+        if self._org_repeat_running.is_set():
+            self._org_repeat_stop_event.set()
         self._flash_banner("■ 已送出停止指令（Esc）", 4000)
 
     def _do_set_position(self):
@@ -1940,6 +2534,23 @@ class DS102GUI:
                 self.root.after(0, lambda: self._ctrl_pos_var.set(pos))
 
         threading.Thread(target=_q, daemon=True).start()
+
+    def _update_ctrl_pos_um(self, *_args):
+        """
+        移動控制分頁「Position:」旁的 um 估算附加顯示，純格式化、無 I/O。
+
+        掛在 _ctrl_pos_var 的 write trace 上，行為比照 _redraw_positions()／
+        _refresh_points() 既有的 estimate_um() 用法：沒有校正參數或當前軸
+        不明時顯示空字串，不猜測、不顯示 0。
+        """
+        ax = NO_AXIS.get(self.ctrl.axis_no)
+        um = None
+        if ax:
+            try:
+                um = self.ctrl.estimate_um(ax, float(self._ctrl_pos_var.get()))
+            except ValueError:
+                um = None
+        self._ctrl_pos_um_var.set(f"≈ {um:,.1f} μm" if um is not None else "")
 
     # =========================================================================
     # TAB：Teaching Points
@@ -3445,7 +4056,11 @@ class DS102GUI:
         )
 
         self._scan_canvas = FigureCanvasTkAgg(self._scan_fig, master=chart_card)
-        self._scan_canvas.draw()
+        # 用 draw_idle() 而非 draw()：建構當下圖表全空（沒有任何樣本點），
+        # 沒有必要在 __init__ 同步完成算圖，改成排進 Tk 主迴圈下一輪 idle
+        # 才畫，量測約省下 180~230ms 的啟動阻塞時間（gridspec + 中文字型
+        # 標籤的首次算版成本），視覺上沒有任何差異。
+        self._scan_canvas.draw_idle()
         self._scan_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
         # 圖表下方數值摘要：仿光功率分頁大數字卡片的視覺語言，字級小很多。
@@ -4303,6 +4918,14 @@ class DS102GUI:
 
     def _toggle_connect(self):
         if self.ctrl.connected:
+            # 原點復歸重現性量測若還在跑，中斷連線前要先讓它收工——
+            # 它跑在自己的背景迴圈裡，沒有現成旗標可用（跟 _stop_playback
+            # 是同一類）。少了這行，量測執行緒會繼續對已經 disconnect()
+            # 的序列埠打指令，最壞情況空等一輪 30s（_wait_axis_stop）
+            # 加一輪 180s（_wait_origin_done）逾時才會發現，卡住一個多
+            # 小時（architect 2026-08-21 審查建議）。
+            if self._org_repeat_running.is_set():
+                self._org_repeat_stop_event.set()
             # 先停再斷。少了這行，移動中按「中斷」會關掉 port 卻讓馬達繼續跑，
             # 程式從此失去對它的控制（_on_close 有做，這裡以前漏了）。
             self.ctrl.stop()
@@ -4363,6 +4986,14 @@ class DS102GUI:
                     if not enabled:
                         self._scan_axis_selected_vars[ax].set(False)
                 self._refresh_scan_entry_states()
+            # 原點復歸重現性量測分頁的量測軸勾選框，比照同一套邏輯。
+            org_repeat_checkbuttons = getattr(self, "_org_repeat_axis_checkbuttons", None)
+            if org_repeat_checkbuttons is not None:
+                for ax in AXES:
+                    enabled = int(AXIS_NO[ax]) <= self.ctrl.axis_count
+                    org_repeat_checkbuttons[ax].config(state="normal" if enabled else "disabled")
+                    if not enabled:
+                        self._org_repeat_axis_vars[ax].set(False)
             # 控制器設定是 RAM-only，斷電就沒了。連線時已嘗試從設定檔補回，
             # 這裡把結果告訴使用者：補了什麼、還缺什麼。
             # 復歸樣式下拉要填當前軸的實際值（設定檔還原之後才讀才準）
@@ -4962,6 +5593,13 @@ class DS102GUI:
                 if cb is not None:
                     cb.config(state="disabled")
             self._refresh_scan_entry_states()
+            # 原點復歸重現性量測的量測軸勾選框比照同一套邏輯——只在關閉
+            # 方向連動，重新 enable 一樣要靠 _on_connect_result 依
+            # axis_count 個別判斷。
+            for ax in AXES:
+                cb2 = getattr(self, "_org_repeat_axis_checkbuttons", {}).get(ax)
+                if cb2 is not None:
+                    cb2.config(state="disabled")
 
     def _toggle_ems(self):
         if not self.ctrl.ems_active:
@@ -5286,7 +5924,12 @@ class DS102GUI:
         # 所以 _do_home_all 剛鎖上的按鈕會在 100ms 後全部復活——包含那顆
         # 文字還停在「🏠 復歸中…」的按鈕，再按一次就疊出第二條復歸執行緒。
         # 任何新增的「作業進行中」狀態都必須同步加進這個判斷。
-        busy = self.ctrl.playback_running or self._homing.is_set() or self._scanning.is_set()
+        busy = (
+            self.ctrl.playback_running
+            or self._homing.is_set()
+            or self._scanning.is_set()
+            or self._org_repeat_running.is_set()
+        )
         if busy:
             self._set_drive_buttons_state("disabled")
         elif self.ctrl.connected and not self.ctrl.ems_active:
@@ -5366,6 +6009,9 @@ class DS102GUI:
                 if self._scanning.is_set():
                     elapsed = int(time.time() - self._scan_start_time)
                     self._scan_elapsed_var.set(f"{elapsed // 60:02d}:{elapsed % 60:02d}")
+                if self._org_repeat_running.is_set():
+                    elapsed = int(time.time() - self._org_repeat_start_time)
+                    self._org_repeat_elapsed_var.set(f"{elapsed // 60:02d}:{elapsed % 60:02d}")
                 # 這兩個都不做 I/O，純畫面同步。掛在這裡（而非
                 # _redraw_scan_plot）是因為那條鏈只在裝了 matplotlib 時
                 # 才會執行；這裡是唯一保證一定會跑的節奏。
@@ -5399,6 +6045,7 @@ class DS102GUI:
                     self.ctrl.connected
                     and not self.ctrl.playback_running
                     and not self.ctrl.scanning_active
+                    and not self.ctrl.measuring_active
                 ):
                     try:
                         self.ctrl.refresh_positions()
@@ -5414,6 +6061,10 @@ class DS102GUI:
     def _on_close(self):
         self._shutting_down.set()
         self._stop_playback.set()
+        # 原點復歸重現性量測跑在自己的迴圈裡（不是靠 _shutting_down 這類
+        # 現成旗標），關窗時要讓它知道視窗正在關閉才會主動收工，避免
+        # 背景執行緒繼續對已經 disconnect() 的序列埠打指令。
+        self._org_repeat_stop_event.set()
         if self._active_scanner is not None:
             # 比照 _stop_playback.set() 的既有模式：尋光執行中關窗，要讓
             # 背景執行緒知道視窗正在關閉才會主動收工。沒有這行，_run()
