@@ -1202,3 +1202,58 @@ class TestPmFloatWindowToggle:
             g._pm_float_open.set(False)
             g._toggle_pm_float_window()
             assert g._pm_float_win is None
+
+
+class TestPmFloatPosition:
+    """
+    案例 u ~ z：浮動視窗的定位計算 `_pm_float_position()`。
+
+    2026-08-26 使用者回報「全螢幕下會消失」：主視窗預設 state("zoomed")
+    最大化開機，此時「主視窗右緣 + 10」必定超出螢幕右緣，視窗被建立在
+    看不到的地方。這裡用假的螢幕／視窗尺寸驗證各種組合，不需要真的把
+    測試視窗最大化（`_pm_float_position()` 刻意寫成不碰 tkinter 的純函式）。
+    """
+
+    W, H = 260, 200
+    SCREEN = (1920, 1080)
+
+    def _pos(self, root_geom):
+        return main_ai.DS102GUI._pm_float_position(
+            *root_geom, *self.SCREEN, self.W, self.H
+        )
+
+    def test_maximized_stays_on_screen(self, gui):
+        """案例 u（回歸主體）：主視窗最大化 -> 視窗仍完整落在螢幕內。"""
+        x, y = self._pos((0, 0, 1920, 1040))
+        assert 0 <= x and x + self.W <= self.SCREEN[0]
+        assert 0 <= y and y + self.H <= self.SCREEN[1]
+
+    def test_maximized_goes_inside_top_right(self, gui):
+        """案例 v：最大化時退回主視窗內側右上角，而不是硬夾在螢幕邊緣外。"""
+        x, y = self._pos((0, 0, 1920, 1040))
+        assert x == 1920 - self.W - 10
+
+    def test_windowed_prefers_outside_right(self, gui):
+        """案例 w：主視窗沒佔滿螢幕時，維持原本「右緣外側」的行為。"""
+        x, y = self._pos((100, 50, 1020, 720))
+        assert x == 100 + 1020 + 10
+        assert y == 50 + 10
+
+    def test_narrow_screen_clamped_not_negative(self, gui):
+        """案例 x：視窗比螢幕還寬的極端情況 -> x 夾在 0，不會是負數。"""
+        x, y = main_ai.DS102GUI._pm_float_position(0, 0, 200, 200, 200, 200, self.W, self.H)
+        assert x == 0 and y == 0
+
+    def test_root_at_negative_coords(self, gui):
+        """案例 y：主視窗被拖到負座標 -> 浮動視窗不跟著被帶出螢幕。"""
+        x, y = self._pos((-1500, -300, 1020, 720))
+        assert x >= 0 and y >= 0
+
+    def test_root_beyond_screen_width_uses_inside(self, gui):
+        """案例 z：主視窗在右側第二螢幕（超出 winfo_screenwidth）-> 走內側位置。
+
+        內側位置只要主視窗看得到就一定看得到，最差只是保守地放進主視窗裡，
+        不會消失（多螢幕的實際可視範圍 tkinter 問不到，這裡刻意取保守解）。
+        """
+        x, y = self._pos((2000, 100, 1200, 800))
+        assert x + self.W <= self.SCREEN[0]

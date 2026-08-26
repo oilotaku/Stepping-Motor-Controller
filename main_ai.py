@@ -283,6 +283,11 @@ ORG_MODES = [f"ORG {i}" for i in range(1, 13)]
 # 四軸約 0.22s，設 0.5s 讓序列埠仍有餘裕給移動中的到位輪詢。
 # 可由 recordings/app_settings.json 的 position_poll_interval 覆寫（純 UI 節奏，無安全含意）。
 POSITION_POLL_INTERVAL = _app_setting_num(_app_settings, "position_poll_interval", 0.5, float)
+
+# 光功率浮動視窗的固定尺寸（win.resizable(False, False)，不讓使用者調整）。
+# 定位邏輯見 DS102GUI._pm_float_position()。
+PM_FLOAT_W = 260
+PM_FLOAT_H = 200
 # GUI LOG 文字框保留的最大行數，超過就從頭截掉。
 # 可由 app_settings.json 的 log_text_max_lines 覆寫。
 LOG_TEXT_MAX_LINES = _app_setting_num(_app_settings, "log_text_max_lines", 2000, int)
@@ -5329,6 +5334,39 @@ class DS102GUI:
             except tk.TclError:
                 pass
 
+    @staticmethod
+    def _pm_float_position(root_x, root_y, root_w, root_h,
+                           screen_w, screen_h, win_w, win_h, margin=10):
+        """
+        算出光功率浮動視窗要開在哪裡，回傳 (x, y)。
+
+        🔴 **主視窗預設是最大化開機**（`_build_window()` 的
+        `state("zoomed")`），此時「主視窗右緣 + 10」必定落在螢幕外，
+        視窗會被建立在看不到的地方——2026-08-26 使用者回報「全螢幕下
+        會消失」即此。原本那段程式的註解還寫著「簡單且不會跑到螢幕外」，
+        正好寫反：它只在主視窗沒有佔滿螢幕寬度時才成立。
+
+        規則：優先放在主視窗右緣外側（不擋操作區）；只要那個位置會超出
+        螢幕右緣，就退回主視窗**內側**右上角。內側位置只要主視窗本身看得
+        到就一定看得到，所以多螢幕情境下最差也只是保守地放進主視窗裡，
+        不會消失。最後再把 x／y 夾回螢幕範圍，避免主視窗被拖到負座標
+        或螢幕外時把浮動視窗一起帶出去。
+
+        寫成不碰 tkinter 的純函式（引數全部由呼叫端量測後傳入），是為了
+        能直接用假數值驗證各種螢幕／視窗尺寸組合，不必真的把測試視窗
+        最大化——見 verify_meter_panel.py::TestPmFloatPosition。
+        """
+        x = root_x + root_w + margin
+        if x + win_w > screen_w:
+            # 放不下 → 改放主視窗內側右上角
+            x = root_x + root_w - win_w - margin
+        y = root_y + margin
+
+        # 夾回螢幕範圍（左上優先，寧可蓋住一點也不要看不見）
+        x = max(0, min(x, screen_w - win_w))
+        y = max(0, min(y, screen_h - win_h))
+        return x, y
+
     def _toggle_pm_float_window(self):
         """
         開關獨立光功率浮動視窗（供移動控制／光功率兩分頁的核取方塊共用）。
@@ -5358,12 +5396,17 @@ class DS102GUI:
         win.attributes("-topmost", True)
         win.protocol("WM_DELETE_WINDOW", self._close_pm_float_window)
 
-        # 定位在主視窗右上角外側，避免蓋住主視窗操作區。
-        # 不記憶上次位置——每次開啟都重新算一次，簡單且不會跑到螢幕外。
+        # 定位在主視窗右上角外側，避免蓋住主視窗操作區；放不下就改放到
+        # 主視窗**內側**右上角（見 _pm_float_position() 的成因說明）。
+        # 不記憶上次位置——每次開啟都重新算一次。
         self.root.update_idletasks()
-        x = self.root.winfo_x() + self.root.winfo_width() + 10
-        y = self.root.winfo_y()
-        win.geometry(f"260x200+{x}+{y}")
+        x, y = self._pm_float_position(
+            self.root.winfo_x(), self.root.winfo_y(),
+            self.root.winfo_width(), self.root.winfo_height(),
+            self.root.winfo_screenwidth(), self.root.winfo_screenheight(),
+            PM_FLOAT_W, PM_FLOAT_H,
+        )
+        win.geometry(f"{PM_FLOAT_W}x{PM_FLOAT_H}+{x}+{y}")
 
         # --- 狀態列（燈 + 文字 / channel·波長）---
         status_row = tk.Frame(win, bg=CLR_CARD)
