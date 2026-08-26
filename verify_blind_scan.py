@@ -149,6 +149,25 @@ def make_flat_query(base=-75.0):
     return q
 
 
+def make_peaked_query(ctrl, axis="X", center=30.0, amp=100.0, k=0.05):
+    """
+    有明顯高斯峰值（用二次曲線近似）情境：峰值在 center。
+
+    ⚠ 刻意疊上 `_FLAT_NOISE` 的微小擾動。完全無雜訊時 `calibrate_noise()`
+    會量到 σ=0，而 `_check_signal_detectable()` 在 `σ<=0` 時直接 return
+    （無法計算期望全距），連「有訊號」的判定也一併跳過——那會讓本檔測
+    `_signal_confirmed` 的案例失去意義。真實儀器不可能零雜訊。
+    """
+    idx = {"i": -1}
+
+    def q():
+        idx["i"] += 1
+        noise = _FLAT_NOISE[idx["i"] % len(_FLAT_NOISE)]
+        return True, amp - k * (ctrl.positions_machine[axis] - center) ** 2 + noise
+
+    return q
+
+
 def make_offset_peak_query(ctrl, peak, base=-75.0, amp=40.0, width=300.0):
     """
     只有走到 `peak` 附近才量得到訊號，其餘位置貼在底噪上。
@@ -251,12 +270,72 @@ class TestDeadMeterAbortsImmediately:
         assert q.calls["n"] <= 6  # calibrate_noise 預設 5 次，容一次餘裕
         assert ctrl.move_log == []  # 一步都不該動
 
-    def test_blind_search_also_refuses_without_baseline(self):
-        scanner, _ = make_scanner(make_dead_meter_query(), blind_mode="always")
+    def test_off_mode_message_points_at_range_setting(self, tmp_path):
+        """blind_mode="off" 時維持「立刻中止並直指量程」的行為。"""
+        scanner, _ = make_scanner(
+            make_dead_meter_query(), ctrl=FakeCtrl(axes=("X", "Y")), blind_mode="off",
+        )
+        scanner.run(initial_step={"X": 100, "Y": 100}, scan_dir=tmp_path)
+        assert "量程" in (scanner.last_abort_reason or "")
+
+
+# =============================================================================
+# 三之二、底噪本身不可量測時的退化判準
+#
+# 🔴 2026-08-26 第一版把「起點讀不到值」當成不能盲搜的理由而直接中止，
+# 那是判斷錯誤：sentinel（+9.9E+37）的語意是「低於可量測下限」，是明確
+# 資訊而非未知——在連底噪都測不到的環境裡，任何一個讀得到的有效值本身
+# 就已經高於底噪。實機 log 13:57／13:59 兩次全 sentinel，使用者選了 auto
+# 模式卻直接看到「未偵測訊號」，盲搜一次都沒跑到。
+# =============================================================================
+class TestUnreadableBaseline:
+    def test_blind_runs_and_sweeps_without_baseline(self):
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        scanner, _ = make_scanner(
+            make_dead_meter_query(), ctrl=ctrl,
+            blind_mode="always", blind_step=100, blind_max_radius=200,
+        )
         scanner.calibrate_noise()
+        assert scanner._noise_baseline is None
         with pytest.raises(fs.NoSignalAbort) as ei:
             scanner.run_stage0_blind()
-        assert "沒有可用的底噪基準" in str(ei.value)
+        # 真的掃了（不是拒絕執行），而且訊息說明是「全程低於可量測下限」
+        assert "掃完" in str(ei.value)
+        assert "低於儀器可量測下限" in str(ei.value)
+        assert ctrl.move_log  # 滑台確實動過
+
+    def test_any_readable_point_counts_as_signal(self):
+        """底噪不可量測時，掃到第一個讀得到的點就算找到訊號。"""
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        state = {"n": 0}
+
+        def q():
+            state["n"] += 1
+            # 前 8 次（含雜訊校準的 5 次）全部讀不到，之後開始讀得到
+            if state["n"] <= 8:
+                return False, 0.0
+            return True, -55.0
+
+        scanner, _ = make_scanner(
+            q, ctrl=ctrl, blind_mode="always", blind_step=100, blind_max_radius=400,
+        )
+        scanner.calibrate_noise()
+        assert scanner._noise_baseline is None
+        assert scanner.run_stage0_blind() is True
+
+    def test_auto_mode_reaches_blind_when_baseline_unreadable(self, tmp_path):
+        """實機 log 13:57／13:59 的回歸鎖：auto 模式必須真的跑到盲搜。"""
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        logs = []
+        scanner, _ = make_scanner(
+            make_dead_meter_query(), ctrl=ctrl, blind_mode="auto",
+            blind_step=100, blind_max_radius=200,
+            progress_cb=lambda m: logs.append(m),
+        )
+        scanner.run(initial_step={"X": 100, "Y": 100}, scan_dir=tmp_path)
+        assert any("直接進入階段零盲搜" in m for m in logs)
+        assert any("階段零（盲搜）開始" in m for m in logs)
+        assert ctrl.move_log  # 不再是「一步都不動」
 
 
 # =============================================================================
@@ -493,3 +572,75 @@ class TestSignalFoundCallback:
         scanner.run(initial_step={"X": 20, "Y": 20}, scan_dir=tmp_path)
         # run() 開頭重置後，這一輪是純雜訊、沒確認到訊號，所以仍是 False
         assert scanner._signal_confirmed is False
+
+
+# =============================================================================
+# 八、階段一「正常收斂但從未偵測到訊號」也要補盲搜
+#
+# 實機 log 13:08：X 軸撞限位使第一輪只收到 11 筆樣本，有效的不足 4 個，
+# `_check_signal_detectable()` 走「樣本太少，不誤殺」的放行分支，接著
+# `total_improvement < noise_floor` 讓外層迴圈 break——run_stage1 就這樣
+# **正常 return**，沒有拋 NoSignalAbort。第一版只攔例外，於是沒有盲搜，
+# 最後由階段二丟出「起點量測失敗」。判準因此改成 `_signal_confirmed` 旗標。
+# =============================================================================
+class TestStage1ConvergesWithoutSignal:
+    def test_auto_mode_falls_back_after_silent_convergence(self, tmp_path):
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        logs = []
+        # 讀值有效但完全平坦，且限制樣本數：X 軸行程極窄 -> 探測很快撞限位
+        scanner, _ = make_scanner(
+            make_flat_query(), ctrl=ctrl, blind_mode="auto",
+            blind_step=100, blind_max_radius=200,
+            abort_if_no_signal=False,  # 關掉中止 -> 階段一必定「正常收斂」
+            progress_cb=lambda m: logs.append(m),
+        )
+        scanner.run(initial_step={"X": 20, "Y": 20}, scan_dir=tmp_path)
+        assert any("階段零（盲搜）開始" in m for m in logs),             "階段一正常收斂但從未確認訊號時，auto 模式仍必須補跑盲搜"
+
+    def test_abort_switch_off_still_evaluates_signal(self):
+        """
+        關掉「無訊號時中止」不可連「有訊號」的判定也一起跳過——否則
+        `_signal_confirmed` 永遠是 False，run() 會誤以為從未偵測到訊號。
+        """
+        ctrl = FakeCtrl(axes=("X",))
+        scanner, _ = make_scanner(
+            make_peaked_query(ctrl), ctrl=ctrl, abort_if_no_signal=False,
+        )
+        scanner.calibrate_noise()
+        scanner.run_stage1({"X": 64})
+        assert scanner._signal_confirmed is True
+
+    def test_no_blind_when_already_on_signal(self, tmp_path):
+        """
+        已經站在訊號上、只是樣本數不足以讓判準表態時，不該白跑一輪盲搜。
+        `_power_clearly_above_baseline()` 就是為此存在。
+        """
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        logs = []
+        scanner, _ = make_scanner(
+            make_peaked_query(ctrl, axis="X"), ctrl=ctrl, blind_mode="auto",
+            blind_step=100, blind_max_radius=1000,
+            progress_cb=lambda m: logs.append(m),
+        )
+        scanner.run(initial_step={"X": 64, "Y": 64}, scan_dir=tmp_path)
+        assert not any("階段零（盲搜）開始" in m for m in logs)
+
+    def test_power_check_returns_actual_reading_not_bool(self):
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        scanner, _ = make_scanner(lambda: (True, -20.0), ctrl=ctrl)
+        scanner._noise_baseline = -70.0
+        scanner._noise_sigma = 0.1
+        assert scanner._power_clearly_above_baseline() == -20.0
+
+    def test_power_check_returns_none_below_threshold(self):
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        scanner, _ = make_scanner(lambda: (True, -69.9), ctrl=ctrl)
+        scanner._noise_baseline = -70.0
+        scanner._noise_sigma = 0.0
+        assert scanner._power_clearly_above_baseline() is None
+
+    def test_power_check_treats_readable_as_signal_when_baseline_unreadable(self):
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        scanner, _ = make_scanner(lambda: (True, -80.0), ctrl=ctrl)
+        scanner._noise_baseline = None
+        assert scanner._power_clearly_above_baseline() == -80.0

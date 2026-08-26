@@ -483,32 +483,72 @@ class FiberAlignmentScanner:
             start_pos = dict(self.ctrl.positions_machine)
 
             self.calibrate_noise()
-            if self._noise_baseline is None:
-                # 連底噪都讀不到＝光功率計沒有給出任何可用的數字，盲搜也
-                # 救不了（每個格點一樣讀不到，無從比較）。立刻中止並直指
-                # 儀器，不要讓它空轉整個階段一之後才由階段二丟出誤導訊息
-                # ——那正是 2026-08-26「尋光無動作」事故的樣子。
+
+            # ── 決定要不要先跑階段零 ──
+            # 「起點連底噪都讀不到」曾經被當成 fatal 直接中止（2026-08-26
+            # 第一版），那是錯的：sentinel 的語意是「低於可量測下限」，是
+            # 明確資訊而非未知，盲搜在這種情況下反而最該跑。實機 log 證實
+            # 了這個判斷失誤——13:57／13:59 兩次全 sentinel，使用者選了
+            # auto 模式卻直接看到「未偵測訊號」，盲搜一次都沒跑到。
+            no_baseline = self._noise_baseline is None
+            if no_baseline and self.blind_mode == "off":
+                # 只有明確關掉盲搜時才維持「立刻中止並直指儀器」的行為。
                 raise NoSignalAbort(
                     "光功率計在起始位置完全讀不到有效值，無法開始尋光。"
                     "最常見的原因是量程設定不涵蓋目前功率——無光時固定量程"
                     "會 underrange，儀器回傳 +9.9E+37 而非數值；其次是光學頭"
-                    "未接或 GPIB 通訊異常。請改用自動量程後重試。"
+                    "未接或 GPIB 通訊異常。請改用自動量程後重試，或啟用階段零盲搜。"
                 )
 
-            if self.blind_mode == "always":
+            if no_baseline:
+                self._log("起點讀不到任何有效功率值 → 直接進入階段零盲搜")
+            if no_baseline or self.blind_mode == "always":
                 self.run_stage0_blind(center=start_pos)
                 self.calibrate_noise()  # 新位置的底噪與起點不同，重新建立基準
 
+            # ── 階段一，必要時回頭補盲搜 ──
+            # 🔴 判準是「跑完階段一有沒有確認到訊號」（self._signal_confirmed），
+            # 不是「階段一有沒有拋 NoSignalAbort」。第一版只攔例外，漏掉了
+            # 階段一**正常收斂結束**卻從未偵測到訊號的情況：
+            # `_check_signal_detectable()` 在有效樣本 <4 時走「樣本太少，
+            # 不誤殺」的放行分支，接著 `total_improvement < noise_floor`
+            # 讓外層迴圈 break，run_stage1 就這樣正常 return。實機 log
+            # 13:08 正是如此——X 軸撞限位使該輪只收到 11 筆樣本、有效的
+            # 更少，於是「階段一收斂」→ 沒有例外 → 沒有盲搜 → 階段二丟出
+            # 「起點量測失敗」。用旗標判斷同時涵蓋這兩條路徑。
+            stage1_aborted_no_signal = False
             try:
                 self.run_stage1(initial_step)
             except NoSignalAbort:
                 if self.blind_mode != "auto":
                     raise
-                # 🔴 只攔 NoSignalAbort，不攔 ScanAbort 本身：使用者主動
-                # 停止與 EMS 觸發也是 ScanAbort，那兩種絕對不可以自動接著
-                # 跑一輪會驅動滑台上千個格點的盲搜。子類別存在的理由就是
-                # 這個分辨（見 NoSignalAbort 的 docstring）。
-                self._log("階段一未偵測到高於雜訊的訊號 → 回到起點改跑階段零盲搜")
+                stage1_aborted_no_signal = True
+
+            if (
+                self.blind_mode == "auto"
+                and not self._signal_confirmed
+                and not stage1_aborted_no_signal
+            ):
+                here = self._power_clearly_above_baseline()
+                if here is not None:
+                    # 已經站在訊號上，只是樣本數不足以讓判準表態——不必盲搜。
+                    self._log(
+                        f"階段一結束時當下功率 {here:.4f} dBm 已明顯高於基準，"
+                        "判定有訊號，略過階段零盲搜"
+                    )
+                    self._confirm_signal(here)
+
+            if self.blind_mode == "auto" and not self._signal_confirmed:
+                # 🔴 這裡刻意不寫成 `except ScanAbort`：使用者主動停止與
+                # EMS 觸發也是 ScanAbort，那兩種絕對不可以自動接著跑一輪
+                # 會驅動滑台上千個格點的盲搜。它們會直接往外傳，根本走不
+                # 到這一行——NoSignalAbort 子類別存在的理由就是這個分辨。
+                reason = (
+                    "階段一未偵測到高於雜訊的訊號"
+                    if stage1_aborted_no_signal
+                    else "階段一已收斂但全程未確認到訊號"
+                )
+                self._log(f"{reason} → 回到起點改跑階段零盲搜")
                 self.run_stage0_blind(center=start_pos)
                 self.calibrate_noise()
                 self.run_stage1(initial_step)
@@ -538,6 +578,33 @@ class FiberAlignmentScanner:
     # ------------------------------------------------------------------
     # 階段零：盲搜粗掃（無訊號時才用得上）
     # ------------------------------------------------------------------
+    def _power_clearly_above_baseline(self) -> Optional[float]:
+        """
+        當下位置的功率是否明顯高於校準時的基準？量一次、不移動。
+
+        用途：階段一跑完但 `_signal_confirmed` 仍是 False 時，區分兩種
+        情況——(a) 真的沒訊號，該去盲搜；(b) 其實已經站在訊號上，只是
+        `_check_signal_detectable()` 因為有效樣本不足 4 個而無從判定
+        （實機 log 13:08：X 軸撞限位使該輪只收到 11 筆樣本）。沒有這道
+        檢查，(b) 會白跑一輪上百格點的盲搜。
+
+        用的門檻與盲搜完全相同，避免兩處判準不一致造成「盲搜認為找到了、
+        這裡認為沒有」的來回擺盪。
+
+        回傳判定為有訊號時的當下讀值，否則 None（讀不到或未達門檻）。
+        回傳數值而非 bool 是為了讓呼叫端能把真實功率傳進 `_confirm_signal()`
+        ——那個值會出現在 log 與量程鎖定的訊息裡，塞一個假的 0.0 會誤導。
+        """
+        s = self._measure_here()
+        if not s.ok or s.power is None:
+            return None
+        if self._noise_baseline is None:
+            # 校準時連底噪都讀不到，現在讀得到＝確定有東西（同盲搜的退化判準）
+            return s.power
+        sigma = self._noise_sigma or 0.0
+        delta = max(self.blind_signal_sigma_mult * sigma, self.blind_signal_min_delta_db)
+        return s.power if s.power >= self._noise_baseline + delta else None
+
     def _blind_axis_pair(self, axes: List[str]) -> Tuple[str, str]:
         """
         決定盲搜要掃哪兩個軸。
@@ -637,27 +704,40 @@ class FiberAlignmentScanner:
             raise ScanAbort("沒有可動的軸")
         ax_a, ax_b = self._blind_axis_pair(axes)
 
+        # 🔴 底噪讀不到值**不是**不能盲搜的理由，這點 2026-08-26 第一版判斷
+        # 錯了。sentinel（+9.9E+37）的語意是「功率低於目前可量測下限」，那是
+        # 明確的資訊，不是「不知道」——在連底噪都測不到的環境裡，任何一個
+        # 讀得到的有效值本身就已經高於底噪，直接當成找到訊號即可。第一版讓
+        # run() 在這種情況下直接中止，等於把盲搜最該派上用場的情境擋掉了
+        # （實機 log：13:57／13:59 兩次全 sentinel，連盲搜都沒跑到）。
         if self._noise_baseline is None:
-            raise NoSignalAbort(
-                "盲搜無法開始：光功率計在起始位置讀不到任何有效值，"
-                "沒有可用的底噪基準。請先確認量程設定（無光時固定量程會"
-                " underrange）與光學頭連接狀態。"
+            target_power = None
+            self._log(
+                "階段零（盲搜）：起點底噪低於儀器可量測下限（每次讀值都是 sentinel），"
+                "改用退化判準——掃到任何一個讀得到的有效值就視為找到訊號"
             )
-
-        sigma = self._noise_sigma or 0.0
-        delta_thresh = max(self.blind_signal_sigma_mult * sigma, self.blind_signal_min_delta_db)
-        target_power = self._noise_baseline + delta_thresh
+        else:
+            sigma = self._noise_sigma or 0.0
+            delta_thresh = max(
+                self.blind_signal_sigma_mult * sigma, self.blind_signal_min_delta_db
+            )
+            target_power = self._noise_baseline + delta_thresh
 
         if center is not None:
             self._return_to_machine(center, axes)
 
         offsets = list(_rect_spiral_offsets(self.blind_step, self.blind_max_radius))
         center = dict(self.ctrl.positions_machine)
+        if target_power is None:
+            thresh_desc = "訊號門檻：任何有效讀值（底噪不可量測）"
+        else:
+            thresh_desc = (
+                f"訊號門檻 {target_power:.4f} dBm"
+                f"（基準 {self._noise_baseline:.4f} + {delta_thresh:.4f}）"
+            )
         self._log(
             f"階段零（盲搜）開始：{ax_a}-{ax_b} 平面，格距 {self.blind_step} pulse，"
-            f"最大半徑 {self.blind_max_radius} pulse，共 {len(offsets)} 個格點；"
-            f"訊號門檻 {target_power:.4f} dBm"
-            f"（基準 {self._noise_baseline:.4f} + {delta_thresh:.4f}）"
+            f"最大半徑 {self.blind_max_radius} pulse，共 {len(offsets)} 個格點；{thresh_desc}"
         )
 
         measured = 0
@@ -686,11 +766,12 @@ class FiberAlignmentScanner:
 
             s = self._measure_here()
             measured += 1
-            if s.ok and s.power is not None and s.power >= target_power:
+            if s.ok and s.power is not None and (target_power is None or s.power >= target_power):
+                gate = "任何有效讀值" if target_power is None else f"{target_power:.4f}"
                 self._log(
                     f"階段零找到訊號：第 {idx + 1}/{len(offsets)} 個格點，"
                     f"偏移 ({ax_a}{da:+d}, {ax_b}{db:+d})，"
-                    f"功率 {s.power:.4f} dBm（門檻 {target_power:.4f}）。"
+                    f"功率 {s.power:.4f} dBm（門檻 {gate}）。"
                     "改由階段一接手精細收斂。"
                 )
                 self._confirm_signal(s.power)
@@ -706,7 +787,12 @@ class FiberAlignmentScanner:
             f"階段零盲搜已掃完 {ax_a}-{ax_b} 平面上 {measured} 個格點"
             f"（格距 {self.blind_step} pulse、半徑 {self.blind_max_radius} pulse，"
             f"另有 {blocked} 點因超出行程或撞限位而略過），"
-            f"沒有任何一點的功率達到門檻 {target_power:.4f} dBm。"
+            + (
+                "沒有任何一點讀到有效功率值（全程都低於儀器可量測下限）。"
+                if target_power is None
+                else f"沒有任何一點的功率達到門檻 {target_power:.4f} dBm。"
+            )
+            + 
             "請確認光源已開啟、光纖已插好，或擴大盲搜半徑／改掃另一組軸"
             "（例如耦合距離不對時要先調整 Z 軸再重掃）。"
         )
@@ -774,8 +860,16 @@ class FiberAlignmentScanner:
             # 統計期望值只隨樣本數對數成長，目前門檻在合理樣本數下有安全餘裕。
             # 第 1 輪跑完就直接檢查，不必等 total_improvement 這個有偏誤的
             # 中介指標開線燈。
-            if cycle == 1 and self.abort_if_no_signal:
-                self._check_signal_detectable(self.samples[stage1_start_idx:])
+            # 🔴 一律呼叫（不再被 abort_if_no_signal 整個 gate 掉），只有
+            # 「判定沒訊號時要不要拋例外」受那個開關控制。原因：這個函式
+            # 同時負責在**有**訊號時設起 `_signal_confirmed`（供量程鎖定與
+            # run() 判斷要不要補盲搜），關掉開關等於連「有訊號」這個判定
+            # 也一併跳過，run() 會誤以為從未偵測到訊號而多跑一輪盲搜。
+            if cycle == 1:
+                self._check_signal_detectable(
+                    self.samples[stage1_start_idx:],
+                    raise_on_no_signal=self.abort_if_no_signal,
+                )
 
             if total_improvement < self._noise_floor():
                 self._log("階段一收斂（本輪改善低於雜訊底限）")
@@ -1316,7 +1410,9 @@ class FiberAlignmentScanner:
             return 0.0  # 尚未校準：不設底限，保守起見一律相信讀值差異
         return self.noise_sigma_mult * self._noise_sigma
 
-    def _check_signal_detectable(self, cycle_samples: List[Sample]) -> None:
+    def _check_signal_detectable(
+        self, cycle_samples: List[Sample], raise_on_no_signal: bool = True
+    ) -> None:
         """
         階段一第 1 輪座標下降跑完就無條件呼叫一次（與本輪 total_improvement
         是否低於雜訊底限無關——原因見 run_stage1 呼叫處的註解），用來區分
@@ -1347,6 +1443,12 @@ class FiberAlignmentScanner:
         # 誤殺」而靜默放行，正是 2026-08-26「尋光無動作」事故裡讓 82 個
         # 全無效樣本一路溜過去、什麼警告都沒有的那個缺口。
         if not powers and len(cycle_samples) >= 4:
+            if not raise_on_no_signal:
+                self._log(
+                    f"⚠ 第一輪 {len(cycle_samples)} 次量測全部無效"
+                    "（已關閉「無訊號時中止」，繼續執行）"
+                )
+                return
             raise NoSignalAbort(
                 f"第一輪座標下降共量測 {len(cycle_samples)} 次，"
                 "但**沒有任何一次讀到有效功率值**——這不是「沒有光」，"
@@ -1374,6 +1476,13 @@ class FiberAlignmentScanner:
             return
 
         if rng <= threshold:
+            if not raise_on_no_signal:
+                self._log(
+                    f"⚠ 第一輪 {n} 個有效讀值的功率變化範圍僅 {rng:.4f}"
+                    f"（門檻 {threshold:.4f}），研判沒有訊號"
+                    "（已關閉「無訊號時中止」，繼續執行）"
+                )
+                return
             raise NoSignalAbort(
                 f"第一輪座標下降共 {n} 個有效讀值，功率變化範圍僅 "
                 f"{rng:.4f}（門檻 {threshold:.4f} = {self.no_signal_range_mult}x "

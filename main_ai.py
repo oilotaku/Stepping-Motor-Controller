@@ -3628,11 +3628,11 @@ class DS102GUI:
         # 刻意高估而非低估——低估會讓使用者以為只要幾分鐘而放著不管。
         secs = points * 0.25
         if secs < 90:
-            dur = f"約 {secs:.0f} 秒"
+            dur = f"{secs:.0f} 秒"
         elif secs < 5400:
-            dur = f"約 {secs / 60:.0f} 分鐘"
+            dur = f"{secs / 60:.0f} 分鐘"
         else:
-            dur = f"約 {secs / 3600:.1f} 小時"
+            dur = f"{secs / 3600:.1f} 小時"
         self._scan_blind_estimate_var.set(f"→ {points:,} 個格點，粗估 {dur}")
 
     def _set_scan_axis_selection(self, value: bool):
