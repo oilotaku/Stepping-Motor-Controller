@@ -428,6 +428,27 @@ ORIGIN_START_POLL = 0.1    # 寬限期內的快輪詢間隔（秒）
 # Driving」這條路徑會用到——Driving 一 assert 就切回 WAIT_INTERVAL 的
 # 節奏，正常復歸最多只多送 1～3 筆 SB1?。
 
+# 一般步進移動「有沒有真的起步」的判定參數（2026-08-26；CLAUDE.md 自
+# 2026-08-21 起記載的「孿生競態」技術債）。上面那組常數修的是
+# `_wait_origin_done()`，這組修的是它在 `_wait_axis_stop()` 的孿生體：
+# 舊語意 `status == "Stop"` 直接 return True，而實測 `GO CW` 的 Driving
+# assert 延遲同樣是 96ms、`_wait_axis_stop()` 第一次 `query_status()`
+# 要 SB3?+SB1? 兩次往返約 112ms——**餘裕只有約 16ms**。落在那個窗口裡
+# 就會把「還沒起步」讀成「已經停好」，`move_step(wait_done=True)` 在軸
+# 飛行中回報成功，下游 `goto_point()` 會提前送出下一軸、
+# `fiber_scanner._measure_here()` 會在移動中量光功率。
+#
+# 🔴 同 ORIGIN_* 那組，刻意不外部化成 safety_settings.json——那會讓維護
+# 人員可以把這道驗證整組調鬆到失去意義。
+#
+# GRACE 取 1.0s（對 96ms 約 10 倍餘裕）而非復歸那邊的 2.0s：步進移動
+# 本身可能只有幾毫秒，寬限期唯一的代價是「出發前就壓在該方向限位上」
+# 這種必定失敗的情境要多等這麼久才報錯，取短一點比較合理。
+MOVE_START_GRACE = 1.0     # 送出 GO CW/CCW 後容許 Driving 尚未 assert 的寬限期（秒）
+MOVE_START_POLL = 0.05     # 寬限期內的快輪詢間隔（秒）
+MOVE_POS_EPS = 1.0         # 「已走完預期行程」的容差（pulse），與量測路徑的 offset-1 同一慣例
+MOVE_MOTION_EPS = 1.0      # 「POS 確實變化過」的門檻（pulse）
+
 # 控制器設定檔（放在 RECORDING_DIR，與 teaching_points / speed_profiles 同區）。
 # 存的是 MEMSW0 復歸樣式與韌體軟體限位——這些都是 RAM-only，
 # 控制器一斷電就整組回到出廠值。
@@ -1477,6 +1498,11 @@ class DS102Controller:
         # 避免馬達震動期間讀到不可信的雜訊值）。
         with self._motion_scope():
             ax = NO_AXIS.get(axis_no)
+            # 送出前的機械座標，供 _wait_axis_stop() 的位移證據當基準
+            # （見該函式 docstring 的「孿生競態」段）。取的是快取值而非
+            # 另打一筆 POS?：熱路徑上多一次往返約 56ms，而快取在每次
+            # 移動結束時都被 query_status() 寫成當下實測值，起點是準的。
+            cur: Optional[float] = None
             if ax:
                 with self._lock:
                     cur = self._positions_pulse[ax]
@@ -1500,7 +1526,9 @@ class DS102Controller:
             self._log("INFO", f"步進 軸{axis_no} {direction} {amount} pulse", tx=cmd)
 
             if wait_done:
-                return self._wait_axis_stop(axis_no)
+                return self._wait_axis_stop(
+                    axis_no, start_pos=cur, expected_travel=pulse_amt
+                )
             return True
 
     def _do_origin_ex(
@@ -2773,28 +2801,119 @@ class DS102Controller:
     # =========================================================================
     # 到位等待（核心改善：確保步進完成後再繼續）
     # =========================================================================
-    def _wait_axis_stop(self, axis_no: str, timeout: float = WAIT_TIMEOUT) -> bool:
+    def _wait_axis_stop(
+        self,
+        axis_no: str,
+        timeout: float = WAIT_TIMEOUT,
+        start_pos: Optional[float] = None,
+        expected_travel: Optional[float] = None,
+    ) -> bool:
         """
         阻塞等待指定軸停止（SB1 bit6 Driving 旗標清除）。
         同時偵測異常狀態（Limit）並觸發警報回調。
-        回傳：True=正常停止，False=逾時或異常。
+        回傳：True=正常停止，False=逾時／異常／GO 未生效。
         此方法應在背景執行緒呼叫，避免凍結 UI。
+
+        🔴 **「非 Driving」不等於「移動已完成」**（2026-08-26 修，CLAUDE.md
+        自 2026-08-21 起記載的「孿生競態」）。舊寫法 `status == "Stop"` 直接
+        `return True`，而實測 `GO CW` 的 Driving assert 延遲是 96ms、本函式
+        第一次 `query_status()` 要 SB3?+SB1? 兩次往返約 112ms——餘裕只有約
+        16ms。落在那個窗口裡就會把「還沒起步」讀成「已經停好」，於是
+        `move_step(wait_done=True)` 在軸飛行中回報成功，`goto_point()` 提前
+        送出下一軸、`fiber_scanner._measure_here()` 在移動中量光功率。這與
+        `_wait_origin_done_ex()` 修掉的是同一個韌體特性，只是症狀不同。
+
+        判定沿用 `_wait_origin_done_ex()` 已經實機驗證過的三重證據配方，
+        但**只在寬限期內**要求證據——寬限期一過就回到舊語意：
+
+          1. `saw_driving`：看過 Driving assert（正常移動的主要路徑）。
+          2. 走完預期行程：`|POS - start_pos| >= expected_travel - MOVE_POS_EPS`。
+             這條是為「移動短到在第一次取樣之前就跑完」準備的——單看
+             Driving 會把它誤判成從未起步。容差 1 pulse，與量測路徑
+             `_wait_axis_stop_leaving_limit()` 的 `offset - 1` 同一慣例。
+          3. POS 相對**第一次取樣值**變化過：呼叫端沒傳 `start_pos` /
+             `expected_travel` 時的保底證據，涵蓋「短移動整段落在兩次取樣
+             之間」。
+
+        三者 OR。只有「Driving 從沒 assert、POS 完全沒動、且寬限期已過」
+        才判 GO 未生效並回傳 False——物理上就是什麼都沒發生。
+
+        🔴 寬限期外**刻意不**要求位移證據，這是與 CLAUDE.md 原本記載的
+        修法（無條件要求 `travelled >= expected - 1`）唯一的差異，理由是
+        後者會在使用者中途按「停止」時退化成空等到 `WAIT_TIMEOUT`(30s)：
+        `STOP 0` 讓軸提前停下，`travelled` 永遠達不到 expected。競態本身
+        純粹是「起步窗口」現象，把證據要求限縮在寬限期內就足以堵住它，
+        且寬限期之後的行為與改動前逐字相同，不影響任何既有路徑。
+
+        `start_pos` / `expected_travel` 皆為機械座標系 pulse（`query_status()`
+        回傳的 POS 就是機械座標），為 None 時只是少一條證據，不會誤報成功。
         """
-        deadline = time.time() + timeout
+        start_time = time.time()
+        deadline = start_time + timeout
+        saw_driving = False
+        first_pos: Optional[float] = None  # 第一次成功取樣到的 POS，證據 3 的基準
         while time.time() < deadline:
             if self.ems_active:
                 return False
             # query_status 內部已完成位置換算與寫入，此處不重複處理
-            status, _pos = self.query_status(axis_no)
+            status, pos = self.query_status(axis_no)
             # 記錄數據
             if self._data_logging:
                 self._record_data_point()
 
-            if status == "Stop":
-                return True
+            try:
+                pos_val: Optional[float] = float(pos)
+            except (ValueError, TypeError):
+                pos_val = None
+            if pos_val is not None and first_pos is None:
+                first_pos = pos_val
+
             if status == "Driving":
+                saw_driving = True
                 time.sleep(WAIT_INTERVAL)
                 continue
+
+            moved = self._move_evidence(pos_val, first_pos, start_pos, expected_travel)
+            within_grace = time.time() - start_time < MOVE_START_GRACE
+
+            if status == "Stop":
+                if saw_driving or moved:
+                    return True
+                if within_grace:
+                    # 從未看過 Driving、POS 也沒動，且還在寬限期內——無法
+                    # 分辨「GO 尚未生效」與「真的停好了」，續輪，不在這裡
+                    # 下任何結論。這裡用 MOVE_START_POLL 而非 WAIT_INTERVAL，
+                    # 理由同 _wait_origin_done_ex()：0.5s 的節奏對 96ms 的
+                    # assert 延遲解析度太差。
+                    time.sleep(MOVE_START_POLL)
+                    continue
+                ax = NO_AXIS.get(axis_no, axis_no)
+                self._log(
+                    "ERROR",
+                    f"軸 {ax} 移動未生效——Driving 未 assert 且 POS 未變化"
+                    f"（{start_pos if start_pos is not None else first_pos}"
+                    f"→{pos_val}），指令可能被韌體忽略",
+                )
+                if self._alarm_cb:
+                    self._alarm_cb(
+                        f"軸 {ax} 移動未生效", "GO 指令送出後未偵測到任何動作"
+                    )
+                return False
+
+            if not saw_driving and not moved and within_grace:
+                # 🔴 限位／異常狀態同樣可能只是「GO 還沒生效時讀到出發前就
+                # 壓著的那一顆限位」——例如從 CCW 限位上往 CW 走。舊寫法會
+                # 在這裡直接判失敗並發警報。續輪等 Driving assert 即可分辨：
+                # 真的走得掉就會轉成 Driving，走不掉則寬限期一過照樣報錯，
+                # 代價只是這種必定失敗的情境晚 1 秒才報。
+                #
+                # 🔴 這個 deferral 刻意排除 moved 成立的情況：那代表軸確實
+                # 走完了並停在限位上，是貨真價實的撞限位，必須照 2026-08-05
+                # 「撞限位不再靜默」的結論大聲報出來，不可因為有位移證據就
+                # 當成功回傳。
+                time.sleep(MOVE_START_POLL)
+                continue
+
             # 其他狀態（Limit / 異常）→ 記錄並觸發警報。
             # 這段一度被註解掉，加上呼叫端忽略回傳值，結果是撞限位全程靜默：
             # teaching point 超出行程時三軸會接連撞端點而畫面與 LOG 都沒有警告。
@@ -2806,6 +2925,65 @@ class DS102Controller:
 
         self._log("WARN", f"軸{axis_no} 等待到位逾時（{timeout}s）")
         return False
+
+    @staticmethod
+    def _move_evidence(
+        pos_val: Optional[float],
+        first_pos: Optional[float],
+        start_pos: Optional[float],
+        expected_travel: Optional[float],
+    ) -> bool:
+        """
+        `_wait_axis_stop()` 用的位移證據：軸是不是真的動過／已經走完。
+
+        兩條證據（見 `_wait_axis_stop()` docstring 的 2. 與 3.）任一成立
+        即可。純計算、無 I/O，讀不到 POS（None）時一律回傳 False——
+        缺證據時只會讓呼叫端繼續等，不會誤報成功。
+
+        `expected_travel <= 0`（例如 PULS 0）時第一條天然成立：
+        `0 >= 0 - MOVE_POS_EPS`，不需要另外特判。
+        """
+        if pos_val is None:
+            return False
+        if (
+            start_pos is not None
+            and expected_travel is not None
+            and abs(pos_val - start_pos) >= expected_travel - MOVE_POS_EPS
+        ):
+            return True
+        return first_pos is not None and abs(pos_val - first_pos) > MOVE_MOTION_EPS
+
+    def _replay_move_hint(
+        self, axis_no: str, tx: str
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        從重播的原始指令字串推出 `_wait_axis_stop()` 要的
+        (start_pos, expected_travel)，湊不出來就回 (None, None)。
+
+        只處理 `PULS n` + `GO CW/CCW` 這一種——本程式錄下來的有終點移動
+        只會是這種格式（見 CLAUDE.md〈DS102 通訊協定重點〉的四種指令）。
+        `GO ABS`/`GO HOME`/`GOTCH` 的行程與 PULS 無關，硬套會算出錯的
+        expected_travel，寧可不傳。
+
+        start_pos 取快取的機械座標：重播期間 position worker 被
+        `playback_running` 排除，快取由上一步的 `_wait_axis_stop()` 內
+        `query_status()` 更新；點動步驟不等到位時可能偏舊，但那只會讓
+        這條證據失效而已——證據不成立只是繼續等，不會誤報成功。
+        """
+        if not re.search(r":GO\s+(?:CW|CCW)\b", tx):
+            return None, None
+        m = re.search(r":PULS\s+(-?\d+(?:\.\d+)?)", tx)
+        if not m:
+            return None, None
+        ax = NO_AXIS.get(axis_no)
+        if not ax:
+            return None, None
+        try:
+            travel = abs(float(m.group(1)))
+        except ValueError:
+            return None, None
+        with self._lock:
+            return self._positions_pulse[ax], travel
 
     def _wait_axis_stop_leaving_limit(
         self,
@@ -2884,7 +3062,13 @@ class DS102Controller:
         self._log("WARN", f"軸{axis_no} 離開移動等待逾時（{timeout}s）")
         return False, False
 
-    def wait_axis_stop(self, axis_no: str, timeout: float = WAIT_TIMEOUT) -> bool:
+    def wait_axis_stop(
+        self,
+        axis_no: str,
+        timeout: float = WAIT_TIMEOUT,
+        start_pos: Optional[float] = None,
+        expected_travel: Optional[float] = None,
+    ) -> bool:
         """
         `_wait_axis_stop()` 的公開版本。
 
@@ -2893,8 +3077,13 @@ class DS102Controller:
         再依序等每一軸到位」，這個等待步驟因此要獨立於 move_step 之外被
         呼叫——供給 controller 以外的模組（fiber_scanner.py）使用，不必
         讓它碰底線用底線開頭的內部方法。
+
+        `start_pos` / `expected_travel` 直接轉交 `_wait_axis_stop()` 當位移
+        證據（機械座標 pulse）。搜尋演算法每次的移動量都很小、可能在第一次
+        取樣之前就跑完，這兩個參數是它避免被誤判成「GO 未生效」的關鍵，
+        呼叫端有值就該傳。
         """
-        return self._wait_axis_stop(axis_no, timeout)
+        return self._wait_axis_stop(axis_no, timeout, start_pos, expected_travel)
 
     # =========================================================================
     # 狀態查詢（對應 main.py update_status()）
@@ -3434,7 +3623,20 @@ class DS102Controller:
                         if _is_finite_move(tx):
                             ax_m = re.search(r"AXI(\d)", tx)
                             if ax_m:
-                                if not self._wait_axis_stop(ax_m.group(1)):
+                                # 從原始指令字串還原位移證據所需的兩個值，
+                                # 讓重播也受「孿生競態」那道保護（見
+                                # _wait_axis_stop docstring）。只認 CW/CCW
+                                # ——GO ABS/HOME/GOTCH 的行程跟 PULS 無關，
+                                # 湊不出 expected_travel 就傳 None，退回
+                                # 保底證據那條路徑。
+                                rec_start, rec_travel = self._replay_move_hint(
+                                    ax_m.group(1), tx
+                                )
+                                if not self._wait_axis_stop(
+                                    ax_m.group(1),
+                                    start_pos=rec_start,
+                                    expected_travel=rec_travel,
+                                ):
                                     self._log(
                                         "ERROR", "重播中某軸未能正常到位，已中止"
                                     )

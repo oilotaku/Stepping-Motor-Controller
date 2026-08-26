@@ -750,7 +750,13 @@ class FiberAlignmentScanner:
         if not active:
             return True
 
-        sent: List[str] = []
+        # 出發前先抓一份機械座標，供 wait_axis_stop() 的位移證據當基準
+        # （見 ds102_ctrl._wait_axis_stop 的「孿生競態」段）。搜尋的單步
+        # 移動量常常小到在第一次狀態取樣之前就跑完，少了這兩個值會被誤
+        # 判成「GO 未生效」——這裡有現成的 deltas，沒有理由不傳。
+        before = dict(self.ctrl.positions_machine)
+
+        sent: List[Tuple[str, str]] = []
         for ax, delta in active.items():
             axis_no = AXIS_NO[ax]
             direction = "CW" if delta > 0 else "CCW"
@@ -763,11 +769,15 @@ class FiberAlignmentScanner:
                 # 檢查擋下）——已出發的軸也要一併停止，不留半出發狀態。
                 self.ctrl.stop()
                 return False
-            sent.append(axis_no)
+            sent.append((axis_no, ax))
 
         all_arrived = True
-        for axis_no in sent:
-            if not self.ctrl.wait_axis_stop(axis_no):
+        for axis_no, ax in sent:
+            if not self.ctrl.wait_axis_stop(
+                axis_no,
+                start_pos=before.get(ax),
+                expected_travel=abs(active[ax]),
+            ):
                 all_arrived = False
 
         if not all_arrived:

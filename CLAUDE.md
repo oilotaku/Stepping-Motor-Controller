@@ -23,7 +23,7 @@ venv/Scripts/python.exe probe_ds102.py --list            # 只列埠，不送任
 venv/Scripts/python.exe -m serial.tools.list_ports -v    # 原始序列埠清單
 venv/Scripts/python.exe -m pip install -r requirements.txt
 venv/Scripts/python.exe -m ruff check .                  # ruff 未列於 requirements.txt，需另行安裝
-venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py -v  # 四支合計 203 項，不需硬體
+venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py verify_wait_axis_stop.py -v  # 五支合計 232 項，不需硬體
 venv/Scripts/python.exe -m pytest verify_scan_tab.py::TestUserStop -v          # 只跑某個 class／單一測試（VS Code Test Explorer 用同一套機制）
 ```
 
@@ -49,7 +49,7 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
 | [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝（PyVISA）。**已於 2026-08-12 整合進 GUI**（main_ai.py 直接 `from meter_GPIB import HP8153APowerMeter`），供「光功率」與「尋光」分頁使用；仍**未接上真實儀器驗證過**，本機沒有 GPIB 卡可測 |
 | [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`：光纖對準尋光演算法（座標下降＋K近鄰精修＋收尾微擾）。**已於 2026-08-13～17 分六階段接上 GUI**（main_ai.py 的「尋光」分頁），並補上 57 項假物件回歸測試（見下方〈光功率／尋光分頁〉）。本檔自己**仍刻意不 import main_ai.py**（避免循環相依），軸命名自成一份，main_ai.py 改軸命名時要同步 |
-| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) / [verify_fiber_scanner_signal.py](verify_fiber_scanner_signal.py) | 「尋光」／「光功率」分頁／軸機械校正參數／`fiber_scanner.py` 訊號有效性判準的假物件回歸測試（合計 187 項 pytest 測試函式，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py -v` 執行，VS Code Testing 面板也認得）。用假的 `ctrl` / `meter` 物件驅動邏輯，不需要真實硬體。`verify_fiber_scanner_signal.py` 是 2026-08-19 從某次 session 的 scratchpad 補進版控並轉成 pytest（原本是獨立可執行腳本），轉換時發現它的 `FakeCtrl` 沒有 `estimate_um()`，因為原腳本寫於 μm 快照功能（見下方〈存檔時的 μm 快照〉）加入之前——`_measure_here()` 現在無條件呼叫這個方法，補上回傳 `None` 的樁即可，不影響任何既有斷言 |
+| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) / [verify_fiber_scanner_signal.py](verify_fiber_scanner_signal.py) / [verify_wait_axis_stop.py](verify_wait_axis_stop.py) | 「尋光」／「光功率」分頁／軸機械校正參數／`fiber_scanner.py` 訊號有效性判準／`_wait_axis_stop()` 起步競態的假物件回歸測試（合計 216 項 pytest 測試函式，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py verify_wait_axis_stop.py -v` 執行，VS Code Testing 面板也認得）。用假的 `ctrl` / `meter` 物件驅動邏輯，不需要真實硬體。`verify_fiber_scanner_signal.py` 是 2026-08-19 從某次 session 的 scratchpad 補進版控並轉成 pytest（原本是獨立可執行腳本），轉換時發現它的 `FakeCtrl` 沒有 `estimate_um()`，因為原腳本寫於 μm 快照功能（見下方〈存檔時的 μm 快照〉）加入之前——`_measure_here()` 現在無條件呼叫這個方法，補上回傳 `None` 的樁即可，不影響任何既有斷言。`verify_wait_axis_stop.py` 是 2026-08-26 修〈孿生競態〉時新增的（29 項），它是唯一一支不建 GUI、直接對 `DS102Controller` 實例逐一 monkeypatch `query_status` 的測試檔，所以沒有用 `conftest.py` 的 `make_gui()`，而是自己 `patch.object` `ds102_ctrl.RECORDING_DIR`／`DATA_DIR`——新增同類測試檔時照抄它的 `ctrl` fixture 即可 |
 | [conftest.py](conftest.py) / [pytest.ini](pytest.ini) | pytest 共用設定：`conftest.py` 放建 GUI／跑 Tk mainloop／monkeypatch `RECORDING_DIR` 這類共用 fixture；`pytest.ini` 把 `python_files` 放寬成同時認得 `verify_*.py` 與標準 `test_*.py`，並排除 `venv`／驅動資料夾等不相關目錄 |
 | [Gtest.py](Gtest.py) | 外部第三方範例（NTT-Mabuchi），`import control` 的模組不存在於本 repo，**無法執行**，僅作參考 |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖與 GPIB 側注意事項。⚠ 但其中的 **DS112 通訊細節全部是錯的**（宣稱結束符 `\r\n`、鮑率 9600、用 `!:` 輪詢 B/R 狀態）——實機是 `\r`、38400、查 `SB1?`。此檔只採信 HP 8153A 與「馬達動則不讀光」那幾段 |
@@ -296,7 +296,14 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 
 🔴 **危險寫入要自己設閘門，不能只信上游的等待函式（`_confirm_stopped()`）。** 這是本專案第三次在同一個模式上出事（`_wait_axis_stop` 誤判撞限位、`_wait_origin_done` 誤判完成、`POS 0` 寫在飛行中），所以升格成通則而不是第三則個案：**傷害發生在 `set_position(axis_no, "0")` 這道指令上，不是在等待函式裡**。等待函式的判定再嚴格都只是「相信上游」，任何新呼叫路徑或未來改動都可能繞過。`_confirm_stopped(axis_no)` 連續數次確認「狀態非 Driving 且 POS 完全沒變」，四個歸零呼叫點（`move_origin`／`origin_all`／量測基準復歸／`_measure_one_combo` 的 `finally`）全部先過它，確認不了一律不寫並記 ERROR。用 POS 連續不變而非只看 Driving，理由同上——Driving 有 96ms 的 assert 延遲，POS 是實際位移的直接證據。
 
-⚠ **技術債：`_wait_axis_stop()` 有同一個競態的孿生體，尚未修。** 它的 `status == "Stop"` 直接 `return True`，而第一次 `query_status()` 約 112ms、assert 延遲約 96ms——**餘裕只有約 16ms**。若那一刻 Driving 尚未 assert，它會把「還沒起步」讀成「已經停好」，`move_step(wait_done=True)` 就會在軸飛行中回報成功，下游 `goto_point()` 會提前送出下一軸、`fiber_scanner._measure_here()` 會在移動中量光功率。`_wait_axis_stop_leaving_limit()` 早就用 `min_travel` 解掉同一件事，只是沒回頭套用到本體。**刻意不併進復歸那批改動**：它動到 `move_step`／`goto_point`／`scanner` 這條最熱的安全路徑，涵蓋面遠大於復歸，要有自己的一輪設計與回歸測試。修法可沿用既有配方（`_do_move_step` 把 `start_pos`／`expected_travel` 傳給 `_wait_axis_stop`，要求 `travelled >= expected - 1` 才承認 Stop）。
+✅ **孿生競態已修（2026-08-26）：`_wait_axis_stop()` 的起步窗口。** 它的 `status == "Stop"` 原本直接 `return True`，而第一次 `query_status()` 約 112ms、Driving assert 延遲約 96ms——**餘裕只有約 16ms**。落在那個窗口就會把「還沒起步」讀成「已經停好」，`move_step(wait_done=True)` 在軸飛行中回報成功，下游 `goto_point()` 提前送出下一軸、`fiber_scanner._measure_here()` 在移動中量光功率。修法沿用 `_wait_origin_done_ex()` 已實機驗證過的三重證據配方（`MOVE_START_GRACE`(1.0s)／`MOVE_START_POLL`(0.05s)／`MOVE_POS_EPS`(1)／`MOVE_MOTION_EPS`(1)，與 `ORIGIN_*` 那組同樣刻意不外部化到 `safety_settings.json`）：
+
+- **證據三選一**：①看過 Driving assert（正常移動的主要路徑）②走完預期行程 `|POS − start_pos| >= expected_travel − 1`（涵蓋「短到在第一次取樣前就跑完」的移動，單看 Driving 會誤判成從未起步）③POS 相對**第一次取樣值**變化過（呼叫端沒傳提示時的保底）。三者皆不成立且寬限期已過，才判 `GO` 未生效、回 `False` 並記 ERROR＋發警報。
+- 🔴 **證據要求只在寬限期內生效，寬限期一過就回到舊語意——這是與本檔原本記載的修法（無條件要求 `travelled >= expected − 1`）唯一的差異，且這個差異是必要的。** 無條件版會在使用者中途按「停止」時退化成空等到 `WAIT_TIMEOUT`(30s)：`STOP 0` 讓軸提前停下，`travelled` 永遠達不到 expected。競態純粹是「起步窗口」現象，把要求限縮在寬限期內就足以堵住，且寬限期之後的行為與改動前逐字相同。
+- 🔴 **`moved` 成立不可當成 `return True` 的通用捷徑。** 走完了預期行程但停在限位上，是貨真價實的撞限位，必須照〈第一批修正〉「撞限位不再靜默」的結論大聲報出來。分支結構因此是「先分 `status == "Stop"` 與其他，再各自考慮證據」，不是「有 `moved` 就成功」——`verify_wait_axis_stop.py::TestLimitHandling::test_limit_with_full_travel_is_not_swallowed_by_evidence` 就是鎖這一點。
+- **順帶修掉一個既有的同源誤判**：從限位上往反方向出發時，`GO` 尚未生效的那一刻讀到的是「出發前就壓著的那顆限位」，舊寫法會直接判失敗並發警報。現在寬限期內、且沒有位移證據時對限位狀態也續輪，等 Driving assert 即可分辨；真的走不掉則寬限期一過照樣報錯，代價只是這種必定失敗的情境晚 1 秒才報。這與 `_wait_axis_stop_leaving_limit()` **不是**同一件事——後者仍然只給量測路徑用，本體沒有放寬「行進方向那一側限位＝失敗」的判定。
+- **四個呼叫端都補上了位移提示**（沒傳只是少一條證據，不會誤報成功，但短移動會被誤判成「未生效」，所以有值就該傳）：`_do_move_step()` 傳快取的機械座標＋`pulse_amt`（刻意不另打一筆 `POS?`——熱路徑上多一次往返約 56ms，而快取在每次移動結束時都被 `query_status()` 寫成當下實測值）；公開的 `wait_axis_stop()` 加了兩個選用參數並轉交；`fiber_scanner._move_multi_axis()` 出發前抓一份 `positions_machine` 快照、依各軸 delta 分別傳入（搜尋的單步移動量常常小到在第一次取樣前就跑完，這裡最需要證據②）；`play_recording()` 用新的 `_replay_move_hint()` 從原始指令字串反解 `PULS n` ＋ `GO CW/CCW`（`GO ABS`／`HOME`／`GOTCH` 的行程與 `PULS` 無關，一律回 `(None, None)` 退回保底證據）。
+- **回歸測試**：`verify_wait_axis_stop.py`（29 項），涵蓋競態序列、短移動、`GO` 未生效、限位四類判定、EMS／逾時／使用者中途停止，以及四個呼叫端有沒有真的把提示傳下去。**尚未實機驗證**——本次改動全部以假物件測試為準，`MOVE_START_GRACE` 對真實韌體的餘裕是否足夠、以及「移動未生效」會不會在實機上誤報，都要等下次接上 COM2 時確認。
 
 `MEMSW0?` 回 `0`（樣式 Type0＝不執行）與 `Stage not connected` 的軸會被略過；單軸失敗不中止整批。
 
@@ -474,7 +481,7 @@ DS102 的 **MEMSW（復歸樣式）與韌體軟體限位都是 RAM-only**，控�
   - `AXI{n}:SB1?` bit6 = Driving，bit4 = 原點偵測，bit1/bit2 = 觸發 limit
   - 觸發 limit 時再查 `AXI{n}:SB2?` 分辨 CW/CCW 硬體限位、CW/CCW 軟體限位、滑台未接
   - `AXI{n}:POS?` 取得目前位置
-- **移動後不可立刻讀值**：`_wait_axis_stop()` 以 `WAIT_INTERVAL`(0.5s) 輪詢，逾時 `WAIT_TIMEOUT`(30s)；原點復歸改用 `_wait_origin_done()`（只看 Driving 位元，逾時 180s）。⚠ 注意 `_wait_axis_stop` **只有 `Driving` 會續輪**，任何其他狀態（Limit／通訊錯誤／軸無法選取）第一輪就 `return False`——搭配上面第 1 點（沒人看回傳值），實際語意是「撞限位＝立刻放棄等待且不通知任何人」。若之後要接光功率量測，停穩後還需再等約 30ms 讓機構震動衰減。
+- **移動後不可立刻讀值**：`_wait_axis_stop()` 以 `WAIT_INTERVAL`(0.5s) 輪詢，逾時 `WAIT_TIMEOUT`(30s)；原點復歸改用 `_wait_origin_done()`（只看 Driving 位元，逾時 180s）。⚠ 注意 `_wait_axis_stop` 的續輪條件只有 `Driving`，其他狀態（Limit／通訊錯誤／軸無法選取）一律 `return False`——2026-08-05 之前搭配「沒人看回傳值」，實際語意是「撞限位＝立刻放棄等待且不通知任何人」。2026-08-26 修〈孿生競態〉後多了一個例外：**送出 GO 之後的 `MOVE_START_GRACE`(1.0s) 寬限期內、且完全沒有位移證據時，非 Driving 狀態（含限位）會續輪而不是立刻下結論**——那一刻無法分辨「GO 尚未生效」與「真的停好／真的撞上」，見上方〈原點復歸〉末尾那段。寬限期之後的判定與改動前逐字相同。若之後要接光功率量測，停穩後還需再等約 30ms 讓機構震動衰減。
 - `limit_direction()` 從狀態字串判斷壓在哪一側限位時，**必須先判斷 `"CCW"`**——`"CCW"` 字串本身就含有 `"CW"`，順序反了會把 CCW 限位全部誤判成 CW。任何新增的方向字串比對都有同一個陷阱。
 - HP 8153A 側（[meter_GPIB.py](meter_GPIB.py)）：SCPI 指令結尾 `\n`（由 pyvisa `write_termination` 預設附加，不是手寫的）。⚠ 連續通訊之間需 `time.sleep(0.03~0.05)` 否則 GPIB 緩衝區溢位會出現 Query INTERRUPTED——但**目前 `meter_GPIB.py` 全檔沒有任何 `time.sleep`**（`import time` 是未使用的 import）。這是「整合時必須補上」的待辦，不是既有實作，別去該檔找對應程式碼。
 
