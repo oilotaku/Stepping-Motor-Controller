@@ -476,6 +476,11 @@ class TestNoSignalAbort:
             g.ctrl.scanning_active = False
             g.ctrl.ems_active = False
             g.meter = FakeMeter(value=0.02, ok=True, noise=0.005)  # 固定值+極小雜訊
+            # 2026-08-26：GUI 預設啟用階段零盲搜（"auto"），無訊號時會先掃過
+            # 整個螺旋才回報。本案例測的是「無訊號提示 UI」，不是盲搜本身
+            # （那在 verify_blind_scan.py），這裡明確關掉才能維持原本的
+            # 判定路徑與可接受的執行時間。
+            g._scan_blind_mode_var.set(g._scan_blind_mode_labels["off"])
             with patch("main_ai.messagebox.askyesno", return_value=True):
                 g._do_start_scan()
             pump_until(root, lambda: not g._scanning.is_set(), timeout=30.0)

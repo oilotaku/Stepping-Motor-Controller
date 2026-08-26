@@ -46,6 +46,12 @@ from fiber_scanner import (
     DEFAULT_MAX_CYCLES,
     DEFAULT_NOISE_SIGMA_MULT,
     DEFAULT_NO_SIGNAL_RANGE_MULT,
+    BLIND_MODES,
+    GUI_DEFAULT_BLIND_MODE,
+    DEFAULT_BLIND_STEP,
+    DEFAULT_BLIND_MAX_RADIUS,
+    DEFAULT_BLIND_SIGNAL_SIGMA_MULT,
+    DEFAULT_BLIND_SIGNAL_MIN_DELTA_DB,
 )
 # DS102Controller 與其專屬的模組層級常數／函式已抽到 ds102_ctrl.py
 # （2026-08-17，架構拆分第一階段 1a，機械式搬移，行為不變）。
@@ -3567,6 +3573,67 @@ class DS102GUI:
             stage2_state = "normal" if (axis_on and stage2_on) else "disabled"
             for w in self._scan_axis_stage2_entries.get(ax, []):
                 w.config(state=stage2_state)
+        # 盲搜平面的可選配對完全由「這次勾了哪些軸」決定，跟階段二無關，
+        # 但觸發時機一模一樣（軸勾選變動），所以掛在同一個重算入口，
+        # 不另外綁一組 command——那正是本函式 docstring 警告的「兩個
+        # handler 各自改狀態、互相覆蓋」的來源。
+        self._refresh_blind_plane_options()
+
+    def _refresh_blind_plane_options(self):
+        """
+        依目前勾選的搜尋軸，重算盲搜「掃描平面」下拉的可選配對。
+
+        沿用 `_scan_pair_combo` 已建立的既有慣例：**存字串（"X-Y"）而非
+        index**，清單長度隨勾選軸變動，存 index 一定會錯位。使用者原本
+        選的配對若仍在新清單裡就保留，否則退回空字串（＝交給演算法自動
+        取前兩軸），不要靜默改選成另一組軸——那會讓滑台往使用者沒預期
+        的方向掃。
+        """
+        if not hasattr(self, "_scan_blind_plane_combo"):
+            return
+        selected = [ax for ax in AXES if self._scan_axis_selected_vars[ax].get()]
+        options = [
+            f"{a}-{b}"
+            for i, a in enumerate(selected)
+            for b in selected[i + 1:]
+        ]
+        self._scan_blind_plane_combo["values"] = [""] + options
+        if self._scan_blind_plane_var.get() not in options:
+            self._scan_blind_plane_var.set("")
+
+    def _update_blind_estimate(self):
+        """
+        即時估算盲搜的格點數與粗略耗時，顯示在設定欄位下方。
+
+        格點數是 `(2×半徑÷格距 + 1)²`——平方成長，把半徑加倍或格距減半
+        都會讓點數變成四倍。使用者很容易在不知情下設出一個要跑數小時的
+        組合，而那個後果要等滑台真的開始掃才會顯現。每點耗時用
+        `settle_sec + 一次 GPIB 讀值 + 一次移動` 的保守估計值，只是量級
+        參考，不是準確預測。
+        """
+        if not hasattr(self, "_scan_blind_estimate_var"):
+            return
+        try:
+            step = int(self._scan_blind_step_var.get())
+            radius = int(self._scan_blind_radius_var.get())
+        except (ValueError, AttributeError):
+            self._scan_blind_estimate_var.set("⚠ 格距／半徑需為整數")
+            return
+        if step <= 0 or radius < 0:
+            self._scan_blind_estimate_var.set("⚠ 格距需 > 0、半徑需 ≥ 0")
+            return
+        n_rings = radius // step
+        points = (2 * n_rings + 1) ** 2
+        # 每點約 0.25s：settle(0.03) + GPIB 讀值(約 0.15) + 一步移動與等待。
+        # 刻意高估而非低估——低估會讓使用者以為只要幾分鐘而放著不管。
+        secs = points * 0.25
+        if secs < 90:
+            dur = f"約 {secs:.0f} 秒"
+        elif secs < 5400:
+            dur = f"約 {secs / 60:.0f} 分鐘"
+        else:
+            dur = f"約 {secs / 3600:.1f} 小時"
+        self._scan_blind_estimate_var.set(f"→ {points:,} 個格點，粗估 {dur}")
 
     def _set_scan_axis_selection(self, value: bool):
         """
@@ -3779,6 +3846,83 @@ class DS102GUI:
         if not self._scan_abort_no_signal_var.get():
             self._scan_abort_warn_lbl.pack(anchor="w", padx=12, pady=(0, 8))
 
+        # =================== 左欄卡片二之二：階段零盲搜 ===================
+        # 2026-08-26 新增。動機見 fiber_scanner.run_stage0_blind()：座標下降
+        # 需要梯度，而尋光起點本來就常常完全無光，那時演算法在原地一步都
+        # 不會動。這張卡片是唯一能讓使用者控制「掃多大、掃多密」的地方。
+        card_blind = self._card(left, "階段零：盲搜粗掃（無訊號時）")
+
+        tk.Label(
+            card_blind, text="模式", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w", padx=12)
+        # 與 ORG_MODES 同一個既有慣例：Combobox 存的是**字串本身**而不是
+        # index，避免清單增刪時整組差一位（CLAUDE.md〈第三批修正〉記載過
+        # ORG_MODES.index() 的差一位事故）。
+        self._scan_blind_mode_labels = {
+            "off": "關閉（維持舊行為）",
+            "auto": "自動：階段一判定無訊號才盲搜",
+            "always": "一律先盲搜再進階段一",
+        }
+        self._scan_blind_label_modes = {v: k for k, v in self._scan_blind_mode_labels.items()}
+        _saved_mode = cfg.get("blind_mode", GUI_DEFAULT_BLIND_MODE)
+        if _saved_mode not in BLIND_MODES:
+            _saved_mode = GUI_DEFAULT_BLIND_MODE
+        self._scan_blind_mode_var = tk.StringVar(value=self._scan_blind_mode_labels[_saved_mode])
+        self._scan_blind_mode_combo = ttk.Combobox(
+            card_blind, textvariable=self._scan_blind_mode_var, state="readonly", width=30,
+            values=[self._scan_blind_mode_labels[m] for m in BLIND_MODES],
+        )
+        self._scan_blind_mode_combo.pack(anchor="w", padx=12, pady=(2, 8))
+
+        tk.Label(
+            card_blind, text="掃描平面（兩軸）", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w", padx=12)
+        self._scan_blind_plane_var = tk.StringVar(value=cfg.get("blind_plane", ""))
+        self._scan_blind_plane_combo = ttk.Combobox(
+            card_blind, textvariable=self._scan_blind_plane_var, state="readonly", width=10,
+        )
+        self._scan_blind_plane_combo.pack(anchor="w", padx=12, pady=(2, 2))
+        tk.Label(
+            card_blind,
+            text="盲搜固定掃兩個軸。第三軸用同樣密度掃會讓格點數變成立方，"
+                 "以光纖對準需要的格距估算根本跑不完——耦合距離不對時請先"
+                 "單獨調整該軸再重掃。留空＝自動取本次搜尋軸的前兩軸。",
+            bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        grid_f = tk.Frame(card_blind, bg=CLR_CARD)
+        grid_f.pack(fill="x", padx=12, pady=(0, 2))
+        tk.Label(
+            grid_f, text="格距 (pulse)", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            grid_f, text="最大半徑 (pulse)", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self._scan_blind_step_var = tk.StringVar(
+            value=cfg.get("blind_step", str(DEFAULT_BLIND_STEP))
+        )
+        self._scan_blind_radius_var = tk.StringVar(
+            value=cfg.get("blind_max_radius", str(DEFAULT_BLIND_MAX_RADIUS))
+        )
+        ttk.Entry(grid_f, textvariable=self._scan_blind_step_var, width=12).grid(
+            row=1, column=0, sticky="w", pady=(2, 0)
+        )
+        ttk.Entry(grid_f, textvariable=self._scan_blind_radius_var, width=12).grid(
+            row=1, column=1, sticky="w", padx=(10, 0), pady=(2, 0)
+        )
+
+        # 格點數是 (2×半徑÷格距+1)²，成長極快——使用者很容易在不知情的
+        # 情況下設出一個要跑好幾小時的組合。這行即時估算是把那個後果
+        # 攤在設定當下，而不是等滑台已經開始掃了才發現。
+        self._scan_blind_estimate_var = tk.StringVar(value="")
+        tk.Label(
+            card_blind, textvariable=self._scan_blind_estimate_var,
+            bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
+        ).pack(anchor="w", padx=12, pady=(4, 8))
+        self._scan_blind_step_var.trace_add("write", lambda *_: self._update_blind_estimate())
+        self._scan_blind_radius_var.trace_add("write", lambda *_: self._update_blind_estimate())
+        self._update_blind_estimate()
+
         # =================== 左欄卡片三：進階設定（可折疊）===================
         card3 = self._card(left, "")
         self._scan_adv_visible = False
@@ -3819,12 +3963,23 @@ class DS102GUI:
         self._scan_noise_sigma_mult_var = tk.StringVar(
             value=cfg.get("noise_sigma_mult", str(DEFAULT_NOISE_SIGMA_MULT))
         )
+        # 盲搜的「找到訊號」門檻＝max(σ倍數×σ, 絕對下限dB)，兩者取大。
+        # 底噪很穩定時 σ→0，只靠倍數會退化成「比基準大一點點就算找到」，
+        # 一個雜訊尖峰就能讓盲搜停在沒有光的地方並回報成功。
+        self._scan_blind_sigma_mult_var = tk.StringVar(
+            value=cfg.get("blind_signal_sigma_mult", str(DEFAULT_BLIND_SIGNAL_SIGMA_MULT))
+        )
+        self._scan_blind_min_delta_var = tk.StringVar(
+            value=cfg.get("blind_signal_min_delta_db", str(DEFAULT_BLIND_SIGNAL_MIN_DELTA_DB))
+        )
         for r, (lbl, var) in enumerate(
             [
                 ("最小步長 step_min", self._scan_step_min_var),
                 ("震動衰減 settle_sec", self._scan_settle_sec_var),
                 ("最多輪數 max_cycles", self._scan_max_cycles_var),
                 ("雜訊倍數 noise_sigma_mult", self._scan_noise_sigma_mult_var),
+                ("盲搜門檻 σ 倍數", self._scan_blind_sigma_mult_var),
+                ("盲搜門檻下限 (dB)", self._scan_blind_min_delta_var),
             ]
         ):
             tk.Label(
@@ -4438,6 +4593,22 @@ class DS102GUI:
         floor_txt = "未設定（僅依讀值相對變化判斷）" if not floor_val else f"{floor_val} dBm"
         abort_txt = "是" if self._scan_abort_no_signal_var.get() else "否"
 
+        # 盲搜是本專案單次自動運動量最大的操作（可達上千個格點），規模必須
+        # 攤在確認對話框裡，不能只寫在設定卡片上——使用者按下開始的那一刻
+        # 才是真正要為這段機械運動負責的時點。
+        blind_mode = self._scan_blind_label_modes.get(
+            self._scan_blind_mode_var.get(), GUI_DEFAULT_BLIND_MODE
+        )
+        if blind_mode == "off":
+            blind_txt = "關閉"
+        else:
+            plane_txt = self._scan_blind_plane_var.get() or f"自動（{axes_txt} 的前兩軸）"
+            mode_txt = "無訊號時才啟動" if blind_mode == "auto" else "一律先執行"
+            blind_txt = (
+                f"{mode_txt}｜平面 {plane_txt}｜"
+                f"{self._scan_blind_estimate_var.get().lstrip('→ ') or '規模未知'}"
+            )
+
         if not messagebox.askyesno(
             "確認開始尋光",
             f"搜尋軸：{axes_txt}\n\n"
@@ -4446,6 +4617,7 @@ class DS102GUI:
             f"階段二精修：{stage2_txt}\n"
             f"訊號有效性下限：{floor_txt}\n"
             f"無訊號時中止：{abort_txt}\n"
+            f"階段零盲搜：{blind_txt}\n"
             f"預估時間：無法精確預估，過去測試單輪落在數十秒到數分鐘不等\n\n"
             f"⚠ 尋光不保證找到訊號，也不代表光纖已對準——搜尋結束仍請自行確認\n"
             f"　光功率讀值是否落在可接受範圍。\n"
@@ -4476,6 +4648,15 @@ class DS102GUI:
                 "min_valid_power_dbm": self._scan_min_valid_power_var.get(),
                 "enable_stage2": self._scan_stage2_var.get(),
                 "selected_axes": selected_axes,
+                # 盲搜參數跟 l_speed／step_min 同類：跟裝置物理配置綁定、
+                # 跨次搜尋穩定，該存。（initial_step／stage2 半徑那種依當次
+                # 搜尋範圍而定的才刻意不存，見上方註解。）
+                "blind_mode": blind_mode,
+                "blind_plane": self._scan_blind_plane_var.get(),
+                "blind_step": self._scan_blind_step_var.get(),
+                "blind_max_radius": self._scan_blind_radius_var.get(),
+                "blind_signal_sigma_mult": self._scan_blind_sigma_mult_var.get(),
+                "blind_signal_min_delta_db": self._scan_blind_min_delta_var.get(),
             },
             log=self.ctrl._log,
         )
@@ -4540,7 +4721,30 @@ class DS102GUI:
             "min_valid_power_dbm": _parse_float_or_none(self._scan_min_valid_power_var.get()),
             "no_signal_range_mult": _parse_float(self._scan_range_mult_var.get(), DEFAULT_NO_SIGNAL_RANGE_MULT),
             "abort_if_no_signal": self._scan_abort_no_signal_var.get(),
+            # blind_mode 已在確認對話框那段從 Combobox 標籤反解成內部代碼
+            # （"off"/"auto"/"always"），這裡直接沿用同一個值，不要再讀一次
+            # Combobox——那時已經進不了主執行緒，而且兩次讀取有機會不一致。
+            "blind_mode": blind_mode,
+            "blind_step": _parse_int(self._scan_blind_step_var.get(), DEFAULT_BLIND_STEP),
+            "blind_max_radius": _parse_int(
+                self._scan_blind_radius_var.get(), DEFAULT_BLIND_MAX_RADIUS
+            ),
+            "blind_signal_sigma_mult": _parse_float(
+                self._scan_blind_sigma_mult_var.get(), DEFAULT_BLIND_SIGNAL_SIGMA_MULT
+            ),
+            "blind_signal_min_delta_db": _parse_float(
+                self._scan_blind_min_delta_var.get(), DEFAULT_BLIND_SIGNAL_MIN_DELTA_DB
+            ),
+            "on_signal_found": self._on_scan_signal_found,
         }
+        # 掃描平面存的是 "X-Y" 這種字串（跟 _scan_pair_combo 同一個既有慣例，
+        # 存 index 會在清單長度變動時整組差一位）。留空＝交給演算法自動取
+        # 本次搜尋軸的前兩軸，這裡就不傳這個參數。
+        blind_plane_raw = self._scan_blind_plane_var.get().strip()
+        if blind_plane_raw and "-" in blind_plane_raw:
+            pa, _, pb = blind_plane_raw.partition("-")
+            if pa in AXES and pb in AXES:
+                scanner_kwargs["blind_axes"] = (pa, pb)
         f_speed_min_raw = self._scan_f_speed_min_var.get().strip()
         if f_speed_min_raw:
             scanner_kwargs["f_speed_min"] = f_speed_min_raw
@@ -4611,7 +4815,9 @@ class DS102GUI:
                     self.root.after(0, lambda: self._on_scan_done(kind="completed", result=result, err=None))
                 else:
                     err_msg = scanner.last_abort_reason
-                    kind = self._classify_scan_abort(err_msg)
+                    kind = self._classify_scan_abort(
+                        err_msg, getattr(scanner, "last_abort_kind", None)
+                    )
                     self.root.after(0, lambda: self._on_scan_done(kind=kind, result=None, err=err_msg))
             except ScanAbort as e:
                 # ⚠ `except X as e` 的 e 會在 except 區塊結束時被自動 del，
@@ -4629,18 +4835,26 @@ class DS102GUI:
         threading.Thread(target=_run, daemon=True).start()
 
     @staticmethod
-    def _classify_scan_abort(err_msg: str) -> str:
+    def _classify_scan_abort(err_msg: str, abort_kind: Optional[str] = None) -> str:
         """
-        把 ScanAbort／last_abort_reason 的訊息字串分類成 _on_scan_done 認得的
-        kind。三則字面量核對於 fiber_scanner.py：_check_abort() 的「使用者
-        中止搜尋」「EMS 觸發，搜尋中止」逐字相符（完整比對，這兩則本身就是
-        完整訊息，不是某段長訊息的子字串）；「沒有偵測到高於雜訊的訊號」是
-        _check_signal_detectable() 拋出的長訊息「研判整個探測範圍內沒有
-        偵測到高於雜訊的訊號——請確認…」裡的子字串，故用 in 判斷而非全等。
+        把中止資訊分類成 _on_scan_done 認得的 kind。
+
+        `abort_kind` 是 `scanner.last_abort_kind`（型別化分類，"no_signal"／
+        "other"／None）。**有值時優先採信**——它由 fiber_scanner 依例外型別
+        直接產生，不受訊息文字改動影響。2026-08-26 新增盲搜時一口氣多了四
+        種無訊號中止訊息，全都不含舊版比對的那個子字串，純字串比對會讓它們
+        統統掉進「其他錯誤」分支、失去專屬的 no_signal 呈現。
+
+        字串比對保留兩個用途：一是判斷 user_stopped（`_check_abort()` 拋的
+        兩則訊息是完整字串、逐字相符，型別上都是普通 ScanAbort 無從分辨）；
+        二是 `abort_kind` 為 None 時的向下相容（舊版 scanner 物件、或直接
+        以訊息字串呼叫本函式的既有測試）。
         """
         if err_msg in ("使用者中止搜尋", "EMS 觸發，搜尋中止"):
             return "user_stopped"
-        if "沒有偵測到高於雜訊的訊號" in err_msg:
+        if abort_kind == "no_signal":
+            return "no_signal"
+        if abort_kind is None and "沒有偵測到高於雜訊的訊號" in err_msg:
             return "no_signal"
         return "aborted_other"
 
@@ -4657,6 +4871,7 @@ class DS102GUI:
         self._active_scanner = None
         self._scan_start_btn.config(state="normal")
         self._scan_stop_btn.config(state="disabled")
+        self._restore_meter_auto_range()
 
         # scanner.run() 內 sample_cb 是同步呼叫，跑到這裡時所有樣本理論上
         # 早就已經 append 進 _scan_plot_pending——但 _redraw_scan_plot 把
@@ -5379,6 +5594,58 @@ class DS102GUI:
         except Exception as e:
             logger.debug(f"尋光讀取光功率例外: {e}")
             return False, 0.0
+
+    def _restore_meter_auto_range(self):
+        """
+        尋光結束後把光功率計還原成自動量程。
+
+        🔴 少了這一步，「尋光在無光位置沒反應」這個 bug 會以更隱蔽的形式
+        復發：上一輪尋光鎖定的量程會留到下一輪，而下一輪的起點常常又是
+        無光的——固定量程在那裡必定 underrange，回傳 sentinel，演算法又
+        變成一步都不動。鎖定量程是**單次搜尋內**的最佳化，不該跨輪存活。
+
+        不論這一輪是完成、中止還是出錯都要還原，所以掛在 _on_scan_done
+        的最前面（那是所有結束路徑的唯一匯流點）。
+        """
+        meter = self.meter
+        if meter is None or getattr(meter, "range_auto", True):
+            return
+        try:
+            meter.set_range_auto(True)
+            self.ctrl._log("INFO", "[尋光] 已將光功率計還原為自動量程")
+        except Exception as e:
+            logger.debug(f"還原自動量程失敗: {e}")
+
+    def _on_scan_signal_found(self, power: float):
+        """
+        尋光第一次確認「真的量到訊號」時由演算法呼叫（背景執行緒）。
+
+        用途是把光功率計從自動量程切成鎖定量程：自動量程每次讀值都要讓
+        儀器自己找檔位，尋光動輒上百次量測，省下來的時間相當可觀。
+
+        🔴 這是**樂觀最佳化，不是必要步驟**。鎖定之後功率會從底噪一路爬
+        到耦合峰值，可能跨數十 dB 而超出鎖定檔位——那時由
+        meter_GPIB.get_power() 自己偵測 sentinel、切回自動量程並重讀
+        （見該檔的自動退回邏輯）。**沒有那道保護就絕對不可以在這裡鎖**，
+        否則演算法會在接近峰值時突然拿到一連串無效讀值，剛好在最需要
+        精度的地方失明。
+
+        跑在 scanner 的背景執行緒上，所以：不碰任何 tkinter widget（狀態
+        文字一律 root.after 回主執行緒），meter 本身有自己的 RLock，而且
+        尋光期間 _pm_should_poll() 因 scanning_active 為真而暫停背景輪詢，
+        這條執行緒是當下唯一的 GPIB 使用者。
+        """
+        meter = self.meter
+        if meter is None or not getattr(meter, "range_auto", False):
+            return  # 已經是鎖定量程，或光功率計中途被斷開，都不必動
+        try:
+            meter.set_range_auto(False)
+        except Exception as e:
+            # 鎖不成只是少了一項最佳化，不可拖垮搜尋（比照 _scanner_power_query
+            # 的既有寫法：尋光路徑上的例外一律收斂成記錄後繼續）。
+            logger.debug(f"尋光鎖定量程失敗（不影響搜尋）: {e}")
+            return
+        self.ctrl._log("INFO", f"[尋光] 已量到訊號 {power:.4f} dBm，光功率計改為鎖定量程以加快讀值")
 
     def _pm_update_age_label(self):
         if self.meter is None or self._pm_last_ok_time <= 0:

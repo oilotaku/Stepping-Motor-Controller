@@ -19,6 +19,14 @@ _OVERFLOW_THRESHOLD = 1e30
 # step-motor.txt 記載的建議值起跳。
 GPIB_THROTTLE_SEC = 0.03
 
+# underrange/overrange sentinel 的 log 節流間隔（秒）。無光時每一次讀值
+# 都會走 sentinel 分支，尋光一輪動輒上百次量測，逐筆記錄會灌爆 log
+# （CLAUDE.md〈LOG 量的控制〉的既有原則）。但完全不記錄也不行——
+# 2026-08-26 實機就是因為這條路徑靜默，「尋光無動作」的真正原因
+# （量程鎖在 -20dBm 導致無光時必定 underrange）完全沒有留下線索，
+# 只能靠比對 viRead 的 byte 數反推。折衷成節流記錄。
+SENTINEL_LOG_INTERVAL_SEC = 5.0
+
 # SYST:ERR? 回應本身只有代碼與（通常是空的）訊息字串，例如 '-230,""'，
 # 沒有可讀文字。這裡對照官方手冊 Appendix I，只收 get_power() 失敗時
 # 實際會遇到的代碼；查不到的代碼直接照原始回應顯示，不強行猜測。
@@ -38,18 +46,43 @@ def _describe_error(raw: str) -> str:
 
 
 class HP8153APowerMeter:
-    def __init__(self, gpib_address: int, channel: int = 1, wavelength_nm: int = 1550):
+    def __init__(
+        self,
+        gpib_address: int,
+        channel: int = 1,
+        wavelength_nm: int = 1550,
+        range_auto: bool = True,
+        range_dbm: float = -20.0,
+    ):
         """
         初始化 HP 8153A
+
         :param gpib_address: GPIB 位址 (例如 22)
         :param channel: 1 代表 Slot A (通道1)，2 代表 Slot B (通道2)
         :param wavelength_nm: 設定量測波長，如 1310 或 1550
+        :param range_auto: True＝自動量程（預設），False＝鎖定在 `range_dbm`
+        :param range_dbm: `range_auto=False` 時使用的固定量程檔位
+
+        🔴 `range_auto` 預設 True 是 2026-08-26 的行為變更，不是原本的
+        寫法。舊版無條件送 `RANG:AUTO OFF` + `RANG -20DBM`，理由是
+        「關鍵速度優化」——但那讓輸入功率低於 -20dBm 檔位下限時必定
+        underrange，回傳 sentinel，`get_power()` 判為失敗。實機後果是
+        「在無光位置執行尋光完全不動」：尋光演算法起點量不到值就判定
+        該步長已收斂（fiber_scanner._search_axis_once），整個階段一
+        空轉、滑台一步未移、82 個樣本全部無效，而唯一的錯誤訊息來自
+        階段二、指向錯誤的位置。而尋光的**起點本來就常常是無光的**
+        ——那正是要尋光的原因。所以正確性優先於速度：預設自動量程，
+        要鎖定由呼叫端明確指定。
         """
         self.rm = pyvisa.ResourceManager()
         resource_str = f"GPIB0::{gpib_address}::INSTR"
         self.ch = channel  # 快取通道編號
         self._last_io = 0.0  # 上次通訊的時間戳，供節流使用
         self.last_error_detail = ""  # get_power() 失敗時的儀器端錯誤碼，供 GUI 顯示
+        # 目前是否為自動量程。get_power() 讀到 sentinel 時要據此判斷
+        # 「能不能靠切回自動量程救回來」，見該方法的自動退回邏輯。
+        self._range_auto = bool(range_auto)
+        self._last_sentinel_log = 0.0  # sentinel log 節流用的時間戳
         # GPIB 是獨立於 main_ai.py _serial_lock 的另一條物理匯流排
         # （RS-232 vs GPIB，沒有共享資源），這把鎖只保護本物件內部的
         # 存取，刻意不與 _serial_lock 巢狀取得，避免無謂的死鎖風險。
@@ -70,13 +103,21 @@ class HP8153APowerMeter:
             # Chapter 8 SENSe:POWer:WAVElength。
             self._write(f":SENS{self.ch}:POW:WAVE {wavelength_nm}NM")  # 設定波長
 
-            # 3. 關鍵速度優化：在細對光前，建議將功率計鎖定在某一適當量程，關閉自動切換檔位
-            #    若對光初期完全沒光(雜訊階段)，可先保留 ON，等抓到微弱光訊號時再由程式控制 OFF
-            self._write(f":SENS{self.ch}:POW:RANG:AUTO OFF")
-            self._write(f":SENS{self.ch}:POW:RANG -20DBM")  # 固定在 -20dBm 檔位
+            # 3. 量程：預設自動，讓無光/微弱耦光的起點也讀得到真實底噪。
+            #    鎖定量程確實比較快（省掉儀器自己找檔位的時間），但那是
+            #    「已經抓到光、功率量級穩定」之後才成立的最佳化——見
+            #    __init__ docstring 記載的實機事故。要鎖定請由呼叫端在
+            #    確認訊號之後呼叫 set_range_auto(False)。
+            if self._range_auto:
+                self._write(f":SENS{self.ch}:POW:RANG:AUTO ON")
+                range_desc = "自動量程"
+            else:
+                self._write(f":SENS{self.ch}:POW:RANG:AUTO OFF")
+                self._write(f":SENS{self.ch}:POW:RANG {range_dbm}DBM")
+                range_desc = f"固定量程 {range_dbm}dBm"
 
             logger.info(
-                f"HP 8153A 通道 {self.ch} 初始化成功。波長: {wavelength_nm}nm, 已固定量程。"
+                f"HP 8153A 通道 {self.ch} 初始化成功。波長: {wavelength_nm}nm, {range_desc}。"
             )
 
         except pyvisa.errors.VisaIOError as e:
@@ -154,15 +195,70 @@ class HP8153APowerMeter:
                 self.last_error_detail = _describe_error(self._query("SYST:ERR?").strip())
             except pyvisa.errors.VisaIOError:
                 self.last_error_detail = "overflow/underflow sentinel（查詢錯誤碼逾時）"
+
+            # ── 手動量程的自動退回 ──
+            # 鎖定量程是「樂觀最佳化」：一旦讀值跑出該檔位的可量測範圍
+            # 就必須放棄鎖定，否則演算法會拿到一連串 sentinel。這在尋光
+            # 收斂過程中是**必然**會發生的——從底噪爬到耦合峰值可能跨
+            # 40dB 以上，鎖在剛偵測到微弱訊號時的檔位，對準到峰值就會
+            # overrange。退回之後不再自動鎖回去（要鎖由呼叫端重新決定），
+            # 避免在檔位邊界上反覆切換。
+            if not self._range_auto:
+                logger.warning(
+                    f"HP 8153A 讀值超出固定量程可量測範圍（{self.last_error_detail}），"
+                    "自動切回自動量程並重讀一次"
+                )
+                try:
+                    self.set_range_auto(True)
+                    raw_retry = self._query(f":READ{self.ch}:POW?")
+                    retry_val = float(raw_retry.strip())
+                except (pyvisa.errors.VisaIOError, ValueError) as e:
+                    logger.error(f"HP 8153A 切回自動量程後重讀失敗: {e}")
+                    return False, 0.0
+                if abs(retry_val) <= _OVERFLOW_THRESHOLD:
+                    self.last_error_detail = ""
+                    return True, retry_val
+                # 自動量程仍然 sentinel＝真的超出儀器能力（通常是無光，
+                # 低於最靈敏檔位的底噪），照常回報失敗，往下走節流記錄。
+
+            self._log_sentinel(value)
             return False, 0.0
 
         self.last_error_detail = ""
         return True, value
 
+    def _log_sentinel(self, value: float) -> None:
+        """
+        節流記錄 underrange/overrange sentinel。
+
+        這條路徑在「無光」時每次讀值都會走到，逐筆記錄會灌爆 log；
+        但完全不記錄，事後就完全查不出「為什麼所有讀值都失敗」——
+        2026-08-26 的實機事故就是這樣，只能靠比對 viRead 的 byte 數
+        反推。折衷成每 SENTINEL_LOG_INTERVAL_SEC 記一次。
+        """
+        now = time.time()
+        if now - self._last_sentinel_log < SENTINEL_LOG_INTERVAL_SEC:
+            return
+        self._last_sentinel_log = now
+        mode = "自動量程" if self._range_auto else "固定量程"
+        logger.warning(
+            f"HP 8153A 回傳 underrange/overrange sentinel（{value:.3E}，{mode}）："
+            f"{self.last_error_detail or '無錯誤碼'}。"
+            "輸入功率超出目前可量測範圍——最常見的原因是根本沒有光耦合進來。"
+            f"（此訊息每 {SENTINEL_LOG_INTERVAL_SEC:.0f} 秒最多記錄一次）"
+        )
+
     def set_range_auto(self, status: bool):
-        """動態開啟或關閉自動量程"""
+        """
+        動態開啟或關閉自動量程。
+
+        會同步更新 `self._range_auto`——get_power() 的自動退回邏輯靠
+        這個旗標判斷「讀到 sentinel 時能不能靠切回自動量程救回來」，
+        繞過這個方法直接送 SCPI 會讓旗標與儀器實際狀態脫節。
+        """
         state = "ON" if status else "OFF"
         self._write(f":SENS{self.ch}:POW:RANG:AUTO {state}")
+        self._range_auto = bool(status)
 
     def set_wavelength(self, wavelength_nm: int) -> None:
         """動態變更量測波長。"""
@@ -171,6 +267,11 @@ class HP8153APowerMeter:
     def set_range(self, dbm: float) -> None:
         """動態變更固定量程（手動量程模式下使用，需先關閉自動量程）。"""
         self._write(f":SENS{self.ch}:POW:RANG {dbm}DBM")
+
+    @property
+    def range_auto(self) -> bool:
+        """目前是否為自動量程（供 GUI 顯示與尋光演算法判斷用）。"""
+        return self._range_auto
 
     def close(self):
         with self._lock:
