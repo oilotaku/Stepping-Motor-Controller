@@ -1135,3 +1135,70 @@ class TestMotionPausesMeterPoll:
             g.ctrl._motion_depth -= 1
             g.meter = None
             g._pm_auto_poll.set(False)
+
+
+class TestPmFloatWindowToggle:
+    """
+    案例 p ~ t：光功率浮動視窗核取方塊與視窗狀態必須同步。
+
+    2026-08-26 使用者回報「浮動視窗失效」：ttk.Checkbutton 會先翻轉
+    variable 再呼叫 command，而 `_toggle_pm_float_window()` 原本無條件
+    當成「開」，取消勾選時只 lift() 不關閉，核取方塊與視窗從此永久
+    不同步（視窗再也關不掉）。這裡的測試就是照使用者的點擊順序驅動：
+    先 set() 變數再呼叫 command，等同 Tk 真實的呼叫時序。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, gui):
+        yield
+        root, g = gui
+        g._close_pm_float_window()
+
+    def test_check_opens_window(self, gui):
+        """案例 p：勾選 -> 建立 Toplevel。"""
+        root, g = gui
+        g._pm_float_open.set(True)
+        g._toggle_pm_float_window()
+        assert g._pm_float_win is not None
+        assert g._pm_float_win.winfo_exists()
+
+    def test_uncheck_closes_window(self, gui):
+        """案例 q（回歸主體）：取消勾選 -> 視窗必須真的被關掉。"""
+        root, g = gui
+        g._pm_float_open.set(True)
+        g._toggle_pm_float_window()
+        g._pm_float_open.set(False)
+        g._toggle_pm_float_window()
+        assert g._pm_float_win is None
+
+    def test_recheck_reopens_after_uncheck(self, gui):
+        """案例 r：關掉之後再勾選 -> 重新開一個新視窗（不是只 lift 舊的）。"""
+        root, g = gui
+        g._pm_float_open.set(True)
+        g._toggle_pm_float_window()
+        g._pm_float_open.set(False)
+        g._toggle_pm_float_window()
+        g._pm_float_open.set(True)
+        g._toggle_pm_float_window()
+        assert g._pm_float_win is not None
+        assert g._pm_float_win.winfo_exists()
+
+    def test_close_via_window_x_syncs_checkbox(self, gui):
+        """案例 s：從視窗右上角 X 關閉 -> 核取方塊自己取消勾選。"""
+        root, g = gui
+        g._pm_float_open.set(True)
+        g._toggle_pm_float_window()
+        g._close_pm_float_window()
+        assert g._pm_float_open.get() is False
+        assert g._pm_float_win is None
+
+    def test_repeated_toggle_stays_in_sync(self, gui):
+        """案例 t：連續開關三輪，變數與視窗狀態不得脫鉤。"""
+        root, g = gui
+        for _ in range(3):
+            g._pm_float_open.set(True)
+            g._toggle_pm_float_window()
+            assert g._pm_float_win is not None and g._pm_float_win.winfo_exists()
+            g._pm_float_open.set(False)
+            g._toggle_pm_float_window()
+            assert g._pm_float_win is None

@@ -5330,7 +5330,21 @@ class DS102GUI:
                 pass
 
     def _toggle_pm_float_window(self):
-        """開關獨立光功率浮動視窗（供移動控制／光功率兩分頁的核取方塊共用）。"""
+        """
+        開關獨立光功率浮動視窗（供移動控制／光功率兩分頁的核取方塊共用）。
+
+        ⚠ ttk.Checkbutton 是「先翻轉 variable，再呼叫 command」，所以本函式
+        必須依 self._pm_float_open 的**新值**決定要開還是要關。原本的寫法
+        無條件當成「開」，取消勾選時只會 lift() 而不會關閉視窗，核取方塊
+        與視窗狀態從此永久不同步（勾選框顯示未勾、視窗卻還在，之後每次點
+        擊都只是把它拉到最上層，視窗再也關不掉）——2026-08-26 使用者回報
+        「浮動視窗失效」即此。兩個分頁共用同一個 BooleanVar，所以任一邊
+        desync 之後另一邊也跟著失效。
+        """
+        if not self._pm_float_open.get():
+            self._close_pm_float_window()
+            return
+
         if self._pm_float_win is not None and self._pm_float_win.winfo_exists():
             self._pm_float_win.lift()
             self._pm_float_win.focus_force()
