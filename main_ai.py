@@ -577,12 +577,13 @@ class DS102GUI:
 
         # 移動控制 UI 參考
         self._ctrl_status_var = tk.StringVar(value="Stop")
-        self._ctrl_pos_var = tk.StringVar(value="0")
+        # 初始值刻意是「—」不是「0」：未連線時顯示 0 等於畫一個「軸壓在
+        # 限位開關上」的假座標（0 幾乎就落在限位上），這是既有的顯示原則。
+        self._ctrl_pos_var = tk.StringVar(value="—")
         # 移動控制分頁「Position:」旁的 um 估算附加顯示，見 _update_ctrl_pos_um()。
-        # 用 trace 掛在 _ctrl_pos_var 上——它的兩個寫入點（_poll_status／
-        # _async_query）都已經是 root.after 回主執行緒的寫入，切軸時
-        # _select_axis() 也會呼叫 _async_query() 觸發一次 set，因此不需要
-        # 額外再監聽軸切換事件。
+        # 用 trace 掛在 _ctrl_pos_var 上——它現在的唯一寫入點是
+        # _redraw_positions()（Tk 主執行緒、UI_REDRAW_INTERVAL 節奏），
+        # 切軸時下一輪重繪就會帶到新軸的座標，不需要額外監聽軸切換事件。
         self._ctrl_pos_um_var = tk.StringVar(value="")
         self._ctrl_pos_var.trace_add("write", self._update_ctrl_pos_um)
         self._drive_mode_var = tk.IntVar(value=MODE_CONTINUE)
@@ -2485,7 +2486,11 @@ class DS102GUI:
             return
 
         ax = NO_AXIS.get(self.ctrl.axis_no, self.ctrl.axis_no)
-        cur = self._ctrl_pos_var.get()
+        # ⚠ 這裡要的是**機械座標**：set_position() 寫的是控制器的 POS 暫存器，
+        # 而畫面上的「Position:」顯示的是工作座標（已扣 offset）。設過工作原點
+        # 之後兩者差一個 offset，直接拿顯示值當「由 X 改寫為 Y」會誤導使用者。
+        cur_mach = self.ctrl.positions_machine.get(ax)
+        cur = f"{cur_mach:,.0f}" if cur_mach is not None else "—"
         if not messagebox.askyesno(
             "確認改寫座標",
             f"將軸 {ax} 的座標暫存器\n\n"
@@ -2514,10 +2519,11 @@ class DS102GUI:
         def _check():
             try:
                 while True:
-                    status, pos = self.ctrl.query_status(self.ctrl.axis_no)
+                    # 回傳的 pos 刻意不寫進 _ctrl_pos_var：query_status() 已經
+                    # 把它寫進 _positions_pulse 快取，畫面統一由
+                    # _redraw_positions() 供應（見該函式的座標同步段落）。
+                    status, _pos = self.ctrl.query_status(self.ctrl.axis_no)
                     self.root.after(0, lambda s=status: self._ctrl_status_var.set(s))
-                    if pos:
-                        self.root.after(0, lambda p=pos: self._ctrl_pos_var.set(p))
                     if status != "Driving":
                         return
                     time.sleep(0.1)
@@ -2528,10 +2534,9 @@ class DS102GUI:
 
     def _async_query(self):
         def _q():
-            status, pos = self.ctrl.query_status(self.ctrl.axis_no)
+            # 同 _poll_status：只更新狀態文字，座標交給 _redraw_positions()。
+            status, _pos = self.ctrl.query_status(self.ctrl.axis_no)
             self.root.after(0, lambda: self._ctrl_status_var.set(status))
-            if pos:
-                self.root.after(0, lambda: self._ctrl_pos_var.set(pos))
 
         threading.Thread(target=_q, daemon=True).start()
 
@@ -2547,7 +2552,11 @@ class DS102GUI:
         um = None
         if ax:
             try:
-                um = self.ctrl.estimate_um(ax, float(self._ctrl_pos_var.get()))
+                # 來源字串是 _redraw_positions() 格式化過的顯示值，帶千分位
+                # 逗號（未連線時是「—」）。先去掉逗號再解析，解析不出來就
+                # 當成「沒有可估算的數值」，不猜測。
+                raw = self._ctrl_pos_var.get().replace(",", "")
+                um = self.ctrl.estimate_um(ax, float(raw))
             except ValueError:
                 um = None
         self._ctrl_pos_um_var.set(f"≈ {um:,.1f} μm" if um is not None else "")
@@ -5987,6 +5996,29 @@ class DS102GUI:
                 if self.ctrl.playback_running:
                     bits.append("重播中")
                 sv.set("　".join(bits))
+
+        # 移動控制分頁的「Position:」以前只由 _poll_status()／_async_query()
+        # 寫入，那兩條路徑有三個問題，疊起來就是「ORG 時分頁座標與 StatusBar
+        # 的座標對不起來」：
+        #   1. _poll_status() 的迴圈只在 status == "Driving" 時續輪，而復歸
+        #      途中的「Detect origin」與壓到限位（樣式 5/6 本來就靠限位感測器
+        #      定位）都不是 Driving → 數字停在中途值不再更新。
+        #   2. 全軸原點復歸（_do_home_all → origin_all）根本沒有觸發過這兩條
+        #      路徑，整趟復歸這顆數字完全不動；而復歸收尾會強制寫 POS 0，
+        #      StatusBar／儀表板隨即跳到 0，兩邊差距最刺眼。
+        #   3. 它們寫的是 query_status() 回傳的**機械座標**（未扣 offset），
+        #      而 StatusBar／儀表板顯示的是工作座標；設過工作原點之後，兩者
+        #      永遠差一個 offset，跟有沒有在復歸無關。
+        # 統一改由這條 100ms 重繪迴圈供應：與其餘座標顯示同一份快取、同一個
+        # 座標系、同一個節奏。移動中的高頻更新不受影響——query_status() 仍會
+        # 把 POS? 寫進 _positions_pulse，只是不再自己畫。
+        cur_pos_txt = "—"
+        if connected and cur_ax and int(AXIS_NO[cur_ax]) <= n_axes:
+            cur_pos_txt = f"{pos_work.get(cur_ax, 0.0):,.0f}"
+        if self._ctrl_pos_var.get() != cur_pos_txt:
+            # 只在值真的變了才 set：StringVar.set() 即使同值也會觸發 write
+            # trace（_update_ctrl_pos_um），沒必要每 100ms 白算一次。
+            self._ctrl_pos_var.set(cur_pos_txt)
 
     def _start_poller(self):
         """

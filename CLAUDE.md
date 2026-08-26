@@ -23,7 +23,7 @@ venv/Scripts/python.exe probe_ds102.py --list            # 只列埠，不送任
 venv/Scripts/python.exe -m serial.tools.list_ports -v    # 原始序列埠清單
 venv/Scripts/python.exe -m pip install -r requirements.txt
 venv/Scripts/python.exe -m ruff check .                  # ruff 未列於 requirements.txt，需另行安裝
-venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py verify_wait_axis_stop.py -v  # 五支合計 232 項，不需硬體
+venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py verify_wait_axis_stop.py verify_ctrl_pos_sync.py -v  # 六支合計 245 項，不需硬體
 venv/Scripts/python.exe -m pytest verify_scan_tab.py::TestUserStop -v          # 只跑某個 class／單一測試（VS Code Test Explorer 用同一套機制）
 ```
 
@@ -49,7 +49,7 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
 | [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝（PyVISA）。**已於 2026-08-12 整合進 GUI**（main_ai.py 直接 `from meter_GPIB import HP8153APowerMeter`），供「光功率」與「尋光」分頁使用；仍**未接上真實儀器驗證過**，本機沒有 GPIB 卡可測 |
 | [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`：光纖對準尋光演算法（座標下降＋K近鄰精修＋收尾微擾）。**已於 2026-08-13～17 分六階段接上 GUI**（main_ai.py 的「尋光」分頁），並補上 57 項假物件回歸測試（見下方〈光功率／尋光分頁〉）。本檔自己**仍刻意不 import main_ai.py**（避免循環相依），軸命名自成一份，main_ai.py 改軸命名時要同步 |
-| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) / [verify_fiber_scanner_signal.py](verify_fiber_scanner_signal.py) / [verify_wait_axis_stop.py](verify_wait_axis_stop.py) | 「尋光」／「光功率」分頁／軸機械校正參數／`fiber_scanner.py` 訊號有效性判準／`_wait_axis_stop()` 起步競態的假物件回歸測試（合計 216 項 pytest 測試函式，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py verify_wait_axis_stop.py -v` 執行，VS Code Testing 面板也認得）。用假的 `ctrl` / `meter` 物件驅動邏輯，不需要真實硬體。`verify_fiber_scanner_signal.py` 是 2026-08-19 從某次 session 的 scratchpad 補進版控並轉成 pytest（原本是獨立可執行腳本），轉換時發現它的 `FakeCtrl` 沒有 `estimate_um()`，因為原腳本寫於 μm 快照功能（見下方〈存檔時的 μm 快照〉）加入之前——`_measure_here()` 現在無條件呼叫這個方法，補上回傳 `None` 的樁即可，不影響任何既有斷言。`verify_wait_axis_stop.py` 是 2026-08-26 修〈孿生競態〉時新增的（29 項），它是唯一一支不建 GUI、直接對 `DS102Controller` 實例逐一 monkeypatch `query_status` 的測試檔，所以沒有用 `conftest.py` 的 `make_gui()`，而是自己 `patch.object` `ds102_ctrl.RECORDING_DIR`／`DATA_DIR`——新增同類測試檔時照抄它的 `ctrl` fixture 即可 |
+| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) / [verify_fiber_scanner_signal.py](verify_fiber_scanner_signal.py) / [verify_wait_axis_stop.py](verify_wait_axis_stop.py) / [verify_ctrl_pos_sync.py](verify_ctrl_pos_sync.py) | 「尋光」／「光功率」分頁／軸機械校正參數／`fiber_scanner.py` 訊號有效性判準／`_wait_axis_stop()` 起步競態／移動控制分頁座標供應鏈的假物件回歸測試（合計 245 項 pytest 測試函式，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py verify_wait_axis_stop.py verify_ctrl_pos_sync.py -v` 執行，VS Code Testing 面板也認得）。用假的 `ctrl` / `meter` 物件驅動邏輯，不需要真實硬體。`verify_fiber_scanner_signal.py` 是 2026-08-19 從某次 session 的 scratchpad 補進版控並轉成 pytest（原本是獨立可執行腳本），轉換時發現它的 `FakeCtrl` 沒有 `estimate_um()`，因為原腳本寫於 μm 快照功能（見下方〈存檔時的 μm 快照〉）加入之前——`_measure_here()` 現在無條件呼叫這個方法，補上回傳 `None` 的樁即可，不影響任何既有斷言。`verify_wait_axis_stop.py` 是 2026-08-26 修〈孿生競態〉時新增的（29 項），它是唯一一支不建 GUI、直接對 `DS102Controller` 實例逐一 monkeypatch `query_status` 的測試檔，所以沒有用 `conftest.py` 的 `make_gui()`，而是自己 `patch.object` `ds102_ctrl.RECORDING_DIR`／`DATA_DIR`——新增同類測試檔時照抄它的 `ctrl` fixture 即可。`verify_ctrl_pos_sync.py` 是 2026-08-26 修〈移動控制分頁「Position:」的座標供應鏈統一〉時新增的（13 項），用 module-scope 的 `gui` fixture＋autouse 的狀態重置，直接同步呼叫 `_redraw_positions()` 斷言畫面文字 |
 | [conftest.py](conftest.py) / [pytest.ini](pytest.ini) | pytest 共用設定：`conftest.py` 放建 GUI／跑 Tk mainloop／monkeypatch `RECORDING_DIR` 這類共用 fixture；`pytest.ini` 把 `python_files` 放寬成同時認得 `verify_*.py` 與標準 `test_*.py`，並排除 `venv`／驅動資料夾等不相關目錄 |
 | [Gtest.py](Gtest.py) | 外部第三方範例（NTT-Mabuchi），`import control` 的模組不存在於本 repo，**無法執行**，僅作參考 |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖與 GPIB 側注意事項。⚠ 但其中的 **DS112 通訊細節全部是錯的**（宣稱結束符 `\r\n`、鮑率 9600、用 `!:` 輪詢 B/R 狀態）——實機是 `\r`、38400、查 `SB1?`。此檔只採信 HP 8153A 與「馬達動則不讀光」那幾段 |
@@ -57,7 +57,7 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 
 ## main_ai.py 架構
 
-main_ai.py 約 5408 行（2026-08-06 時約 3100 行，2026-08-12～17 加入光功率／尋光兩分頁後一度衝到 6601 行，2026-08-17 把 `DS102Controller` 拆出去後降到 4839 行，之後陸續加入 B 類安全常數橫幅、軸機械校正參數卡片、尋光彈性選軸與軌跡圖重繪，漲回目前規模——2026-08-19 architect 重新評估模組化時的量測點是 5106 行，之後又加了約 300 行，仍未到下方〈模組化現況與下一步門檻〉定義的 5800～6000 行觸發線），邏輯上仍是三塊，但**`DS102Controller` 現在實際定義在 [ds102_ctrl.py](ds102_ctrl.py)**：
+main_ai.py 約 6149 行（2026-08-26 實測；⚠ 這已越過下方〈模組化現況與下一步門檻〉的門檻 4「5800～6000 行」，下次動到分頁結構前應先重新評估方向1b，本檔先前記載的 5408 行是過時數字）（2026-08-06 時約 3100 行，2026-08-12～17 加入光功率／尋光兩分頁後一度衝到 6601 行，2026-08-17 把 `DS102Controller` 拆出去後降到 4839 行，之後陸續加入 B 類安全常數橫幅、軸機械校正參數卡片、尋光彈性選軸與軌跡圖重繪，漲回目前規模——2026-08-19 architect 重新評估模組化時的量測點是 5106 行，之後又加了約 300 行，仍未到下方〈模組化現況與下一步門檻〉定義的 5800～6000 行觸發線），邏輯上仍是三塊，但**`DS102Controller` 現在實際定義在 [ds102_ctrl.py](ds102_ctrl.py)**：
 
 1. **`DS102Controller`**（[ds102_ctrl.py](ds102_ctrl.py)，約 2326 行）— 所有序列通訊集中於此，完全不碰 tkinter。對外只暴露 `connect()` / `move_step()` / `query_status()` / `goto_point()` 等高階方法。main_ai.py 開頭用 `from ds102_ctrl import DS102Controller, AXES, AXIS_NO, NO_AXIS, MODE_CONTINUE, MODE_STEP, MODE_ORIGIN, COMM_FAIL_THRESHOLD, _BASE_DIR, LOG_DIR, RECORDING_DIR, DATA_DIR, NON_RECORDING_JSON, logger, _write_json_with_backup, _load_json_settings, _app_settings, _app_setting_num, _safety_setting_rejections` 整批重新引入——這份清單就是 `DS102Controller` 的完整依賴閉包，改動任一邊的模組層級常數前先確認它有沒有在這份清單裡（`_load_json_settings`／`_safety_setting_rejections` 是後來加的，見〈B 類安全常數外部化〉與〈設定檔讀取骨架〉兩節，這份清單本身就是活的，隨改動同步更新）。
 2. **`StatusBar`**（仍在 main_ai.py）— 各分頁共用的座標 / 連線狀態列（同時存在多個實例，統一收在 `self._status_bars`）。**刻意沒有跟著搬去 `ds102_ctrl.py`**：它用到的 `CLR_*` 色票（含 `app_settings.json` 覆寫邏輯）留在 main_ai.py，若把 `StatusBar` 也搬走，`ds102_ctrl.py` 會反過來需要 import main_ai.py 的色票，形成循環相依；`StatusBar` 本身只有約 120 行、且與 `DS102GUI` 的 `self._status_bars` 集中管理耦合更緊，留給下次拆 `DS102GUI` 時一併考慮較合適。
@@ -371,6 +371,23 @@ WARN／ERROR 一律照記，安靜的只有成功路徑。另有兩道上限：`
 - **儀表板每軸狀態小字接上資料**（`_dash_status_vars` 以前建立後全檔沒人更新，永遠是「—」）。
 - **版面重分配**：速度設定從儀表板搬到**移動控制、緊接驅動按鈕下方**（調速是反覆試出來的，以前每次都要來回切兩次分頁）；軟體限位與控制器設定也搬過去、用分隔線隔在底部。行程錄製分頁改依操作動線排序：錄製 → 已儲存行程 → 步驟明細 → 重播設定（以前「步驟明細」排在它的資料來源上方）。
 - `_append_log_ui` 不再每筆都呼叫 `_update_stat_ui()`（`_start_poller` 已經在做）。
+
+#### 移動控制分頁「Position:」的座標供應鏈統一（2026-08-26）
+
+使用者回報「ORG 時分頁座標與狀態座標不同步」。根因不在復歸邏輯，而是**同一個畫面上有兩條互不相干的座標供應鏈**：移動控制分頁的「Position:」（`_ctrl_pos_var`）以前只由 `_poll_status()`／`_async_query()` 寫入，其餘所有座標顯示（StatusBar 六格、儀表板、Teaching）走的是 `_start_poller` 100ms 重繪 `ctrl.positions` 那條。三個疊起來的落差：
+
+1. **`_poll_status()` 的迴圈只在 `status == "Driving"` 時續輪**，而復歸途中的「Detect origin」（`SB1` bit4）與壓到限位（樣式 5/6 本來就靠限位感測器定位）都不是 Driving——輪詢當場收工，數字停在中途值。
+2. **全軸原點復歸（`_do_home_all` → `origin_all`）根本沒觸發過那兩條路徑**，整趟復歸這顆數字完全不動；而復歸收尾會強制寫 `POS 0`（見上方〈原點復歸〉），StatusBar／儀表板隨即跳到 0，兩邊差距最刺眼。單軸的 `_do_origin_move()` 雖然有呼叫 `_poll_status()`，但一樣被第 1 點提前收工。
+3. **座標系不同**：那兩條路徑寫的是 `query_status()` 回傳的**機械座標**（未扣 offset），StatusBar／儀表板顯示工作座標。儀表板有「設為工作原點」按鈕（`set_offset_here`），設過之後兩者永遠差一個 offset，跟有沒有在復歸無關。
+
+修法是**把顯示的職責收回單一供應鏈**，不是在復歸流程裡補呼叫 `_poll_status()`（那會讓 GUI 每 0.1s 跟 `origin_all` 搶 `_serial_lock`，而背景 position worker 本來就在打 `POS?` 了）：
+
+- `_redraw_positions()` 末尾新增一段，用當前軸的 `ctrl.positions` 值寫 `_ctrl_pos_var`，未連線或當前軸超出 `axis_count` 一律「—」（沿用「絕不顯示 0」的既有原則，`_ctrl_pos_var` 的初始值也從 `"0"` 改成 `"—"`）。只在值真的改變時才 `set()`——`StringVar.set()` 即使同值也會觸發 write trace（`_update_ctrl_pos_um`）。
+- `_poll_status()`／`_async_query()` **只保留狀態文字的更新，不再寫座標**。它們呼叫的 `query_status()` 仍會把 `POS?` 寫進 `_positions_pulse` 快取，所以移動中的高頻更新一點都沒少，只是不再自己畫。留著兩個寫入者才是問題：一個寫工作座標一個寫機械座標，移動中會互相覆蓋成閃爍。
+- 🔴 **`_do_set_position()` 的確認視窗改讀 `ctrl.positions_machine`**。`set_position()` 寫的是控制器 `POS` 暫存器＝機械座標，而「Position:」現在顯示工作座標——照舊拿畫面上的值當「由 X 改寫為 Y」，設過工作原點之後會誤導使用者（這是改動本身**引入**的新落差，不是既有問題，順著改才完整）。
+- `_update_ctrl_pos_um()` 改成先去掉千分位逗號再 `float()`：新的來源字串是格式化過的顯示值（`f"{v:,.0f}"`），`float("10,000")` 會 `ValueError`，μm 估算會整個消失。
+- **狀態文字（`_ctrl_status_var`）仍是舊架構**：全軸復歸期間它一樣不更新，未連線時還顯示初始值「Stop」。這次刻意沒動——要修得先在 controller 端做狀態快取（目前只有座標有快取），屬於另一件事。
+- **回歸測試**：[verify_ctrl_pos_sync.py](verify_ctrl_pos_sync.py)（13 項），含 ORG 情境的回歸鎖（非 Driving 狀態不再凍結顯示、強制歸零兩處同時反映、兩個舊寫入者確實不再寫座標）。既有五支 232 項重跑全數通過。**尚未實機驗證**。
 
 #### 仍然存在（尚未修，動到時要知道）
 
