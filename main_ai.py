@@ -6111,7 +6111,11 @@ class DS102GUI:
             try:
                 ok, msg = self.ctrl.origin_all(l, f, r, s, progress_cb=_progress)
             except Exception as e:  # 背景執行緒的例外不可讓旗標卡在 set
-                self.root.after(0, lambda: _done(False, f"復歸過程發生例外: {e}"))
+                # except-as 變數在區塊結束就會被 Python 自動 unbind，
+                # 下面的 lambda 是透過 root.after 延後執行的閉包，直接
+                # 引用 e 會在真正執行時撞上 NameError（蓋掉原始例外訊息）
+                err_msg = f"復歸過程發生例外: {e}"
+                self.root.after(0, lambda: _done(False, err_msg))
                 return
             self.root.after(0, lambda: _done(ok, msg))
 
