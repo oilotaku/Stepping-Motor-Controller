@@ -315,6 +315,163 @@ class TestStartScanPreflight:
 
 
 # =============================================================================
+# 一之一、速度欄位驗證（NaN／Inf／0／負值／f_speed_min > f_speed）
+# =============================================================================
+class TestSpeedInputValidation:
+    """
+    迴歸測試：l_speed／f_speed／rate／s_rate／f_speed_min 都是原始文字
+    輸入。float() 能接受 "nan"／"inf"／"0"／負值，但這些值直接組進
+    DS102 指令字串（L0／R0／S0／F0）或送進 FiberAlignmentScanner 建構子，
+    對控制器毫無意義。驗證必須發生在打開確認對話框之前（跟 0 軸檢查
+    同一個位置），失敗時 askyesno 完全不會被呼叫、_scanning 也不會被
+    set()。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _arrange(self, gui):
+        root, g = gui
+        setup_fake_ctrl(g)
+        g.meter = FakeMeter(value=-10.0, ok=True)
+
+    def _assert_blocked(self, g, mock_ask, banner_calls):
+        assert not mock_ask.called, "驗證應在確認對話框之前擋下，不該讓使用者看到注定失敗的確認視窗"
+        assert not g._scanning.is_set()
+        assert any("尋光參數錯誤" in str(a) for a in banner_calls)
+
+    def _run_blocked(self, g):
+        banner_calls = []
+        with patch("main_ai.messagebox.askyesno", return_value=True) as mock_ask, \
+             patch.object(g, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
+            g._do_start_scan()
+        self._assert_blocked(g, mock_ask, banner_calls)
+
+    @pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf", "0", "-100"])
+    def test_f_speed_rejects_non_positive_or_non_finite(self, gui, bad_value):
+        root, g = gui
+        saved = g._scan_f_speed_var.get()
+        g._scan_f_speed_var.set(bad_value)
+        try:
+            self._run_blocked(g)
+        finally:
+            g._scan_f_speed_var.set(saved)
+
+    def test_l_speed_rejects_non_numeric(self, gui):
+        """l_speed 完全未經轉換就直接送進 L0——同樣要擋下非數字輸入。"""
+        root, g = gui
+        saved = g._scan_l_speed_var.get()
+        g._scan_l_speed_var.set("abc")
+        try:
+            self._run_blocked(g)
+        finally:
+            g._scan_l_speed_var.set(saved)
+
+    def test_rate_rejects_non_numeric(self, gui):
+        root, g = gui
+        saved = g._scan_rate_var.get()
+        g._scan_rate_var.set("abc")
+        try:
+            self._run_blocked(g)
+        finally:
+            g._scan_rate_var.set(saved)
+
+    def test_s_rate_rejects_zero(self, gui):
+        root, g = gui
+        saved = g._scan_s_rate_var.get()
+        g._scan_s_rate_var.set("0")
+        try:
+            self._run_blocked(g)
+        finally:
+            g._scan_s_rate_var.set(saved)
+
+    def test_f_speed_min_exceeding_f_speed_rejected(self, gui):
+        """f_speed_min 本身合法，但大於 f_speed 時邏輯矛盾——一樣要擋下。"""
+        root, g = gui
+        saved_min = g._scan_f_speed_min_var.get()
+        saved_f = g._scan_f_speed_var.get()
+        g._scan_f_speed_var.set("1000")
+        g._scan_f_speed_min_var.set("2000")
+        try:
+            self._run_blocked(g)
+        finally:
+            g._scan_f_speed_min_var.set(saved_min)
+            g._scan_f_speed_var.set(saved_f)
+
+    def test_f_speed_min_blank_is_not_validated(self, gui):
+        """f_speed_min 留空是合法的自動模式，不該被驗證擋下。"""
+        root, g = gui
+        saved_min = g._scan_f_speed_min_var.get()
+        g._scan_f_speed_min_var.set("")
+        banner_calls = []
+        try:
+            with patch("main_ai.messagebox.askyesno", return_value=True) as mock_ask, \
+                 patch.object(g, "_flash_banner", side_effect=lambda *a, **k: banner_calls.append(a)):
+                g._do_start_scan()
+            assert mock_ask.called, "空白 f_speed_min 不應被參數驗證擋下，應正常進到確認對話框"
+            assert not any("尋光參數錯誤" in str(a) for a in banner_calls)
+        finally:
+            g._scan_f_speed_min_var.set(saved_min)
+            if g._scanning.is_set():
+                g._do_stop_scan()
+                pump_until(root, lambda: not g._scanning.is_set(), timeout=15.0)
+
+
+# =============================================================================
+# 一之二、建構子輸入驗證失敗時必須回復 UI（不可鎖死開始鍵）
+# =============================================================================
+class TestConstructorValidationRecovers:
+    """
+    迴歸測試：FiberAlignmentScanner.__init__ 仍可能因為 TestSpeedInputValidation
+    沒涵蓋到的原因丟出 ValueError／TypeError（例如未來新增的建構子參數、
+    或驗證邏輯本身遺漏的邊界情況）。_do_start_scan() 在建構 scanner 之前
+    已經 set() 了 _scanning、切換了兩個按鈕狀態——若不接住這個例外，UI
+    會永久卡在「掃描中」，開始鍵按不下去，因為背景執行緒從未啟動、
+    _on_scan_done() 永遠不會被呼叫去解鎖畫面。
+
+    這裡直接 mock FiberAlignmentScanner 本身讓建構必定失敗，不依賴任何
+    特定欄位的壞值——欄位層級的驗證由 TestSpeedInputValidation 負責，
+    兩者刻意分開，其中一邊的驗證範圍擴大也不會讓另一邊的測試失去意義。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _arrange(self, gui):
+        root, g = gui
+        setup_fake_ctrl(g)
+        g.meter = FakeMeter(value=-10.0, ok=True)
+
+    def _start_with_failing_constructor(self, g, exc):
+        with patch("main_ai.messagebox.askyesno", return_value=True), \
+             patch("main_ai.messagebox.showerror") as mock_error, \
+             patch("main_ai.FiberAlignmentScanner", side_effect=exc):
+            g._do_start_scan()
+        return mock_error
+
+    def test_constructor_value_error_recovers_ui(self, gui):
+        """建構子丟 ValueError -> _scanning 不殘留 set、開始鍵回復可按。"""
+        root, g = gui
+        mock_error = self._start_with_failing_constructor(g, ValueError("could not convert string to float: 'abc'"))
+        assert not g._scanning.is_set()
+        assert str(g._scan_start_btn.cget("state")) == "normal"
+        assert str(g._scan_stop_btn.cget("state")) == "disabled"
+        assert g._scan_status_var.get() == "尚未開始"
+        assert mock_error.called
+
+    def test_constructor_type_error_recovers_ui(self, gui):
+        """建構子丟 TypeError（例如參數型別不合）-> 同樣要回復。"""
+        root, g = gui
+        mock_error = self._start_with_failing_constructor(g, TypeError("unexpected keyword argument"))
+        assert not g._scanning.is_set()
+        assert str(g._scan_start_btn.cget("state")) == "normal"
+        assert str(g._scan_stop_btn.cget("state")) == "disabled"
+        assert mock_error.called
+
+    def test_constructor_failure_does_not_start_background_thread(self, gui):
+        """建構失敗後 _active_scanner 不應被設成新 scanner（維持 None）。"""
+        root, g = gui
+        self._start_with_failing_constructor(g, ValueError("bad"))
+        assert g._active_scanner is None
+
+
+# =============================================================================
 # 二、正常收斂完成（案例 6~8）
 # =============================================================================
 class TestScanCompletesNormally:
@@ -383,6 +540,29 @@ class TestScanCompletesNormally:
         try:
             assert len(g._scan_samples) == 0
             assert g._scan_sample_count == 0
+        finally:
+            # 收尾：讓這一輪跑完，避免殘留背景執行緒影響後續測試。
+            pump_until(root, lambda: not g._scanning.is_set(), timeout=60.0)
+
+    def test_second_scan_resets_last_completed_and_abort_reason(self, completed_scan):
+        """
+        案例 8b：第二輪開始後 _scan_last_completed / _scan_last_abort_reason
+        立即重設為 None（不是沿用上一輪的收尾狀態）。
+
+        沿用 completed_scan（第一輪已正常完成，此時 _scan_last_completed
+        應已是 True）。掃描進行中若按「匯出 Excel」
+        （_export_scan_xlsx）會直接讀這兩個屬性，不重設就會把上一輪的
+        完成／中止狀態誤標到這一輪還在進行中的報表上。同樣是
+        _do_start_scan() 內同步完成的重設，呼叫一結束就該生效，不必等
+        這一輪真的跑完再驗證。
+        """
+        root, g = completed_scan
+        assert g._scan_last_completed is True, "前置條件不成立：第一輪應已標記完成才能驗證『第二輪重設』"
+        with patch("main_ai.messagebox.askyesno", return_value=True):
+            g._do_start_scan()
+        try:
+            assert g._scan_last_completed is None
+            assert g._scan_last_abort_reason is None
         finally:
             # 收尾：讓這一輪跑完，避免殘留背景執行緒影響後續測試。
             pump_until(root, lambda: not g._scanning.is_set(), timeout=60.0)

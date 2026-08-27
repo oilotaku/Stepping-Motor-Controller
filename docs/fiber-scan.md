@@ -182,3 +182,17 @@ self._write(f":SENS{self.ch}:POW:RANG -20DBM")
 **寫檔方式**：比照 `_write_json_with_backup()`，先寫 `.tmp` 再 `replace()`；中途失敗會清掉 `.tmp`。半殘的 xlsx 用 Excel 開起來會直接報毀損，比沒有檔案更難診斷。
 
 **回歸測試**：[verify_scan_export.py](../verify_scan_export.py)（24 項）——**真的把檔案寫出來再用 `zipfile` 解開 xlsx 內部 XML 讀回驗證**，沒有 mock 掉 `xlsxwriter`。這個功能唯一的價值就是「產生的檔案 Excel 打得開、欄位對得上」，把寫檔那段換成假物件等於什麼都沒測到。用 `zipfile` 而非 openpyxl 是為了不再多一個測試專用相依（venv 也沒有 openpyxl）。
+
+#### 尋光分頁的預設速度調成 10 倍（2026-08-27，配合分度變更）
+
+本節由 AI 協助整理（This document was AI-assisted）。
+
+**改了什麼**：「尋光」分頁〈速度設定〉的四個預設值全部調成原本的 10 倍——`l_speed` 5→50 pps、`f_speed` 1000→10000 pps、`rate` 100→1000 ms、`s_rate` 5→50 %（[main_ai.py](../main_ai.py) `_build_tab_scan` 的 `tk.StringVar` 初始值）。
+
+**為什麼**：驅動器的**分度（division）設定調整為原本的 1/10**——同一顆馬達走同樣的物理距離，現在對應的 pulse 數變成 10 倍（每個 pulse 代表的實際位移縮小為 1/10）。速度單位是 pps（pulse/sec），分度變細後，原本的 pps 數字對應的物理移動速度也跟著掉到 1/10；把尋光分頁四個速度預設值同步調成 10 倍，是為了讓實際移動速度維持跟分度調整前一致，不是單純把尋光調快。
+
+🔴 **這是「尋光」分頁專屬的預設值，跟〈移動控制〉分頁的〈速度設定〉卡（[main_ai.py:1180-1186](../main_ai.py#L1180-L1186)）是兩組獨立的 `tk.StringVar`，這次沒有跟著改。** 若〈移動控制〉分頁之後也要因為同一個分度變更調整手動點動速度，需要另外處理，不要假設兩邊已經同步。
+
+**已一併修掉的不一致**：`_do_start_scan()` 組 `scanner_kwargs` 時，四個速度欄位若被使用者清空會退回救援預設值（[main_ai.py](../main_ai.py) 的 `scanner_kwargs` 建構處），原本這組救援值還停在舊的 10 倍前數字（"5"/"1000"/"100"/"5"），沒有跟著 Entry 的新預設一起改，正常路徑不會踩到（Entry 一開始就帶新預設），但使用者清空欄位時會悄悄退回分度調整前的舊速度。已同步改成 "50"/"10000"/"1000"/"50"。
+
+⚠ **這次改動未附回歸測試**——四個值都是 UI 預設字串，`verify_blind_scan.py`／`verify_scan_export.py` 等既有測試都是自建 `FiberAlignmentScanner` 時直接傳入速度參數，不經過這條 GUI 預設值路徑，沒有測試需要同步更新，也沒有新增測試涵蓋「分度變更後速度預設是否正確换算」這件事本身（那屬於實機校正判斷，不是程式邏輯可驗證的範圍）。

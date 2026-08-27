@@ -3963,10 +3963,10 @@ class DS102GUI:
         # 既有標籤命名，不要另外發明一套詞彙。
         spd_f = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
         spd_f.pack(fill="x", padx=12, pady=(8, 4))
-        self._scan_l_speed_var = tk.StringVar(value=cfg.get("l_speed", "5"))
-        self._scan_f_speed_var = tk.StringVar(value=cfg.get("f_speed", "1000"))
-        self._scan_rate_var = tk.StringVar(value=cfg.get("rate", "100"))
-        self._scan_s_rate_var = tk.StringVar(value=cfg.get("s_rate", "5"))
+        self._scan_l_speed_var = tk.StringVar(value=cfg.get("l_speed", "50"))
+        self._scan_f_speed_var = tk.StringVar(value=cfg.get("f_speed", "10000"))
+        self._scan_rate_var = tk.StringVar(value=cfg.get("rate", "1000"))
+        self._scan_s_rate_var = tk.StringVar(value=cfg.get("s_rate", "50"))
         for r, (lbl, var) in enumerate(
             [
                 ("Start-up Speed (L)", self._scan_l_speed_var),
@@ -4611,6 +4611,42 @@ class DS102GUI:
             self._flash_banner("尋光需要至少選擇一個軸")
             return
 
+        # 四個速度欄位（Start-up Speed L／Driving Speed F／Accel-Decel Rate R／
+        # S-curve Rate S）與可選的 f_speed_min 都是原始文字輸入，直接組進
+        # DS102 指令字串（L0／R0／S0／F0）或送進 FiberAlignmentScanner
+        # 建構子的 float()。float() 能接受 "nan"／"inf"／"0"／負值，但這些
+        # 值送進控制器毫無意義（`F0 nan` 這種指令可能被整條拒收，或讓滑台
+        # 用未定義速度移動）——一律在打開確認對話框之前擋下，跟上面的
+        # 0 軸檢查同一個理由：不該讓使用者看到一個注定會失敗的確認視窗，
+        # 也絕不能讓壞值走到已經送出序列埠指令那一步才發現。
+        def _validate_speed(raw: str, label: str) -> float:
+            try:
+                value = float(raw)
+            except ValueError:
+                raise ValueError(f"{label} 必須是數字，目前是「{raw}」") from None
+            if not math.isfinite(value):
+                raise ValueError(f"{label} 必須是有限數值，不可為 NaN 或無限大")
+            if value <= 0:
+                raise ValueError(f"{label} 必須是正值，目前是 {value:g}")
+            return value
+
+        try:
+            _validate_speed(self._scan_l_speed_var.get().strip() or "50", "Start-up Speed (L)")
+            f_speed_val = _validate_speed(self._scan_f_speed_var.get().strip() or "10000", "Driving Speed (F)")
+            _validate_speed(self._scan_rate_var.get().strip() or "1000", "Accel/Decel Rate (R)")
+            _validate_speed(self._scan_s_rate_var.get().strip() or "50", "S-curve Rate (S)")
+            f_speed_min_raw = self._scan_f_speed_min_var.get().strip()
+            if f_speed_min_raw:
+                f_speed_min_val = _validate_speed(f_speed_min_raw, "最低速度 f_speed_min")
+                if f_speed_min_val > f_speed_val:
+                    raise ValueError(
+                        f"最低速度 f_speed_min（{f_speed_min_val:g}）不可大於 "
+                        f"Driving Speed F（{f_speed_val:g}）"
+                    )
+        except ValueError as e:
+            self._flash_banner(f"尋光參數錯誤：{e}")
+            return
+
         axis_summary = " ".join(f"{ax}={self._scan_axis_step_vars[ax].get()}" for ax in selected_axes)
         axes_txt = "、".join(selected_axes)
         stage2_txt = "啟用" if self._scan_stage2_var.get() else "不啟用"
@@ -4740,10 +4776,10 @@ class DS102GUI:
         # 實際值在 _parse_int/_parse_float 已轉成 FiberAlignmentScanner
         # 建構子要求的正確型別。
         scanner_kwargs = {
-            "l_speed": self._scan_l_speed_var.get().strip() or "5",
-            "f_speed": self._scan_f_speed_var.get().strip() or "1000",
-            "rate": self._scan_rate_var.get().strip() or "100",
-            "s_rate": self._scan_s_rate_var.get().strip() or "5",
+            "l_speed": self._scan_l_speed_var.get().strip() or "50",
+            "f_speed": self._scan_f_speed_var.get().strip() or "10000",
+            "rate": self._scan_rate_var.get().strip() or "1000",
+            "s_rate": self._scan_s_rate_var.get().strip() or "50",
             "step_min": _parse_int(self._scan_step_min_var.get(), DEFAULT_STEP_MIN),
             "settle_sec": _parse_float(self._scan_settle_sec_var.get(), DEFAULT_SETTLE_SEC),
             "max_cycles": _parse_int(self._scan_max_cycles_var.get(), DEFAULT_MAX_CYCLES),
@@ -4817,13 +4853,28 @@ class DS102GUI:
             self.root.after(0, lambda: self._scan_status_var.set(msg))
             self.ctrl._log("INFO", f"[尋光] {msg}")
 
-        scanner = FiberAlignmentScanner(
-            self.ctrl, self._scanner_power_query,
-            progress_cb=_progress,
-            sample_cb=self._on_scan_sample,
-            selected_axes=selected_axes,
-            **scanner_kwargs,
-        )
+        # 🔴 f_speed／f_speed_min 是未經驗證的原始文字輸入，FiberAlignmentScanner
+        # 建構子內部直接 float() 轉換、失敗就丟 ValueError——此時 _scanning
+        # 已經 set()、兩個按鈕也已切換成「搜尋中」狀態，若不在這裡接住，
+        # 例外會直接炸穿 _do_start_scan()：背景執行緒從未啟動，
+        # _on_scan_done() 也就永遠不會被呼叫去解鎖畫面，UI 會卡死在
+        # 「掃描中」，開始鍵永久按不下去。
+        try:
+            scanner = FiberAlignmentScanner(
+                self.ctrl, self._scanner_power_query,
+                progress_cb=_progress,
+                sample_cb=self._on_scan_sample,
+                selected_axes=selected_axes,
+                **scanner_kwargs,
+            )
+        except (ValueError, TypeError) as e:
+            self._scanning.clear()
+            self._scan_start_btn.config(state="normal")
+            self._scan_stop_btn.config(state="disabled")
+            self._scan_status_var.set("尚未開始")
+            self.ctrl._log("ERROR", f"[尋光] 參數錯誤，無法建立 scanner: {e}")
+            messagebox.showerror("參數錯誤", f"尋光參數輸入有誤，無法開始：\n{e}")
+            return
         self._active_scanner = scanner
 
         def _run():
