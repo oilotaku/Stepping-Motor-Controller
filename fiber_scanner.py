@@ -310,6 +310,250 @@ def _default_scan_dir() -> Path:
 
 
 # =============================================================================
+# 樣本 → Excel（.xlsx）匯出
+# =============================================================================
+# xlsxwriter 只在「產報表」時用得到，跟量測／移動主流程毫無關係。比照
+# main_ai.py 對 matplotlib 的處理方式優雅降級：裝不到就不寫 Excel，既有的
+# JSON 樣本檔照常產出，尋光本身完全不受影響——樣本持久化是「跑到哪裡出
+# 問題」的唯一資料來源，絕不能因為一個報表格式的相依套件缺席而失效。
+try:
+    import xlsxwriter  # type: ignore
+
+    _XLSXWRITER_AVAILABLE = True
+    _XLSXWRITER_IMPORT_ERROR = ""
+except ImportError as _xlsx_err:  # pragma: no cover - 取決於執行環境
+    xlsxwriter = None  # type: ignore
+    _XLSXWRITER_AVAILABLE = False
+    _XLSXWRITER_IMPORT_ERROR = str(_xlsx_err)
+
+# Excel 儲存格上限是 32767 個字元，超過會被 xlsxwriter 拒收（整份寫檔失敗）。
+# note 欄理論上不會這麼長，但截斷比讓整份報表寫不出來好。
+_XLSX_CELL_LIMIT = 32000
+
+
+def _sample_axes(samples: List["Sample"]) -> List[str]:
+    """這批樣本實際量到的軸，依 AXES 的固定順序排列。"""
+    seen = set()
+    for s in samples:
+        seen.update(s.coords.keys())
+    ordered = [ax for ax in AXES if ax in seen]
+    # 不在 AXES 清單裡的鍵理論上不會出現，但假物件測試可能塞進來。附在
+    # 後面而不是靜默丟掉——報表少一整欄比多一欄難察覺得多。
+    ordered += sorted(str(k) for k in seen if k not in AXES)
+    return ordered
+
+
+def export_samples_xlsx(
+    samples: List["Sample"],
+    path: Path,
+    *,
+    completed: Optional[bool] = None,
+    abort_reason: Optional[str] = None,
+    extra_meta: Optional[Dict[str, object]] = None,
+) -> Path:
+    """
+    把樣本寫成一份 .xlsx（兩張工作表：〈摘要〉與〈樣本〉）。
+
+    與 `persist_samples()` 寫的 JSON 是**互補**而非取代：JSON 是完整、
+    無損、給程式讀的原始紀錄（事後重繪軌跡圖、回溯除錯都靠它）；xlsx 是
+    給人看的報表，欄位攤平成表格、加了 μm 估算欄與統計摘要。兩者同時
+    產出，不要為了「省一個檔」把 JSON 換掉。
+
+    寫法比照 `_write_json_with_backup()`：先寫 `.tmp` 再 `replace`，
+    避免中途失敗留下一份半殘的 xlsx（Excel 開起來會直接報毀損）。
+
+    失敗一律拋例外（`RuntimeError` = 沒有 xlsxwriter；`ValueError` = 沒有
+    樣本；`OSError` = 寫檔失敗），由呼叫端決定要靜默略過（persist_samples）
+    還是跳訊息框（GUI 的手動匯出按鈕）。
+    """
+    if not _XLSXWRITER_AVAILABLE:
+        raise RuntimeError(
+            f"未安裝 xlsxwriter，無法輸出 Excel（{_XLSXWRITER_IMPORT_ERROR}）"
+        )
+    if not samples:
+        raise ValueError("沒有樣本可匯出")
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    axes = _sample_axes(samples)
+    um_axes = [
+        ax for ax in axes if any(s.coords_um and ax in s.coords_um for s in samples)
+    ]
+
+    valid = [s for s in samples if s.ok and s.power is not None]
+    best = max(valid, key=lambda s: s.power if s.power is not None else float("-inf")) if valid else None
+    best_idx = samples.index(best) + 1 if best is not None else None
+
+    # 校正參數快照取「最後一筆有帶的」——一輪搜尋期間使用者理論上不會去
+    # 改校正參數，取最後一筆與取第一筆結果相同；真的中途被改過時，取最後
+    # 一筆反映的才是這輪結束時實際生效的那組。
+    calib: Dict[str, dict] = {}
+    for s in samples:
+        if s.calib_snapshot:
+            calib = s.calib_snapshot
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    wb = xlsxwriter.Workbook(str(tmp))
+    try:
+        f_title = wb.add_format({"bold": True, "font_size": 12})
+        f_warn = wb.add_format({"font_color": "#B36B00"})
+        f_head = wb.add_format(
+            {"bold": True, "bg_color": "#DDE6F0", "border": 1, "align": "center"}
+        )
+        f_key = wb.add_format({"bold": True, "bg_color": "#F2F2F2", "border": 1})
+        f_val = wb.add_format({"border": 1})
+        f_pulse = wb.add_format({"num_format": "#,##0", "border": 1})
+        f_um = wb.add_format({"num_format": "0.000", "border": 1})
+        f_pw = wb.add_format({"num_format": "0.00", "border": 1})
+
+        # ── 工作表：摘要 ──────────────────────────────────────────────
+        ws = wb.add_worksheet("摘要")
+        ws.set_column(0, 0, 22)
+        ws.set_column(1, 1, 46)
+        ws.write(0, 0, "尋光搜尋結果摘要", f_title)
+
+        rows: List[Tuple[str, object]] = [
+            ("匯出時間", datetime.now().isoformat(timespec="seconds")),
+            (
+                "結束狀態",
+                "完成" if completed else ("中止／未完成" if completed is not None else "未提供"),
+            ),
+        ]
+        if abort_reason:
+            rows.append(("中止原因", abort_reason))
+        rows += [
+            ("樣本總數", len(samples)),
+            ("有效樣本數", len(valid)),
+            ("搜尋軸", "、".join(axes) if axes else "—"),
+            ("起始時間", samples[0].ts),
+            ("結束時間", samples[-1].ts),
+        ]
+        if best is not None:
+            rows.append(("最佳功率 (dBm)", round(best.power, 3) if best.power is not None else "—"))
+            rows.append(("最佳樣本序號", best_idx))
+            rows.append(
+                (
+                    "最佳座標 (pulse)",
+                    "  ".join(f"{ax}={best.coords.get(ax, 0.0):,.0f}" for ax in axes),
+                )
+            )
+            if best.coords_um:
+                rows.append(
+                    (
+                        "最佳座標 (µm 估算)",
+                        "  ".join(
+                            f"{ax}={best.coords_um[ax]:,.3f}"
+                            for ax in um_axes
+                            if ax in best.coords_um
+                        ),
+                    )
+                )
+        else:
+            rows.append(("最佳功率 (dBm)", "—（整輪沒有任何有效讀值）"))
+        rows.append(
+            (
+                "最終座標 (pulse)",
+                "  ".join(f"{ax}={samples[-1].coords.get(ax, 0.0):,.0f}" for ax in axes),
+            )
+        )
+        for ax in axes:
+            p = calib.get(ax)
+            if p:
+                rows.append(
+                    (
+                        f"{ax} 軸校正參數",
+                        f"導程 {p.get('lead_pitch_mm')} mm／步進角 "
+                        f"{p.get('step_angle_deg')}°／分度 {p.get('division')}",
+                    )
+                )
+        for k, v in (extra_meta or {}).items():
+            rows.append((str(k), v))
+
+        r = 3
+        for key, val in rows:
+            ws.write(r, 0, key, f_key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                ws.write_number(r, 1, val, f_val)
+            else:
+                ws.write_string(r, 1, str(val)[:_XLSX_CELL_LIMIT], f_val)
+            r += 1
+        # µm 欄是估算顯示值，不是量測值——報表被單獨傳出去時，這句話是唯一
+        # 能阻止讀者把它當實測位移引用的東西（見 docs/axis-calibration.md）。
+        if um_axes:
+            ws.write(
+                r + 1,
+                0,
+                "⚠ µm 欄為依機械校正參數換算的估算值，非實測位移；pulse 才是控制器的原始單位。",
+                f_warn,
+            )
+
+        # ── 工作表：樣本 ──────────────────────────────────────────────
+        ws2 = wb.add_worksheet("樣本")
+        headers = ["#", "時間"]
+        headers += [f"{ax} (pulse)" for ax in axes]
+        headers += [f"{ax} (µm 估算)" for ax in um_axes]
+        headers += ["功率 (dBm)", "有效", "備註"]
+        for c, h in enumerate(headers):
+            ws2.write(0, c, h, f_head)
+        ws2.set_column(0, 0, 6)
+        ws2.set_column(1, 1, 20)
+        ws2.set_column(2, max(2, len(headers) - 2), 13)
+        ws2.set_column(len(headers) - 1, len(headers) - 1, 40)
+        ws2.freeze_panes(1, 2)
+        ws2.autofilter(0, 0, len(samples), len(headers) - 1)
+
+        for i, s in enumerate(samples, start=1):
+            c = 0
+            ws2.write_number(i, c, i, f_val)
+            c += 1
+            ws2.write_string(i, c, str(s.ts), f_val)
+            c += 1
+            for ax in axes:
+                v = s.coords.get(ax)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    ws2.write_number(i, c, float(v), f_pulse)
+                else:
+                    ws2.write_blank(i, c, None, f_pulse)
+                c += 1
+            for ax in um_axes:
+                v = (s.coords_um or {}).get(ax)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    ws2.write_number(i, c, float(v), f_um)
+                else:
+                    ws2.write_blank(i, c, None, f_um)
+                c += 1
+            # 🔴 power 有值但 ok=False 時照樣寫進去（讀值低於絕對下限的情況，
+            # 見 Sample 的 docstring）——那個數值是事後判斷「門檻是不是設太高」
+            # 的唯一依據，「有效」欄已經分辨得出來，不需要再把數值抹掉。
+            if isinstance(s.power, (int, float)) and not isinstance(s.power, bool):
+                ws2.write_number(i, c, float(s.power), f_pw)
+            else:
+                ws2.write_blank(i, c, None, f_pw)
+            c += 1
+            ws2.write_string(i, c, "是" if s.ok else "否", f_val)
+            c += 1
+            ws2.write_string(i, c, str(s.note or "")[:_XLSX_CELL_LIMIT], f_val)
+
+        wb.close()
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    try:
+        tmp.replace(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+# =============================================================================
 # FiberAlignmentScanner
 # =============================================================================
 class FiberAlignmentScanner:
@@ -433,6 +677,9 @@ class FiberAlignmentScanner:
         # None＝沒有中止。見 run() 的 except 區塊說明為什麼不讓呼叫端
         # 繼續對訊息字串做子字串比對。
         self.last_abort_kind: Optional[str] = None
+        # 這一輪自動寫出的 Excel 報表路徑（沒裝 xlsxwriter 或寫檔失敗時是
+        # None）。GUI 端拿它顯示「報表在哪」，不必自己重組檔名。
+        self.last_xlsx_path: Optional[Path] = None
         # 階段二開始時記下 samples 的長度，_estimate_gradient 只從這個
         # 索引之後取鄰居——見該方法 docstring 說明為什麼不能用階段一的
         # 歷史樣本。
@@ -488,6 +735,7 @@ class FiberAlignmentScanner:
 
         self.ctrl.scanning_active = True
         self.last_abort_reason = None  # 重置：這個實例若被重複呼叫 run()，不能沿用上一輪的中止原因
+        self.last_xlsx_path = None  # 同上，不能讓 GUI 指到上一輪的報表
         self.last_abort_kind = None
         self._signal_confirmed = False  # 同理：量程鎖定的一次性旗標也要重置
         # 行程邊界是「這一輪實測到的」，不跨輪沿用：兩輪之間可能做過原點
@@ -591,6 +839,15 @@ class FiberAlignmentScanner:
             # 無訊號中止訊息時這個耦合就繃不住了，改成由這裡直接給型別。
             self.last_abort_kind = "no_signal" if isinstance(e, NoSignalAbort) else "other"
             self._log(f"搜尋中止：{e}")
+        except Exception as e:
+            # 非預期例外（非 ScanAbort）也要讓 last_abort_reason／kind 有值，
+            # 否則 finally 照樣呼叫 persist_samples()，報表會輸出但完全看
+            # 不出中止原因——這是自動輸出的報表唯一能還原「跑到哪裡出錯」
+            # 的欄位，不能因為例外種類是未預期的就留白。
+            self.last_abort_reason = f"未預期例外：{e}"
+            self.last_abort_kind = "exception"
+            self._log(f"搜尋因未預期例外中止：{e}")
+            raise
         finally:
             self.ctrl.scanning_active = False
             self.persist_samples(completed=completed, scan_dir=scan_dir)
@@ -1723,17 +1980,22 @@ class FiberAlignmentScanner:
         if not self.samples:
             return None
         out_dir = scan_dir or _default_scan_dir()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 檔名用微秒精度：同一秒內連續兩輪 persist_samples()（例如階段零
+        # 盲搜後緊接失敗中止、run() 又立刻重跑一輪）曾經共用同一個檔名，
+        # tmp.replace() 不報錯，第一輪的原始樣本會被靜默覆蓋消失。
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = out_dir / f"scan_{ts}.json"
         data = {
             "completed": completed,
             "saved": datetime.now().isoformat(timespec="seconds"),
             "sample_count": len(self.samples),
+            "abort_reason": self.last_abort_reason,
+            "abort_kind": self.last_abort_kind,
             "samples": [s.to_dict() for s in self.samples],
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         try:
+            out_dir.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.replace(path)
         except OSError as e:
@@ -1744,4 +2006,33 @@ class FiberAlignmentScanner:
                 pass
             return None
         self._log(f"搜尋樣本已存檔：{path.name}（{len(self.samples)} 筆）")
+        self.last_xlsx_path = self._persist_samples_xlsx(path, completed)
         return path
+
+    def _persist_samples_xlsx(self, json_path: Path, completed: bool) -> Optional[Path]:
+        """
+        在 JSON 旁邊再寫一份同檔名的 .xlsx 報表。
+
+        🔴 **任何失敗都只記 log、不往外拋。** 這個函式跑在 `run()` 的
+        `finally` 裡，緊接在 JSON 寫完之後——JSON 才是「跑到哪裡出問題」
+        的權威紀錄，絕不能因為報表格式的相依套件缺席、或檔案被 Excel 開著
+        鎖住（Windows 上會 PermissionError，實務上很容易發生：使用者上一輪
+        的報表還開著），就讓例外炸穿 finally、蓋掉原本要回傳的結果。
+        """
+        xlsx_path = json_path.with_suffix(".xlsx")
+        try:
+            export_samples_xlsx(
+                self.samples,
+                xlsx_path,
+                completed=completed,
+                abort_reason=self.last_abort_reason,
+            )
+        except RuntimeError as e:
+            # 沒裝 xlsxwriter：講一次就好，不必每輪都當成錯誤
+            self._log(f"未輸出 Excel 報表：{e}")
+            return None
+        except Exception as e:
+            self._log(f"Excel 報表寫入失敗（JSON 樣本檔不受影響）: {e}")
+            return None
+        self._log(f"Excel 報表已存檔：{xlsx_path.name}")
+        return xlsx_path

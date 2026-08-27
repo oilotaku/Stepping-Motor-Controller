@@ -156,3 +156,29 @@ self._write(f":SENS{self.ch}:POW:RANG -20DBM")
 ⚠ 附帶觀察：測試當下 Y 軸連線後座標即為 `0.0`，而 -6000 的移動指令送出後座標**完全沒有變化**就回報撞限位——代表這次連線時 Y 已經停在 CCW 端附近，與 [hardware.md](hardware.md) 2026-07-31 記載「Y 的 CW 端在 0 附近」的座標系不是同一個。這正是文件早就寫明的「`POS` 是相對暫存器，再次復歸會重設，端點的座標值會變」，不代表量測有誤，只是提醒兩份記錄的座標系不能互相比對。
 
 **⚠ 使用者側的設定同樣值得調整**：`recordings/scanner_config.json` 目前是 `blind_max_radius=10000`／`blind_step=2000`。半徑 10000 對 Y 軸（全行程 4146 pulse）本來就有一大半掃不到，這個修正只是讓掃不到的部分**不再用撞的**去發現。要讓盲搜真的有效率，半徑應該依各軸實際行程設定，或先在 GUI 的〈軟體行程限制〉填上實測端點。
+
+#### 尋光樣本的 Excel 報表（2026-08-26）
+
+本節由 AI 協助撰寫（This document was AI-assisted）。
+
+**產出什麼**：每輪尋光結束時（完成、中止、例外都算），`persist_samples()` 在既有的 `recordings/scans/scan_YYYYMMDD_HHMMSS.json` **旁邊**再寫一份同檔名的 `.xlsx`。另外「尋光」分頁工具列新增「⤓ 匯出 Excel」按鈕，讓使用者自選存檔位置——兩條路徑共用同一個產生器 `fiber_scanner.export_samples_xlsx()`，報表內容一致。
+
+**🔴 xlsx 不取代 JSON，兩份都要。** JSON 是完整、無損、給程式讀的原始紀錄（事後重繪軌跡圖、回溯除錯都靠它，`Sample` 的每個欄位原樣保存）；xlsx 是給人看的報表，欄位攤平成表格、多了 μm 估算欄與統計摘要，但 `calib_snapshot` 只留最後一筆、note 超過 32000 字元會截斷。為了「省一個檔」把 JSON 換成 xlsx 等於把唯一能回答「跑到哪裡出問題」的資料來源降級。
+
+**🔴 xlsx 的任何失敗都只記 log、不往外拋（`_persist_samples_xlsx()`）。** 這個函式跑在 `run()` 的 `finally` 裡、緊接在 JSON 寫完之後。實務上最常見的失敗是 **Windows 上目標檔正被 Excel 開著造成的 `PermissionError`**（使用者上一輪的報表還開著就會遇到），其次是沒裝 `xlsxwriter`。讓例外炸穿 `finally` 會蓋掉 `run()` 原本要回傳的最終座標，換來的只是一個報表格式的問題。`verify_scan_export.py::TestPersistSamplesIntegration::test_xlsx寫失敗不影響json` 鎖這一點。
+
+**相依套件優雅降級**：`xlsxwriter` 比照 main_ai.py 對 matplotlib 的處理——`fiber_scanner` 頂端 try/except import，缺席時 `_XLSXWRITER_AVAILABLE=False`，自動存檔靜默跳過（只記一行 log），GUI 的匯出鍵在建分頁時就 disable 並把原因寫進按鈕文字（「⤓ 匯出 Excel（缺 xlsxwriter）」），而不是讓使用者按下去才看到例外。已列入 `requirements.txt`。
+
+**報表內容**：
+
+- 〈摘要〉：匯出時間、結束狀態（完成／中止＋中止原因）、樣本總數與有效樣本數、搜尋軸、起訖時間、最佳功率與其座標與序號、最終座標、各軸校正參數快照。有 μm 欄時附一行警語——μm 是依機械校正參數換算的**估算顯示值、不是實測位移**（見 [axis-calibration.md](axis-calibration.md)），報表被單獨傳出去時這句是唯一能阻止讀者當實測值引用的東西。
+- 〈樣本〉：每筆一列，`#`／時間／各軸 pulse／各軸 μm 估算／功率 dBm／有效／備註。凍結窗格 + 自動篩選。
+
+**兩個容易改錯的地方**：
+
+- 🔴 **`ok=False` 但 `power` 有數值時，功率欄照樣寫出，不可抹掉。** 那是 `Sample` docstring 講的第二種情況（讀值低於絕對下限，`min_valid_power_dbm`），該數值是事後判斷「門檻是不是設太高」的唯一依據；「有效」欄已經分辨得出來。只有通訊失敗（`power=None`）才留空。
+- **軸欄依 `AXES` 的固定順序排，不是依 `coords` 的鍵出現順序**（`_sample_axes()`）——否則同一輪不同樣本的欄序可能不一致。不在 `AXES` 裡的鍵附在最後而不是丟掉：報表少一整欄比多一欄難察覺得多。
+
+**寫檔方式**：比照 `_write_json_with_backup()`，先寫 `.tmp` 再 `replace()`；中途失敗會清掉 `.tmp`。半殘的 xlsx 用 Excel 開起來會直接報毀損，比沒有檔案更難診斷。
+
+**回歸測試**：[verify_scan_export.py](../verify_scan_export.py)（24 項）——**真的把檔案寫出來再用 `zipfile` 解開 xlsx 內部 XML 讀回驗證**，沒有 mock 掉 `xlsxwriter`。這個功能唯一的價值就是「產生的檔案 Excel 打得開、欄位對得上」，把寫檔那段換成假物件等於什麼都沒測到。用 `zipfile` 而非 openpyxl 是為了不再多一個測試專用相依（venv 也沒有 openpyxl）。

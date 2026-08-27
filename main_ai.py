@@ -52,6 +52,8 @@ from fiber_scanner import (
     DEFAULT_BLIND_MAX_RADIUS,
     DEFAULT_BLIND_SIGNAL_SIGMA_MULT,
     DEFAULT_BLIND_SIGNAL_MIN_DELTA_DB,
+    export_samples_xlsx,
+    _XLSXWRITER_AVAILABLE,
 )
 # DS102Controller 與其專屬的模組層級常數／函式已抽到 ds102_ctrl.py
 # （2026-08-17，架構拆分第一階段 1a，機械式搬移，行為不變）。
@@ -500,6 +502,12 @@ class DS102GUI:
         # 這個勾選框永遠回到未勾選，且沒有任何提示告訴使用者設定其實有存）。
         self._scan_status_var = tk.StringVar(value="尚未開始")
         self._scan_elapsed_var = tk.StringVar(value="00:00")
+        # 上一輪搜尋的結束狀態，供「匯出 Excel」把「完成／中止」與中止原因
+        # 寫進報表〈摘要〉。刻意不從 self._active_scanner 讀——_on_scan_done
+        # 已經把它清成 None（那是必要的，scanner 實例不該被 GUI 續抱），
+        # 使用者按匯出時早就沒有 scanner 可問了。
+        self._scan_last_completed: Optional[bool] = None
+        self._scan_last_abort_reason: Optional[str] = None
         self._scan_start_time = 0.0
         # 設定檔載入延後套用：這裡的 tk.StringVar/BooleanVar 要等
         # _build_tab_scan 建立分頁時才會存在，先把設定檔內容存成普通 dict，
@@ -3699,6 +3707,18 @@ class DS102GUI:
             toolbar, text="■ 停止尋光", style="Danger.TButton", command=self._do_stop_scan, state="disabled"
         )
         self._scan_stop_btn.pack(side="left", padx=4, pady=8)
+        # 匯出鍵刻意**不**放進 _drive_buttons，也不隨尋光進行中 disable：
+        # 它只讀主執行緒的 self._scan_samples、不碰序列埠也不碰 GPIB，
+        # 搜尋跑到一半想先撈一份中途資料出來看是完全合理的操作。
+        self._scan_export_btn = ttk.Button(
+            toolbar, text="⤓ 匯出 Excel", style="Info.TButton",
+            command=self._export_scan_xlsx,
+        )
+        self._scan_export_btn.pack(side="left", padx=4, pady=8)
+        if not _XLSXWRITER_AVAILABLE:
+            # 跟 matplotlib 缺席時整個分頁停用同一種處理：講清楚為什麼不能按，
+            # 而不是讓使用者按下去才看到例外訊息。
+            self._scan_export_btn.config(state="disabled", text="⤓ 匯出 Excel（缺 xlsxwriter）")
         tk.Label(
             toolbar, textvariable=self._scan_status_var, bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 11, "bold")
         ).pack(side="left", padx=(16, 6))
@@ -4675,6 +4695,11 @@ class DS102GUI:
         # 上一輪如果是無訊號中止、使用者還沒按「知道了」就直接開始下一輪，
         # 這條常駐提示不該繼續掛著誤導這一輪的狀態。
         self._hide_scan_no_signal_notice()
+        # 同理必須重設：新掃描還在跑的時候若按下「匯出 Excel」
+        # （_export_scan_xlsx），不重設這兩個會把上一輪的完成／中止狀態
+        # 誤標到這一輪還在進行中的報表上。
+        self._scan_last_completed = None
+        self._scan_last_abort_reason = None
 
         initial_step = {}
         for ax, var in self._scan_axis_step_vars.items():
@@ -4873,6 +4898,13 @@ class DS102GUI:
 
     def _on_scan_done(self, kind: str, result, err):
         self._scanning.clear()
+        # 先把 scanner 身上這輪的收尾資訊撈出來再放掉它——下面就把
+        # _active_scanner 清成 None 了，之後（例如使用者稍後才按「匯出
+        # Excel」）沒有第二次機會問。
+        scanner = self._active_scanner
+        auto_xlsx = getattr(scanner, "last_xlsx_path", None) if scanner else None
+        self._scan_last_completed = kind == "completed"
+        self._scan_last_abort_reason = None if kind == "completed" else err
         self._active_scanner = None
         self._scan_start_btn.config(state="normal")
         self._scan_stop_btn.config(state="disabled")
@@ -4898,6 +4930,7 @@ class DS102GUI:
             self._flash_banner(
                 f"✔ 尋光完成 — 最終座標 {result}（共 {self._scan_sample_count} 筆樣本，"
                 f"耗時 {self._scan_elapsed_var.get()}）"
+                + (f"　報表：{auto_xlsx.name}" if auto_xlsx else "")
             )
         elif kind == "user_stopped":
             self._scan_status_var.set("已停止（使用者中止）")
@@ -4920,6 +4953,58 @@ class DS102GUI:
         # （250ms 節奏）也會自然收回提示列，但這裡主動呼叫一次讓收尾更
         # 即時，不必讓使用者多等最多一個節奏週期。
         self._pm_sync_scan_notice()
+
+    def _export_scan_xlsx(self):
+        """
+        把目前記憶體裡的尋光樣本另存成 Excel。
+
+        跟 `FiberAlignmentScanner.persist_samples()` 每輪自動寫進
+        `recordings/scans/` 的那份是**同一個產生器**（`export_samples_xlsx`），
+        差別只在這裡讓使用者挑存檔位置——要交出去給別人看的那份通常不會想
+        放在程式目錄底下。
+
+        資料來源是 `self._scan_samples`（主執行緒專用的完整歷史），不是
+        scanner 實例——搜尋結束後 `_active_scanner` 已經被清成 None，但畫面
+        上的樣本還在，使用者這時才想到要匯出是很正常的操作順序。
+        """
+        # 併入還沒被 250ms 重繪節奏搬過來的最後一批，理由同 _on_scan_done：
+        # 搜尋剛結束就馬上按匯出時，尾巴那幾筆有機會還卡在 pending。
+        try:
+            with self._scan_plot_lock:
+                pending, self._scan_plot_pending = self._scan_plot_pending, []
+            if pending:
+                self._scan_plot_extend(pending)
+        except tk.TclError:
+            pass
+
+        samples = list(self._scan_samples)  # 取快照：對話框開著時背景仍可能追加
+        if not samples:
+            self._flash_banner("尚未有任何尋光樣本可匯出", 5000)
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel 活頁簿", "*.xlsx"), ("All", "*.*")],
+            initialfile=f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        )
+        if not path:
+            return
+        try:
+            export_samples_xlsx(
+                samples,
+                Path(path),
+                completed=self._scan_last_completed,
+                abort_reason=self._scan_last_abort_reason,
+                extra_meta={"匯出方式": "使用者手動匯出（尋光分頁）"},
+            )
+        except Exception as e:
+            # PermissionError 是這裡最常見的失敗：目標檔正被 Excel 開著。
+            # 訊息直接把它講出來，比讓使用者自己猜「為什麼存不了」有用。
+            messagebox.showerror("匯出失敗", f"Excel 匯出失敗：\n{e}")
+            self.ctrl._log("ERROR", f"[尋光] Excel 匯出失敗: {e}")
+            return
+        self.ctrl._log("INFO", f"[尋光] 已匯出 Excel：{path}（{len(samples)} 筆樣本）")
+        messagebox.showinfo("完成", f"已匯出 {len(samples)} 筆樣本:\n{path}")
 
     def _show_scan_no_signal_notice(self, msg: str):
         """
