@@ -8,9 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Windows 桌面應用，用 Python + tkinter 控制 **駿河精機 SURUGA SEIKI DS102 / DS112 步進馬達控制箱**（RS-232C / USB 虛擬 COM 埠），用於光纖對準與光學自動化量測。長期目標（見 [step-motor.txt](step-motor.txt)）是把滑台與 **HP 8153A 光波萬用表**（GPIB）串起來做自動掃描尋光。
 
-沒有 CI、沒有套件化結構——全部是可直接執行的頂層腳本。有七支回歸測試腳本（`verify_scan_tab.py` 57、`verify_meter_panel.py` 93、`verify_axis_calib.py` 50、`verify_blind_scan.py` 44、`verify_wait_axis_stop.py` 29、`verify_fiber_scanner_signal.py` 14、`verify_ctrl_pos_sync.py` 13，共 300 項，見下方〈常用指令〉。⚠ 這串數字每次加測試都會過期，以 `pytest --collect-only -q` 的實際輸出為準），用假物件跑 GUI 邏輯。2026-08-18 起改寫成 **pytest 測試檔**（檔名不變，透過 `pytest.ini` 的 `python_files` 設定讓 pytest 認得 `verify_*.py` 這個既有命名），VS Code 的 Testing 面板可以個別發現、個別重跑每一項；`conftest.py` 放共用的 fixture（建 GUI、跑 Tk mainloop、monkeypatch `RECORDING_DIR`）。
-
-🔴 **`conftest.py` 的 `make_gui()` 必須同時 `patch.object(main_ai, "RECORDING_DIR", ...)` 與 `patch.object(ds102_ctrl, "RECORDING_DIR", ...)`，只 patch 一邊等於沒防護（2026-08-19 實測踩到）。** `main_ai.py` 是用 `from ds102_ctrl import RECORDING_DIR` 重新引入，這只是另一個獨立綁定同一初始物件的名字；`DS102Controller` 的持久化方法（`save_point`／`set_axis_calib`／`save_recording`／`capture_controller_config` 等）全部定義在 `ds102_ctrl.py`，引用的是該模組**自己的**模組層級綁定，只 patch `main_ai.RECORDING_DIR` 完全攔不到這些方法，會直接寫進專案真正的 `recordings/`。`verify_scan_tab.py`／`verify_meter_panel.py` 之前沒踩到純粹是因為沒呼叫到這些方法，不代表這層防護真的有效——跟本檔記載「測試腳本清空過兩次 teaching points」是同一類風險。已在 `make_gui()` 修好，**任何新增的測試檔案都不需要（也不應該）再自己額外 patch 一次**，但改動 `conftest.py` 本身時要記得這兩邊要同步。**2026-08-21 起 `DATA_DIR` 也比照辦理**（`patch.object` main_ai 與 ds102_ctrl 兩邊，導到 `recording_dir/data`）：新增的 `save_homing_repeat_result()` 寫的是 `DATA_DIR` 而非 `RECORDING_DIR`，理由與上述完全相同——少 patch 一邊，測試就會寫進專案真正的 `data/`。
+沒有 CI、沒有套件化結構——全部是可直接執行的頂層腳本。有八支回歸測試腳本（清單見下方〈常用指令〉，實際項數以 `pytest --collect-only -q` 為準），用假物件跑 GUI 邏輯。2026-08-18 起改寫成 **pytest 測試檔**（檔名不變，透過 `pytest.ini` 的 `python_files` 設定讓 pytest 認得 `verify_*.py` 這個既有命名），VS Code 的 Testing 面板可以個別發現、個別重跑每一項；`conftest.py` 放共用的 fixture（建 GUI、跑 Tk mainloop、monkeypatch `RECORDING_DIR`）。
 
 ## 常用指令
 
@@ -23,7 +21,7 @@ venv/Scripts/python.exe probe_ds102.py --list            # 只列埠，不送任
 venv/Scripts/python.exe -m serial.tools.list_ports -v    # 原始序列埠清單
 venv/Scripts/python.exe -m pip install -r requirements.txt
 venv/Scripts/python.exe -m ruff check .                  # ruff 未列於 requirements.txt，需另行安裝
-venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py verify_wait_axis_stop.py verify_ctrl_pos_sync.py verify_blind_scan.py -v  # 七支合計 300 項（2026-08-26 實測），不需硬體
+venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py verify_wait_axis_stop.py verify_ctrl_pos_sync.py verify_blind_scan.py verify_scan_export.py -v  # 不需硬體
 venv/Scripts/python.exe -m pytest verify_scan_tab.py::TestUserStop -v          # 只跑某個 class／單一測試（VS Code Test Explorer 用同一套機制）
 ```
 
@@ -42,15 +40,15 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | 檔案 | 定位 |
 |---|---|
 | [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，功能與修正都加在這裡 |
-| [ds102_ctrl.py](ds102_ctrl.py) | 🔴 **不要跟下面的 `ds102_controller.py` 搞混**——這是 2026-08-17 從 main_ai.py 拆出來的 `DS102Controller` 本體（現役程式碼，約 3763 行），main_ai.py 用 `from ds102_ctrl import DS102Controller, ...` 引入。細節見下方〈main_ai.py 架構〉 |
-| [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照（約 1970 行，跟上面的 `ds102_ctrl.py` 是完全不同的兩個檔案）。已進版控，可作為對照，但**不要在此新增功能** |
+| [ds102_ctrl.py](ds102_ctrl.py) | 🔴 **不要跟下面的 `ds102_controller.py` 搞混**——這是 2026-08-17 從 main_ai.py 拆出來的 `DS102Controller` 本體（現役程式碼），main_ai.py 用 `from ds102_ctrl import DS102Controller, ...` 引入。細節見下方〈main_ai.py 架構〉 |
+| [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照（跟上面的 `ds102_ctrl.py` 是完全不同的兩個檔案）。已進版控，可作為對照，但**不要在此新增功能** |
 | [main.py](main.py) | 廠商 SURUGA SEIKI 官方範例（模組層級全域變數風格），是**指令格式的權威來源**。main_ai.py 的每個指令組法都對應此檔某段程式。修改指令時先回頭比對 |
 | [test.py](test.py) | 無 GUI 的連線 / 狀態查詢腳本（含 `find_ds_port()` 自動搜埠）。名稱誤導——不是單元測試 |
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
 | [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝（PyVISA）。**已於 2026-08-12 整合進 GUI**（main_ai.py 直接 `from meter_GPIB import HP8153APowerMeter`），供「光功率」與「尋光」分頁使用。**2026-08-26 已實機連線**（`HEWLETT-PACKARD,8153A,0,2.1`，GPIB21／Ch2／1310nm），同日修掉「初始化無條件鎖死 -20dBm 量程」導致無光時必定 underrange 的問題，改為預設自動量程＋讀到 sentinel 時自動退回，見 [docs/fiber-scan.md](docs/fiber-scan.md)〈階段零：盲搜粗掃〉。⚠ 自動量程在實機能否讀到無光底噪**尚未驗證** |
-| [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`：光纖對準尋光演算法（座標下降＋K近鄰精修＋收尾微擾）。**已於 2026-08-13～17 分六階段接上 GUI**（main_ai.py 的「尋光」分頁），並補上 57 項假物件回歸測試（見 [docs/fiber-scan.md](docs/fiber-scan.md)）。本檔自己**仍刻意不 import main_ai.py**（避免循環相依），軸命名自成一份，main_ai.py 改軸命名時要同步 |
-| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) / [verify_fiber_scanner_signal.py](verify_fiber_scanner_signal.py) / [verify_wait_axis_stop.py](verify_wait_axis_stop.py) / [verify_ctrl_pos_sync.py](verify_ctrl_pos_sync.py) / [verify_blind_scan.py](verify_blind_scan.py) | 「尋光」／「光功率」分頁／軸機械校正參數／`fiber_scanner.py` 訊號有效性判準／`_wait_axis_stop()` 起步競態／移動控制分頁座標供應鏈的假物件回歸測試（合計 300 項 pytest 測試函式，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py verify_wait_axis_stop.py verify_ctrl_pos_sync.py verify_blind_scan.py -v` 執行，VS Code Testing 面板也認得）。用假的 `ctrl` / `meter` 物件驅動邏輯，不需要真實硬體。`verify_fiber_scanner_signal.py` 是 2026-08-19 從某次 session 的 scratchpad 補進版控並轉成 pytest（原本是獨立可執行腳本），轉換時發現它的 `FakeCtrl` 沒有 `estimate_um()`，因為原腳本寫於 μm 快照功能（見 [docs/axis-calibration.md](docs/axis-calibration.md)）加入之前——`_measure_here()` 現在無條件呼叫這個方法，補上回傳 `None` 的樁即可，不影響任何既有斷言。`verify_wait_axis_stop.py` 是 2026-08-26 修〈孿生競態〉時新增的（29 項），它是唯一一支不建 GUI、直接對 `DS102Controller` 實例逐一 monkeypatch `query_status` 的測試檔，所以沒有用 `conftest.py` 的 `make_gui()`，而是自己 `patch.object` `ds102_ctrl.RECORDING_DIR`／`DATA_DIR`——新增同類測試檔時照抄它的 `ctrl` fixture 即可。`verify_ctrl_pos_sync.py` 是 2026-08-26 修〈移動控制分頁「Position:」的座標供應鏈統一〉時新增的（13 項），用 module-scope 的 `gui` fixture＋autouse 的狀態重置，直接同步呼叫 `_redraw_positions()` 斷言畫面文字。`verify_blind_scan.py` 是 2026-08-26 修〈無光位置尋光無動作〉時新增的（44 項，見 [docs/fiber-scan.md](docs/fiber-scan.md)〈階段零：盲搜粗掃〉），它的 `FakeCtrl` 與 `verify_fiber_scanner_signal.py` 那份**不通用**：盲搜走 `_move_multi_axis()`，該路徑會傳 `start_pos`／`expected_travel` 兩個位移提示，舊的 `wait_axis_stop()` 樁沒有這兩個參數會直接 TypeError；本檔的版本另外支援軟體限位，用來驗證盲搜對超出行程的格點是「跳過並繼續」而不是整批中止 |
-| [conftest.py](conftest.py) / [pytest.ini](pytest.ini) | pytest 共用設定：`conftest.py` 放建 GUI／跑 Tk mainloop／monkeypatch `RECORDING_DIR` 這類共用 fixture；`pytest.ini` 把 `python_files` 放寬成同時認得 `verify_*.py` 與標準 `test_*.py`，並排除 `venv`／驅動資料夾等不相關目錄 |
+| [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`：光纖對準尋光演算法（座標下降＋K近鄰精修＋收尾微擾）。**已於 2026-08-13～17 分六階段接上 GUI**（main_ai.py 的「尋光」分頁），並補上 57 項假物件回歸測試（見 [docs/fiber-scan.md](docs/fiber-scan.md)）。本檔自己**仍刻意不 import main_ai.py**（避免循環相依），軸命名自成一份，main_ai.py 改軸命名時要同步。**2026-08-26 另修「撞限位反覆撞 + 階段一不會結束」**（`_note_limit_hit()` / `_targets_reachable()` / 方向探測雜訊門檻，見 [docs/fiber-scan.md](docs/fiber-scan.md)）。**2026-08-26 新增 `export_samples_xlsx()`**：每輪搜尋結束時在 JSON 樣本檔旁邊順帶寫一份 Excel 報表，🔴 **xlsx 不取代 JSON、且它的任何失敗都不可往外拋**（見 [docs/fiber-scan.md](docs/fiber-scan.md)〈尋光樣本的 Excel 報表〉） |
+| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) / [verify_fiber_scanner_signal.py](verify_fiber_scanner_signal.py) / [verify_wait_axis_stop.py](verify_wait_axis_stop.py) / [verify_ctrl_pos_sync.py](verify_ctrl_pos_sync.py) / [verify_blind_scan.py](verify_blind_scan.py) / [verify_scan_export.py](verify_scan_export.py) | 八支假物件回歸測試（pytest），用假的 `ctrl` / `meter` 物件驅動邏輯，不需要真實硬體。🔴 **各檔的 `FakeCtrl` 彼此不通用**，新增或改動測試前先讀 [docs/testing.md](docs/testing.md) |
+| [conftest.py](conftest.py) / [pytest.ini](pytest.ini) | pytest 共用設定：`conftest.py` 放建 GUI／跑 Tk mainloop／monkeypatch `RECORDING_DIR` 這類共用 fixture；`pytest.ini` 把 `python_files` 放寬成同時認得 `verify_*.py` 與標準 `test_*.py`，並排除 `venv`／驅動資料夾等不相關目錄。動到 `conftest.py` 前先讀 [docs/testing.md](docs/testing.md) |
 | [Gtest.py](Gtest.py) | 外部第三方範例（NTT-Mabuchi），`import control` 的模組不存在於本 repo，**無法執行**，僅作參考 |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖與 GPIB 側注意事項。⚠ 但其中的 **DS112 通訊細節全部是錯的**（宣稱結束符 `\r\n`、鮑率 9600、用 `!:` 輪詢 B/R 狀態）——實機是 `\r`、38400、查 `SB1?`。此檔只採信 HP 8153A 與「馬達動則不讀光」那幾段 |
 | [FIBER_ALIGNMENT_SCAN_DESIGN.md](FIBER_ALIGNMENT_SCAN_DESIGN.md) | 尋光演算法的完整設計文件：mathematician 兩輪演算法討論、architect 落地評估、無硬體驗證方式、待實測參數清單 |
@@ -74,6 +72,7 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | 新增／調整 GUI 元件、色票、按鈕樣式 | [docs/ui-design.md](docs/ui-design.md) |
 | 打包成 exe、執行期目錄 | [docs/packaging.md](docs/packaging.md) |
 | 想把 main_ai.py 拆檔 | [docs/modularization.md](docs/modularization.md) |
+| 動到測試、`conftest.py`、`verify_*.py` | [docs/testing.md](docs/testing.md) |
 
 ## 🔴 紅線速查（每條的完整經過在括號中的文件）
 
@@ -83,6 +82,9 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 - **`motion_active` 只判斷「要不要占用其他硬體資源」，絕不可當移動守衛。**（fiber-scan）
 - **光功率計預設用自動量程，不可為了速度無條件鎖死檔位。** 鎖在 -20dBm 曾讓無光起點必定 underrange（HP 8153A 回 `+9.9E+37`），尋光整段靜默空轉、滑台一步未動。要鎖必須搭配 `get_power()` 的自動退回。（fiber-scan）
 - **盲搜的 `except` 只能攔 `NoSignalAbort`，不可攔 `ScanAbort`。** 使用者中止與 EMS 也是 ScanAbort，攔錯會讓「按下停止」換來一輪掃過上千格點的盲搜。（fiber-scan）
+- **`ctrl.check_sw_limits_batch()` 在實機上預設是 no-op**（`sw_limits` 六軸都是 `(None, None)`，韌體 `CWSLE`/`CCWSLE` 出廠停用且 RAM-only），尋光的行程保護**只能靠撞過一次之後記住的 `_travel_bounds`**。新增任何「送出前檢查行程」的程式碼一律走 `_targets_reachable()`，不要只呼叫 `check_sw_limits_batch()`。（fiber-scan）
+- **移動失敗 ≠ 撞限位。** 逾時／通訊失聯若被記成「行程末端」，那一側一整片區域會被靜默排除，比多撞幾次嚴重得多——`_note_limit_hit()` 判不出方向時一律不動邊界。（fiber-scan）
+- **`_search_axis_once()` 的方向探測必須帶雜訊門檻（`> p0 + noise_floor`）。** 用赤裸的 `>` 會讓純雜訊環境下兩側輪流「看起來比較好」，每次呼叫都移動、步長永遠不縮、階段一永遠不結束（實測 180 萬次移動仍在擺盪）。`STAGE1_MAX_PASSES_PER_STEP` 是保險絲不是調校參數。（fiber-scan）
 - **`POS 0` 只能在 `_confirm_stopped()` 通過後才寫。** 寫在飛行中等於把座標系原點偷偷改掉，且零警告。（homing）
 - **「非 Driving」不等於「已停好」**：`GO` 有約 96ms 的 Driving assert 延遲，等待函式一律要有位移證據。（homing）
 - **任何新增的「作業進行中」狀態，必須同步加進 `_update_stat_ui` 的按鈕鎖定判斷**，否則 100ms 後按鈕自己復活。（safety-fixes）
@@ -96,13 +98,15 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 - **`axis_calib.division`（使用者輸入的倍數）不可用 `axis_drdiv`（軟體暫存器查表索引）代入**，那會把索引當倍數算出錯誤的 μm。（axis-calibration）
 - **`ttk.Checkbutton` 的 `command` 必須依 `variable` 的新值分流**（Tk 先翻轉變數再呼叫 command）。無條件當成「開」會讓浮動視窗永遠關不掉。（ui-design）
 - **主視窗預設最大化（`state("zoomed")`），任何「開在主視窗外側」的 Toplevel 定位都會落在螢幕外。** 定位一律要有放不下時退回內側的分支＋螢幕範圍夾制。（ui-design）
+- **測試的 `RECORDING_DIR`／`DATA_DIR` 必須同時 patch `main_ai` 與 `ds102_ctrl` 兩邊**，只 patch 一邊等於沒防護，會直接寫進專案真正的 `recordings/`／`data/`。已在 `conftest.py` 的 `make_gui()` 修好，新增測試檔不需也不應再自己 patch 一次。（testing）
+- **尋光的 Excel 報表寫入失敗只能記 log，不可往外拋。** 它跑在 `run()` 的 `finally` 裡、緊接在 JSON 樣本檔之後；最常見的失敗是目標檔正被 Excel 開著（`PermissionError`）。例外炸穿 `finally` 會蓋掉 `run()` 的回傳值，代價遠大於一份報表。（fiber-scan）
 - **打包用 `--onedir` 不用 `--onefile`**（SentinelOne 誤判前科）。（packaging）
 
 ## main_ai.py 架構
 
-main_ai.py 約 6430 行（2026-08-26 實測；⚠ 這已越過[docs/modularization.md](docs/modularization.md)的門檻 4「5800～6000 行」，下次動到分頁結構前應先重新評估方向1b，本檔先前記載的 5408 行是過時數字）（2026-08-06 時約 3100 行，2026-08-12～17 加入光功率／尋光兩分頁後一度衝到 6601 行，2026-08-17 把 `DS102Controller` 拆出去後降到 4839 行，之後陸續加入 B 類安全常數橫幅、軸機械校正參數卡片、尋光彈性選軸與軌跡圖重繪，漲回目前規模——2026-08-19 architect 重新評估模組化時的量測點是 5106 行，之後又加了約 300 行，仍未到[docs/modularization.md](docs/modularization.md)定義的 5800～6000 行觸發線），邏輯上仍是三塊，但**`DS102Controller` 現在實際定義在 [ds102_ctrl.py](ds102_ctrl.py)**：
+main_ai.py 約 6553 行（2026-08-27 實測；⚠ 這已越過[docs/modularization.md](docs/modularization.md)的門檻 4「5800～6000 行」，下次動到分頁結構前應先重新評估方向1b），邏輯上仍是三塊，但**`DS102Controller` 現在實際定義在 [ds102_ctrl.py](ds102_ctrl.py)**：
 
-1. **`DS102Controller`**（[ds102_ctrl.py](ds102_ctrl.py) 全檔約 3763 行，`class DS102Controller` 本身約 3170 行）— 所有序列通訊集中於此，完全不碰 tkinter。對外只暴露 `connect()` / `move_step()` / `query_status()` / `goto_point()` 等高階方法。main_ai.py 開頭用 `from ds102_ctrl import DS102Controller, AXES, AXIS_NO, NO_AXIS, MODE_CONTINUE, MODE_STEP, MODE_ORIGIN, COMM_FAIL_THRESHOLD, _BASE_DIR, LOG_DIR, RECORDING_DIR, DATA_DIR, NON_RECORDING_JSON, logger, _write_json_with_backup, _load_json_settings, _app_settings, _app_setting_num, _safety_setting_rejections` 整批重新引入——這份清單就是 `DS102Controller` 的完整依賴閉包，改動任一邊的模組層級常數前先確認它有沒有在這份清單裡（`_load_json_settings`／`_safety_setting_rejections` 是後來加的，見 [docs/settings-files.md](docs/settings-files.md) 與 [docs/modularization.md](docs/modularization.md)，這份清單本身就是活的，隨改動同步更新）。
+1. **`DS102Controller`**（[ds102_ctrl.py](ds102_ctrl.py)）— 所有序列通訊集中於此，完全不碰 tkinter。對外只暴露 `connect()` / `move_step()` / `query_status()` / `goto_point()` 等高階方法。main_ai.py 開頭用 `from ds102_ctrl import DS102Controller, AXES, AXIS_NO, NO_AXIS, MODE_CONTINUE, MODE_STEP, MODE_ORIGIN, COMM_FAIL_THRESHOLD, _BASE_DIR, LOG_DIR, RECORDING_DIR, DATA_DIR, NON_RECORDING_JSON, logger, _write_json_with_backup, _load_json_settings, _app_settings, _app_setting_num, _safety_setting_rejections` 整批重新引入——這份清單就是 `DS102Controller` 的完整依賴閉包，改動任一邊的模組層級常數前先確認它有沒有在這份清單裡（`_load_json_settings`／`_safety_setting_rejections` 是後來加的，見 [docs/settings-files.md](docs/settings-files.md) 與 [docs/modularization.md](docs/modularization.md)，這份清單本身就是活的，隨改動同步更新）。
 2. **`StatusBar`**（仍在 main_ai.py）— 各分頁共用的座標 / 連線狀態列（同時存在多個實例，統一收在 `self._status_bars`）。**刻意沒有跟著搬去 `ds102_ctrl.py`**：它用到的 `CLR_*` 色票（含 `app_settings.json` 覆寫邏輯）留在 main_ai.py，若把 `StatusBar` 也搬走，`ds102_ctrl.py` 會反過來需要 import main_ai.py 的色票，形成循環相依；`StatusBar` 本身只有約 120 行、且與 `DS102GUI` 的 `self._status_bars` 集中管理耦合更緊，留給下次拆 `DS102GUI` 時一併考慮較合適。
 3. **`DS102GUI`**（main_ai.py）— 七個分頁（分頁標題字串為「儀表板 / 移動控制 / Teaching / 行程錄製 / 光功率 / 尋光 / LOG」，grep 時用這些字），只呼叫 controller 的公開方法。「光功率」封裝 `HP8153APowerMeter`（[meter_GPIB.py](meter_GPIB.py)）、「尋光」封裝 `FiberAlignmentScanner`（[fiber_scanner.py](fiber_scanner.py)），細節見 [docs/fiber-scan.md](docs/fiber-scan.md)。
 
@@ -135,6 +139,7 @@ main_ai.py 約 6430 行（2026-08-26 實測；⚠ 這已越過[docs/modularizati
 
 - `logs/ds102_YYYYMMDD_HHMMSS.log` — 每次啟動一個檔（DEBUG 進檔案，INFO 以上進終端機）；關閉時另存 `*_history.txt`
 - `recordings/*.json` — 錄製的行程；同目錄的 `teaching_points.json`、`speed_profiles.json`、`controller_config.json`、`meter_config.json`、`scanner_config.json` 是設定檔，載入錄製清單時由 `NON_RECORDING_JSON` 明確排除（另有自動產生的 `*.json.bak`）
+- `recordings/scans/scan_*.json` + 同名 `scan_*.xlsx` — 每輪尋光的樣本。JSON 是給程式讀的無損原始紀錄，xlsx 是給人看的報表（〈摘要〉+〈樣本〉兩張表），**兩份都要、不可互相取代**，見 [docs/fiber-scan.md](docs/fiber-scan.md)
 - `data/data_*.csv` — 實驗數據（時間戳 + 各軸位置）
 - `data/homing_repeat_*.csv` / `data/homing_repeat_*.json` — 原點復歸重現性量測結果（CSV 長格式逐輪明細，JSON 是 metadata + 統計摘要），見 [docs/homing.md](docs/homing.md)
 - 根目錄殘留的 `ds102_log_YYYYMMDD.log` 來自舊版 main.py / test.py 的 logging 設定
