@@ -61,6 +61,16 @@ DEFAULT_NO_SIGNAL_RANGE_MULT = 2.0
 # d2(n)×σ」上，數值本身沿用 2.0（對實測 n≈150~350 區間仍有數個標準差
 # 的餘裕，見驗算），但若曾假設這是「6σ」等固定倍數，該假設已不成立。
 REOPEN_STEP_MULT = 8           # 階段一第 2 輪起，每輪從 step_min×這個倍數重新收斂
+# 階段一單軸單一步長的「沒收斂就再來一輪」次數上限（見 run_stage1 的用法）。
+# 🔴 這是防無窮迴圈的保險絲，不是調校參數。`while s >= step_min` 只在
+# `_search_axis_once()` 回報收斂時才縮步，而該函式只要「有移動」就回報
+# 未收斂——純雜訊環境下方向探測可以無止境地左右擺盪，兩邊輪流看起來
+# 都比對方好，於是步長永遠不縮、迴圈永遠不結束。2026-08-26 用假物件重現：
+# 起點壓在限位上、讀值只有雜訊時，舊版跑到 180 萬次移動仍未收斂（其中
+# 60 萬次是真的撞在限位開關上）。實機的症狀就是「尋光跑不完、限位警報
+# 一直跳」。200 對真的在跟訊號的搜尋非常寬鬆——爬坡是在單次呼叫內部
+# 連續走完的，這裡數的是「換方向的次數」。
+STAGE1_MAX_PASSES_PER_STEP = 200
 
 # ---- 階段零（盲搜粗掃）的預設值，同樣是起跳值不是校準值 ----
 # 2026-08-26 新增。動機：座標下降／爬坡需要梯度才能決定方向，而尋光的
@@ -307,8 +317,9 @@ class FiberAlignmentScanner:
     三階段光纖對準尋光：座標下降粗定位 → K 近鄰局部精修（可選）→ 收尾微擾。
 
     只透過 `ctrl` 的公開方法操作滑台（`scan_move_step` / `query_status` /
-    `positions_machine` / `check_sw_limits_batch` / `wait_axis_stop` /
-    `stop`），絕不直接碰 `ctrl.ser` 或 `ctrl._serial_lock`——維持
+    `positions_machine` / `check_sw_limits_batch` / `limit_direction` /
+    `wait_axis_stop` / `stop`），絕不直接碰 `ctrl.ser` 或
+    `ctrl._serial_lock`——維持
     DS102Controller 對序列通訊的獨占（architect 落地評估的既定要求）。
 
     `scan_move_step` 是 `move_step` 的搜尋演算法專用版本，只受
@@ -426,6 +437,11 @@ class FiberAlignmentScanner:
         # 索引之後取鄰居——見該方法 docstring 說明為什麼不能用階段一的
         # 歷史樣本。
         self._stage2_sample_start = 0
+        # 這一輪實測到的行程邊界（機械座標 pulse）：{軸: [CCW 端, CW 端]}，
+        # None＝該側這一輪還沒撞到過。由 _note_limit_hit() 寫入、
+        # _targets_reachable() 讀取，每次 run() 重置。見 _note_limit_hit()
+        # docstring 說明為什麼光靠 ctrl.sw_limits 擋不住。
+        self._travel_bounds: Dict[str, List[Optional[float]]] = {}
 
     # ------------------------------------------------------------------
     # 對外控制
@@ -474,6 +490,11 @@ class FiberAlignmentScanner:
         self.last_abort_reason = None  # 重置：這個實例若被重複呼叫 run()，不能沿用上一輪的中止原因
         self.last_abort_kind = None
         self._signal_confirmed = False  # 同理：量程鎖定的一次性旗標也要重置
+        # 行程邊界是「這一輪實測到的」，不跨輪沿用：兩輪之間可能做過原點
+        # 復歸，POS 是相對暫存器（見 docs/hardware.md），復歸後同一個機械
+        # 位置的座標值會整組改變，沿用舊邊界等於用錯誤的座標把一整片區域
+        # 靜默排除掉。代價只是每輪各方向要重新實撞一次。
+        self._travel_bounds = {}
         completed = False
         try:
             self._check_abort()
@@ -747,10 +768,14 @@ class FiberAlignmentScanner:
             cur = dict(self.ctrl.positions_machine)
             targets = {ax_a: center[ax_a] + da, ax_b: center[ax_b] + db}
 
-            # 先做批次限位檢查再送指令：超出行程的格點不必真的送一次 GO
+            # 先做批次行程檢查再送指令：超出行程的格點不必真的送一次 GO
             # 才發現走不了。盲搜的半徑常常會蓋到行程邊界外，逐點試錯的
             # 代價（每點一次來回通訊＋一次失敗等待）在上千個格點下很可觀。
-            ok, _reason = self.ctrl.check_sw_limits_batch(targets)
+            # 🔴 檢查走 `_targets_reachable()` 而不是直接 `check_sw_limits_batch()`：
+            # 後者比對的 `ctrl.sw_limits` 預設是空的（GUI 不填就全部放行），
+            # 光靠它，這段最該發揮作用的檢查會整個退化成 no-op——實機
+            # 2026-08-26 一輪盲搜就實撞了 50 次限位。見 `_note_limit_hit()`。
+            ok, _reason = self._targets_reachable(targets)
             if not ok:
                 blocked += 1
                 continue
@@ -839,11 +864,27 @@ class FiberAlignmentScanner:
                 self._check_abort()
                 p_before = self._current_power_estimate()
                 s = step[ax]
+                passes = 0  # 同一步長「未收斂而重跑」的次數，見下方保險絲
                 while s >= self.step_min:
                     self._check_abort()
                     converged, _ = self._search_axis_once(ax, s)
                     if converged:
                         s //= 2
+                        passes = 0
+                        continue
+                    passes += 1
+                    if passes >= STAGE1_MAX_PASSES_PER_STEP:
+                        # 保險絲熔斷。這裡刻意縮步繼續而不是整個中止：走到
+                        # 這一步代表這個步長在這個位置附近沒有可靠的梯度，
+                        # 換更小的步長還有機會，而中止整輪搜尋的代價太大。
+                        # 一定要記 log——這條路徑正常情況下不該被走到，
+                        # 靜默熔斷會讓「為什麼結果怪怪的」永遠查不出來。
+                        self._log(
+                            f"⚠ 階段一 軸 {ax} 步長 {s} pulse 連續 {passes} 次未收斂，"
+                            "判定此步長附近沒有可靠梯度（多半是純雜訊），強制縮步"
+                        )
+                        s //= 2
+                        passes = 0
                 p_after = self._current_power_estimate()
                 if p_before is not None and p_after is not None:
                     total_improvement += max(0.0, p_after - p_before)
@@ -892,14 +933,23 @@ class FiberAlignmentScanner:
             return True, None  # 起點都量不到，無從比較，外層會縮步或最終中止
 
         # ── 1. 方向探測（最多兩次移動）──
+        # 🔴 門檻是 `p0 + 雜訊底限`，不是 `p0`。下方爬坡迴圈一直都用這個
+        # 門檻，方向探測卻用赤裸的 `>`——這個不對稱本身就是既有註解說的
+        # 「等同挑雜訊讀值中較大者的選擇偏誤」。後果不只是統計上的偏誤：
+        # 純雜訊環境下兩側輪流「看起來比較好」，每次呼叫都會移動、於是
+        # 每次都回報未收斂，外層 while 的步長永遠不縮——搜尋不會結束。
+        # 2026-08-26 假物件重現：起點壓在限位上、讀值只有雜訊時，舊版
+        # 180 萬次移動仍在原地兩點之間擺盪。低於雜訊底限的「改善」本來
+        # 就不是可靠資訊，拿它決定方向等於讓雜訊駕駛滑台。
+        floor = self._noise_floor()
         moved_plus, p_plus = self._probe(axis, step)
-        if moved_plus and p_plus is not None and p_plus > p0:
+        if moved_plus and p_plus is not None and p_plus > p0 + floor:
             direction, p_prev, p_curr = 1, p0, p_plus
         else:
             if moved_plus:
                 self._move_relative(axis, -step)  # 撤回原點
             moved_minus, p_minus = self._probe(axis, -step)
-            if moved_minus and p_minus is not None and p_minus > p0:
+            if moved_minus and p_minus is not None and p_minus > p0 + floor:
                 direction, p_prev, p_curr = -1, p0, p_minus
             else:
                 if moved_minus:
@@ -1013,7 +1063,7 @@ class FiberAlignmentScanner:
             for sign in (1, -1):
                 self._check_abort()
                 target = self.ctrl.positions_machine[ax] + sign * r
-                ok, reason = self.ctrl.check_sw_limits_batch({ax: target})
+                ok, reason = self._targets_reachable({ax: target})
                 if not ok:
                     self._log(f"階段二星形取樣：{reason}，略過此點")
                     continue
@@ -1063,7 +1113,7 @@ class FiberAlignmentScanner:
                 for ax, dv in deltas.items()
                 if dv != 0
             }
-            ok, reason = self.ctrl.check_sw_limits_batch(targets)
+            ok, reason = self._targets_reachable(targets)
             if not ok:
                 self._log(f"階段二候選點超限：{reason}，縮小步長重試")
                 step_length = max(self.step_min, step_length // 2)
@@ -1172,6 +1222,98 @@ class FiberAlignmentScanner:
 
         return {ax: grad_normalized[ax] / max(scale.get(ax, 1.0), 1e-9) for ax in axes}
 
+    # ------------------------------------------------------------------
+    # 行程邊界（撞過一次就記起來，不再往同一個方向反覆撞）
+    # ------------------------------------------------------------------
+    def _note_limit_hit(self, axis: str) -> bool:
+        """
+        移動失敗之後查一次該軸狀態；確實壓在限位上就把當下座標記成
+        這一輪該側的行程邊界。回傳是否真的判定為撞限位。
+
+        **為什麼需要這個**：搜尋過程中所有「送出前的限位檢查」比對的都是
+        `ctrl.sw_limits`，而那份軟體限位預設六軸都是 `(None, None)`、GUI
+        不填就是全部放行，控制器韌體的 `CWSLE`/`CCWSLE` 出廠也是停用
+        （見 [docs/hardware.md]，2026-08-05 複測 `cwsle=0`，且它是 RAM-only、
+        斷電就沒了）。也就是說候選點超出行程時**沒有任何一層擋得住**，
+        只能靠真的撞上限位開關才知道走不了。
+
+        撞一次是必要的代價，撞五十次不是。2026-08-26 實機 log
+        （`ds102_20260826_150901.log` 15:10 起）一輪盲搜就撞了 50 次、
+        全部是 `Detect CCW limit`：盲搜每個格點都用「絕對目標 − 目前座標」
+        重算 delta（這是刻意的，見 `run_stage0_blind`），而卡在限位上的軸
+        座標不會變，於是下一個格點算出來的 delta 幾乎一模一樣，原地反覆
+        撞同一顆開關，每撞一次就送一次 `STOP 0`（連坐停掉正在正常移動的
+        另一軸）並彈一則限位警報橫幅。記下邊界之後，同側超界的候選點在
+        送指令前就被 `_targets_reachable()` 擋掉，一輪最多各撞一次。
+
+        🔴 **判不出限位方向時一律不動邊界**（回傳 False）。移動失敗還有
+        逾時、通訊失聯等成因，把那些誤記成「行程末端」會讓該方向一整片
+        區域在這一輪被永久排除，而且是靜默排除——比多撞幾次嚴重得多。
+
+        同側重複撞到時取「比較靠內側」的那個值（CCW 取大、CW 取小）：
+        限位開關有實體作用寬度，同一顆開關每次停下的座標會差幾個 pulse，
+        取靠內側的才是保守方向。
+        """
+        axis_no = AXIS_NO.get(axis)
+        if not axis_no:
+            return False
+        try:
+            status, _pos = self.ctrl.query_status(axis_no)
+            side = self.ctrl.limit_direction(status)
+        except Exception as e:
+            # 查狀態本身失敗不該讓搜尋中止——這只是「要不要記邊界」的
+            # 額外資訊，拿不到就退回改動前的行為（下次還是會實撞）。
+            self._log(f"軸 {axis} 移動失敗後查狀態失敗（不影響搜尋）: {e}")
+            return False
+        if side is None:
+            return False
+        here = self.ctrl.positions_machine.get(axis)
+        if here is None:
+            return False
+
+        bounds = self._travel_bounds.setdefault(axis, [None, None])
+        idx = 0 if side == "CCW" else 1
+        prev = bounds[idx]
+        if prev is None:
+            bounds[idx] = here
+            self._log(
+                f"軸 {axis} 已到 {side} 側行程末端（{here:.0f} pulse）——"
+                "本輪後續超過這個座標的候選點會在送指令前直接略過，不再實撞"
+            )
+        else:
+            bounds[idx] = max(prev, here) if side == "CCW" else min(prev, here)
+        return True
+
+    def _targets_reachable(self, targets: Dict[str, float]) -> Tuple[bool, str]:
+        """
+        候選點送指令前的行程檢查，兩層都要過：
+
+          1. `ctrl.check_sw_limits_batch()`——使用者在 GUI 設定的軟體限位。
+             涵蓋「還沒撞過但已知不該去」的方向，預設沒設就是全部放行。
+          2. 本輪實測到的行程邊界（`_note_limit_hit()` 記的）。涵蓋「沒設
+             軟體限位」這個實際上的常態。
+
+        兩層互相取代不了：第一層事先知道、但預設是空的；第二層一定準、
+        但要先撞過一次才有。`targets` 是**機械座標**（與 `sw_limits`、
+        `positions_machine` 同一個座標系）。
+        """
+        ok, reason = self.ctrl.check_sw_limits_batch(targets)
+        if not ok:
+            return False, reason
+        for ax, target in targets.items():
+            lo, hi = self._travel_bounds.get(ax, (None, None))
+            if lo is not None and target < lo:
+                return False, (
+                    f"軸 {ax} 目標 {target:.0f} pulse 超出本輪實測的 "
+                    f"CCW 行程末端 {lo:.0f} pulse"
+                )
+            if hi is not None and target > hi:
+                return False, (
+                    f"軸 {ax} 目標 {target:.0f} pulse 超出本輪實測的 "
+                    f"CW 行程末端 {hi:.0f} pulse"
+                )
+        return True, ""
+
     def _move_multi_axis(self, deltas: Dict[str, int]) -> bool:
         """
         多軸同時出發：全部送出 GO（不等待）→ 依序等每一軸到位。
@@ -1194,6 +1336,18 @@ class FiberAlignmentScanner:
         # 判成「GO 未生效」——這裡有現成的 deltas，沒有理由不傳。
         before = dict(self.ctrl.positions_machine)
 
+        # 已知走不到的目標一根軸都不送。呼叫端（階段零/二）多半已經檢查
+        # 過同一批座標，這裡是最後一道：`_move_relative()` 以外的所有多軸
+        # 移動都經過本函式，把檢查放在這裡才涵蓋得完（例如 _return_to_machine）。
+        targets = {
+            ax: before[ax] + dv for ax, dv in active.items() if ax in before
+        }
+        if targets:
+            ok, reason = self._targets_reachable(targets)
+            if not ok:
+                self._log(f"多軸候選點略過：{reason}")
+                return False
+
         sent: List[Tuple[str, str]] = []
         for ax, delta in active.items():
             axis_no = AXIS_NO[ax]
@@ -1210,6 +1364,7 @@ class FiberAlignmentScanner:
             sent.append((axis_no, ax))
 
         all_arrived = True
+        failed: List[str] = []
         for axis_no, ax in sent:
             if not self.ctrl.wait_axis_stop(
                 axis_no,
@@ -1217,9 +1372,15 @@ class FiberAlignmentScanner:
                 expected_travel=abs(active[ax]),
             ):
                 all_arrived = False
+                failed.append(ax)
 
         if not all_arrived:
             self.ctrl.stop()  # 保險：確保其餘可能還在動的軸也停下來
+            # 🔴 記邊界要排在 stop() **之後**：_note_limit_hit() 會多送一次
+            # SB3?/SB1? 查詢（約 112ms），插在 stop() 前面等於讓其餘還在動的
+            # 軸多跑那段時間。限位狀態是準位不是邊緣，停下來之後照樣讀得到。
+            for ax in failed:
+                self._note_limit_hit(ax)
             return False
         return True
 
@@ -1290,6 +1451,16 @@ class FiberAlignmentScanner:
         self._check_abort()
         if delta_pulse == 0:
             return True
+        here = self.ctrl.positions_machine.get(axis)
+        if here is not None:
+            ok, reason = self._targets_reachable({axis: here + delta_pulse})
+            if not ok:
+                # 刻意**不**記 log：這條路徑在階段一每一輪的方向探測都會
+                # 走到（撞到底的那一側每次都會被擋），逐筆記等於把 log 灌爆，
+                # 而真正需要大聲講的那一次（實際撞上限位）已經由
+                # _note_limit_hit() 記過了。回傳 False 的語意與「真的撞了
+                # 走不動」一致，呼叫端不需要分辨這兩者。
+                return False
         axis_no = AXIS_NO[axis]
         direction = "CW" if delta_pulse > 0 else "CCW"
         ok = self.ctrl.scan_move_step(
@@ -1298,6 +1469,7 @@ class FiberAlignmentScanner:
         )
         if not ok:
             self._log(f"軸 {axis} 移動 {delta_pulse:+d} pulse 失敗（撞限位/逾時）")
+            self._note_limit_hit(axis)
         return ok
 
     def _measure_here(self) -> Sample:
@@ -1397,12 +1569,13 @@ class FiberAlignmentScanner:
             return 0.0
         mean = self._noise_baseline
         var = sum((p - mean) ** 2 for p in powers) / (len(powers) - 1)
-        self._noise_sigma = var ** 0.5
+        sigma = var ** 0.5
+        self._noise_sigma = sigma
         self._log(
-            f"雜訊校準完成：σ={self._noise_sigma:.5f}，"
+            f"雜訊校準完成：σ={sigma:.5f}，"
             f"基準功率 {self._noise_baseline:.4f} dBm（{len(powers)} 次量測）"
         )
-        return self._noise_sigma
+        return sigma
 
     def _noise_floor(self) -> float:
         """功率改善需要超過這個值才算「真的更好」（雜訊底限概念）。"""

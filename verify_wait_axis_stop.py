@@ -357,17 +357,30 @@ class TestScannerBatchMovePassesHints:
                 waits.append((axis_no, start_pos, expected_travel))
                 return True
 
+            def check_sw_limits_batch(self, targets):
+                return True, ""   # 本檔不測限位，全部放行
+
             def stop(self):
                 pass
 
         class FakeScanner:
             ctrl = FakeCtrl()
+            _travel_bounds = {}
 
             def _check_abort(self):
                 pass
 
+            def _log(self, msg):
+                pass
+
             def _dynamic_speed(self, delta):
                 return ("100", "5000", "2000", "300")
+
+            # 2026-08-26 `_move_multi_axis()` 新增了「送出前的行程檢查」。
+            # 這裡刻意借用**真正的**實作，而不是塞一個永遠回 True 的樁：
+            # 本檔測的是位移提示有沒有正確傳給每一軸，換成假的檢查等於讓
+            # 測試走一條實機不存在的路徑。
+            _targets_reachable = fiber_scanner.FiberAlignmentScanner._targets_reachable
 
         fiber_scanner.FiberAlignmentScanner._move_multi_axis(
             FakeScanner(), {"X": 40, "Y": -25, "Z": 0}

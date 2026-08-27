@@ -33,6 +33,7 @@ FiberAlignmentScanner 階段零「盲搜粗掃」回歸測試（pytest，合成�
 
 import pytest
 
+import ds102_ctrl  # 只為了 FakeCtrl.limit_direction 委派給真正的實作
 import fiber_scanner as fs
 
 
@@ -43,17 +44,29 @@ class FakeCtrl:
     """
     假的 DS102Controller。
 
-    與 verify_fiber_scanner_signal.py 的 FakeCtrl 有兩點刻意不同：
+    與 verify_fiber_scanner_signal.py 的 FakeCtrl 有三點刻意不同：
       - `wait_axis_stop()` 接受 `start_pos`／`expected_travel` 兩個關鍵字
         參數。盲搜走的是 `_move_multi_axis()`（多軸同時出發），那條路徑會
         傳這兩個位移提示（見 CLAUDE.md〈孿生競態〉），少了它們會 TypeError。
       - 支援軟體限位（`limits`），用來驗證盲搜對超出行程的格點是「跳過並
         繼續」而不是整個中止。
+      - 支援**實體**限位（`hard_limits`，2026-08-26 新增）。這與 `limits`
+        是兩件完全不同的事，混在一起看會誤解整個修正的重點：
+
+          * `limits`（軟體限位）＝ `ctrl.sw_limits`，在**送指令前**就把
+            目標擋掉，滑台一步都不會動。它的實際狀態是「預設六軸全是
+            `(None, None)`、GUI 不填就是全部放行」。
+          * `hard_limits`（實體限位開關）擋不住任何指令。軸會真的走到
+            端點停住，`SB1?` 從此回報 `Detect CW/CCW limit`，而且會一直
+            這樣回報到軸離開開關為止。這是實機唯一存在的那一層保護。
+
+        `_note_limit_hit()` 要鎖的就是「只有第二層存在時不要反覆去撞它」，
+        所以測試必須有辦法模擬第二層。
     """
 
     _MAP = {"1": "X", "2": "Y", "3": "Z", "4": "U", "5": "V", "6": "W"}
 
-    def __init__(self, axes=("X", "Y"), limits=None):
+    def __init__(self, axes=("X", "Y"), limits=None, hard_limits=None):
         self.axes = list(axes)
         self.axis_count = len(self.axes)
         self.connected = True
@@ -65,6 +78,11 @@ class FakeCtrl:
         self.move_log = []
         # {軸: (下限, 上限)}，None 表示該側無限制
         self.limits = limits or {}
+        # {軸: (下限, 上限)}——實體限位開關，見上方 docstring
+        self.hard_limits = hard_limits or {}
+        self._limit_side = {}      # {軸: "CW"/"CCW"}，目前壓在哪一側
+        self._pending_fail = set()  # wait_done=False 那條路徑要讓哪些軸的等待失敗
+        self.limit_hits = []       # [(軸, 側)]，每次真的撞上記一筆，供斷言用
 
     @property
     def positions_machine(self):
@@ -77,7 +95,31 @@ class FakeCtrl:
         ax = self._MAP.get(axis_no)
         if ax not in self._pos:
             return "Stage not connected", ""
+        side = self._limit_side.get(ax)
+        if side:
+            # 壓在限位上時 SB1? 一直都是這個狀態（準位而非邊緣），
+            # 這正是 _note_limit_hit() 在移動失敗後補查一次的前提。
+            return f"Detect {side} limit", str(self._pos[ax])
         return "Stop", str(self._pos[ax])
+
+    @staticmethod
+    def limit_direction(status):
+        """刻意委派給真正的實作，不自己再寫一份。
+
+        CLAUDE.md 記著「比對方向字串必須先判斷 CCW」（`"CCW"` 本身含有
+        `"CW"`）——測試裡複製一份等於讓那條規則有兩個來源，真正的實作
+        改壞了測試也照樣綠燈。
+        """
+        return ds102_ctrl.DS102Controller.limit_direction(status)
+
+    def _hard_clamp(self, ax, target):
+        """回傳 (實際會停在哪, 撞到哪一側或 None)。"""
+        lo, hi = self.hard_limits.get(ax, (None, None))
+        if lo is not None and target < lo:
+            return lo, "CCW"
+        if hi is not None and target > hi:
+            return hi, "CW"
+        return target, None
 
     def _within(self, ax, target):
         lo, hi = self.limits.get(ax, (None, None))
@@ -98,11 +140,26 @@ class FakeCtrl:
         target = self._pos[ax] + delta
         if not self._within(ax, target):
             return False
-        self._pos[ax] = target
+        final, side = self._hard_clamp(ax, target)
+        self._pos[ax] = final
         self.move_log.append((ax, direction, amount))
+        if side is None:
+            self._limit_side.pop(ax, None)  # 走離開關就不再壓著了
+            return True
+        self._limit_side[ax] = side
+        self.limit_hits.append((ax, side))
+        if wait_done:
+            return False  # 同實機：_wait_axis_stop() 讀到 Limit 判失敗
+        # wait_done=False：GO 確實送出去了（回 True），失敗要由後續的
+        # wait_axis_stop() 回報——_move_multi_axis() 走的正是這條路徑。
+        self._pending_fail.add(ax)
         return True
 
     def wait_axis_stop(self, axis_no, timeout=30, start_pos=None, expected_travel=None):
+        ax = self._MAP.get(axis_no)
+        if ax in self._pending_fail:
+            self._pending_fail.discard(ax)
+            return False
         return True
 
     def check_sw_limits_batch(self, targets):
@@ -456,6 +513,255 @@ class TestBlindSearch:
 # =============================================================================
 # 六、模式串接與安全邊界
 # =============================================================================
+# =============================================================================
+# 實體限位：撞過一次就記住，不再往同一側反覆撞（2026-08-26）
+# =============================================================================
+class TestTravelBounds:
+    """
+    起因（實機 `logs/ds102_20260826_150901.log` 15:10 起）：一輪盲搜實撞了
+    **50 次**限位，全部是 `Detect CCW limit`。
+
+    成因是三件事疊在一起：
+
+      1. `ctrl.sw_limits` 預設六軸都是 `(None, None)`，GUI 不填就沒有；
+         控制器韌體的 `CWSLE`/`CCWSLE` 出廠停用、而且是 RAM-only。所以
+         `check_sw_limits_batch()` 對所有目標一律放行——盲搜裡那句「先做
+         批次限位檢查再送指令」實際上是 no-op。
+      2. 盲搜半徑（實機設 10000 pulse）大於實際行程（Y 軸全程只有 4146
+         pulse，見 docs/hardware.md），螺旋有很大一片在行程外。
+      3. 每個格點都用「絕對目標 − 目前座標」重算 delta（這是刻意的，見
+         `run_stage0_blind`），而卡在限位上的軸座標不會變，下一個格點算出
+         的 delta 幾乎一樣 → 原地反覆撞同一顆開關，每次還連帶送一次
+         `STOP 0`（停掉正在正常移動的另一軸）並彈一則限位警報橫幅。
+
+    本 class 鎖的是修正後的行為：**同一軸的同一側，一輪最多實撞一次**。
+    """
+
+    def _peak_far_outside(self, ctrl):
+        """峰值放在行程外——強迫盲搜掃完整個半徑，把每個格點都試過。"""
+        return make_flat_query()
+
+    def test_each_axis_side_is_hit_at_most_once(self):
+        ctrl = FakeCtrl(
+            axes=("X", "Y"),
+            hard_limits={"X": (-100.0, 100.0), "Y": (-100.0, 100.0)},
+        )
+        scanner, _ = make_scanner(
+            self._peak_far_outside(ctrl), ctrl=ctrl,
+            blind_step=100, blind_max_radius=400,
+        )
+        scanner.calibrate_noise()
+        with pytest.raises(fs.NoSignalAbort):
+            scanner.run_stage0_blind()
+
+        counts = {}
+        for ax, side in ctrl.limit_hits:
+            counts[(ax, side)] = counts.get((ax, side), 0) + 1
+        assert counts, "測試設計錯誤：這個組態本來就該撞到限位"
+        assert all(n == 1 for n in counts.values()), (
+            f"同一側撞了不只一次：{counts}（修正前實機是 50 次）"
+        )
+
+    def test_bound_records_the_position_it_stopped_at(self):
+        ctrl = FakeCtrl(axes=("X", "Y"), hard_limits={"X": (-100.0, 100.0)})
+        scanner, _ = make_scanner(make_flat_query(), ctrl=ctrl, step_min=10)
+        assert scanner._move_relative("X", 500) is False  # 撞 CW 端
+        assert scanner._travel_bounds["X"][1] == 100.0
+        assert scanner._travel_bounds["X"][0] is None     # CCW 側還沒撞過
+
+    def test_bounded_direction_sends_no_further_command(self):
+        """記住邊界之後，同方向的移動要在送指令前就被擋下，不再打到硬體。"""
+        ctrl = FakeCtrl(axes=("X", "Y"), hard_limits={"X": (-100.0, 100.0)})
+        scanner, _ = make_scanner(make_flat_query(), ctrl=ctrl, step_min=10)
+        scanner._move_relative("X", 500)
+        n_cmds = len(ctrl.move_log)
+        n_hits = len(ctrl.limit_hits)
+
+        assert scanner._move_relative("X", 500) is False
+        assert scanner._move_relative("X", 10) is False
+        assert len(ctrl.move_log) == n_cmds, "不該再送出任何指令"
+        assert len(ctrl.limit_hits) == n_hits, "不該再撞一次"
+
+    def test_opposite_direction_still_allowed(self):
+        """只擋撞到的那一側。反方向是唯一走得掉的方向，擋掉它等於整軸鎖死。"""
+        ctrl = FakeCtrl(axes=("X", "Y"), hard_limits={"X": (-100.0, 100.0)})
+        scanner, _ = make_scanner(make_flat_query(), ctrl=ctrl, step_min=10)
+        scanner._move_relative("X", 500)
+        assert scanner._move_relative("X", -50) is True
+        assert ctrl.positions_machine["X"] == 50.0
+
+    def test_timeout_failure_does_not_record_a_bound(self):
+        """
+        🔴 移動失敗不等於撞限位。逾時／通訊失聯若被記成「行程末端」，
+        那一側一整片區域會在這一輪被靜默排除，比多撞幾次嚴重得多。
+        """
+        class TimeoutCtrl(FakeCtrl):
+            def scan_move_step(self, *a, **kw):
+                return False  # 失敗，但 query_status 仍回 "Stop"（沒壓在限位上）
+
+        ctrl = TimeoutCtrl(axes=("X", "Y"))
+        scanner, _ = make_scanner(make_flat_query(), ctrl=ctrl, step_min=10)
+        assert scanner._move_relative("X", 500) is False
+        assert scanner._travel_bounds.get("X") in (None, [None, None])
+
+    def test_repeat_hit_keeps_the_inner_value(self):
+        """
+        限位開關有實體作用寬度，同一顆開關每次停下的座標會差幾個 pulse。
+        重複撞到時取靠內側的（CCW 取大、CW 取小）才是保守方向。
+        """
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        scanner, _ = make_scanner(make_flat_query(), ctrl=ctrl, step_min=10)
+        ctrl._limit_side["X"] = "CCW"
+        ctrl._pos["X"] = -100.0
+        scanner._note_limit_hit("X")
+        ctrl._pos["X"] = -98.0
+        scanner._note_limit_hit("X")
+        assert scanner._travel_bounds["X"][0] == -98.0
+        ctrl._pos["X"] = -105.0
+        scanner._note_limit_hit("X")
+        assert scanner._travel_bounds["X"][0] == -98.0
+
+    def test_bounds_reset_between_runs(self, tmp_path):
+        """
+        兩輪之間可能做過原點復歸，POS 是相對暫存器、復歸後座標整組改變，
+        沿用舊邊界等於用錯誤的座標把一片區域靜默排除。
+
+        用一組「陳舊到不可能成立」的邊界（把 X 夾在 10~20，而滑台在 0）
+        當探針：只要 run() 有重置，這一輪沒撞過限位的軸就不會再有邊界；
+        沒重置的話它會把 X 整條軸鎖死。
+        """
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        scanner, _ = make_scanner(
+            make_flat_query(), ctrl=ctrl, blind_mode="auto",
+            blind_step=100, blind_max_radius=200,
+        )
+        scanner._travel_bounds = {"X": [10.0, 20.0]}
+
+        scanner.run(initial_step={"X": 20, "Y": 20}, scan_dir=tmp_path)
+        assert "X" not in scanner._travel_bounds, (
+            f"上一輪的陳舊邊界沒有被清掉：{scanner._travel_bounds}"
+        )
+
+    def test_user_sw_limits_still_apply(self):
+        """新增的實測邊界是**疊加**在 ctrl.sw_limits 上，不是取代它。"""
+        ctrl = FakeCtrl(axes=("X", "Y"), limits={"X": (-50.0, 50.0)})
+        scanner, _ = make_scanner(make_flat_query(), ctrl=ctrl, step_min=10)
+        ok, reason = scanner._targets_reachable({"X": 200.0})
+        assert ok is False and "X" in reason
+
+    def test_multi_axis_precheck_sends_nothing_when_out_of_bounds(self):
+        """
+        多軸路徑同樣要在送出前擋下——`_move_multi_axis()` 的失敗代價比單軸
+        高：任一軸失敗就整批 `STOP 0`，會連坐停掉本來正常移動的另一軸。
+        """
+        ctrl = FakeCtrl(axes=("X", "Y"), hard_limits={"X": (-100.0, 100.0)})
+        scanner, _ = make_scanner(make_flat_query(), ctrl=ctrl, step_min=10)
+        scanner._move_multi_axis({"X": 500, "Y": 50})   # X 撞 CW 端
+        n_cmds, n_stops = len(ctrl.move_log), ctrl.stop_calls
+
+        assert scanner._move_multi_axis({"X": 500, "Y": 50}) is False
+        assert len(ctrl.move_log) == n_cmds, "一根軸都不該送"
+        assert ctrl.stop_calls == n_stops, "沒送出去就不需要 STOP"
+
+    def test_blind_scan_still_covers_the_reachable_region(self):
+        """擋掉走不到的格點之後，走得到的那些仍然要照掃，而且幾何不漂移。"""
+        ctrl = FakeCtrl(axes=("X", "Y"), hard_limits={"X": (-100.0, 100.0)})
+        visited = []
+        scanner, _ = make_scanner(
+            make_flat_query(), ctrl=ctrl,
+            blind_step=100, blind_max_radius=300,
+            sample_cb=lambda s: visited.append((s.coords["X"], s.coords["Y"])),
+        )
+        scanner.calibrate_noise()
+        with pytest.raises(fs.NoSignalAbort):
+            scanner.run_stage0_blind()
+        assert visited
+        for x, y in visited:
+            assert -100.0 <= x <= 100.0        # 沒有一點停在行程外
+            assert -300.0 <= y <= 300.0        # 也沒有漂出使用者設定的半徑
+        # 走得到的那一段（X∈{-100,0,100}×Y∈{-300..300}）要真的掃到
+        assert len({(x, y) for x, y in visited}) >= 15
+
+
+# =============================================================================
+# 階段一一定要停得下來（2026-08-26）
+# =============================================================================
+class TestStage1Termination:
+    """
+    與 TestTravelBounds 同一次修正，但這是**另一個**根因，兩個疊在一起才
+    是實機「尋光一直跳 Detect limit」的完整解釋：
+
+      - `_search_axis_once()` 只要「有移動」就回報未收斂，而外層
+        `while s >= step_min` 只在收斂時才縮步。
+      - 方向探測用的是赤裸的 `p_plus > p0`，沒有雜訊門檻（同一個函式裡的
+        爬坡迴圈一直都用 `> p_curr + noise_floor`，這個不對稱既有註解自己
+        就寫著是「選擇偏誤」）。
+
+    純雜訊環境下兩側輪流「看起來比較好」→ 每次呼叫都移動 → 永遠不縮步 →
+    永遠不結束。假物件重現（起點壓在限位上、讀值只有雜訊）：**舊版跑到
+    180 萬次移動仍在原地兩點之間擺盪，其中 60 萬次是真的撞在限位開關上**。
+    """
+
+    def test_pure_noise_from_a_limit_terminates(self, tmp_path):
+        budget = 3000
+
+        class BudgetCtrl(FakeCtrl):
+            """超過預算就炸——測不出來的話會變成整個測試套件掛住。"""
+
+            def scan_move_step(self, *a, **kw):
+                if len(self.move_log) >= budget:
+                    raise RuntimeError(
+                        f"階段一未收斂：移動次數超過 {budget}（舊版是 180 萬次）"
+                    )
+                return super().scan_move_step(*a, **kw)
+
+        ctrl = BudgetCtrl(axes=("X", "Y"), hard_limits={"X": (-100.0, 100.0)})
+        scanner, _ = make_scanner(make_flat_query(), ctrl=ctrl, step_min=10)
+        scanner._move_relative("X", 500)          # 先把 X 推到端點壓住
+        scanner.run({"X": 10, "Y": 10}, scan_dir=tmp_path)
+
+        assert len(ctrl.move_log) < budget
+        # 撞限位的次數才是使用者實際看到的東西（每次都是一則警報橫幅）
+        assert len(ctrl.limit_hits) <= 4, f"撞太多次：{ctrl.limit_hits}"
+
+    def test_direction_probe_requires_noise_floor(self):
+        """
+        方向探測的門檻是 `p0 + 雜訊底限`。低於底限的「改善」不是資訊，
+        拿它決定方向等於讓雜訊駕駛滑台——這正是上面那個無窮擺盪的來源。
+        """
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        readings = iter([
+            -50.0,   # p0（起點）
+            -49.99,  # +step：比 p0 大，但遠小於雜訊底限 → 不可採信
+            -49.99,  # -step：同上
+        ])
+
+        def q():
+            try:
+                return True, next(readings)
+            except StopIteration:
+                return True, -50.0
+
+        scanner, _ = make_scanner(q, ctrl=ctrl, step_min=10)
+        scanner._noise_sigma = 0.5        # 底限 = 3σ = 1.5 dB
+        scanner._noise_baseline = -50.0
+
+        converged, _ = scanner._search_axis_once("X", 10)
+        assert converged is True, "雜訊等級的差異不該被當成找到方向"
+        assert ctrl.positions_machine["X"] == 0.0, "兩側都試過後必須回到原點"
+
+    def test_real_gradient_is_still_followed(self):
+        """保險絲與雜訊門檻都不可以擋掉真正的梯度——這才是尋光本體。"""
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        scanner, _ = make_scanner(
+            make_peaked_query(ctrl, axis="X", center=100.0, amp=100.0, k=0.05),
+            ctrl=ctrl, step_min=10,
+        )
+        scanner.calibrate_noise()
+        scanner.run_stage1({"X": 40, "Y": 40})
+        assert abs(ctrl.positions_machine["X"] - 100.0) <= 20.0
+
+
 class TestBlindModeIntegration:
     def test_library_default_is_off(self):
         scanner, _ = make_scanner(make_flat_query())

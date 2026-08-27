@@ -89,6 +89,15 @@ class FakeCtrl:
             return "Stage not connected", ""
         return "Stop", str(self._pos[ax])
 
+    @staticmethod
+    def limit_direction(status):
+        """2026-08-26 新增：`_move_relative()` 移動失敗後會呼叫
+        `_note_limit_hit()`，那裡會問 ctrl 這個問題。本檔的 FakeCtrl 只有
+        EMS 會讓移動失敗（`query_status` 永遠回 "Stop"），所以這裡怎麼答
+        都不影響本檔斷言——但少了這個方法會直接 AttributeError。
+        """
+        return None
+
     def scan_move_step(self, axis_no, direction, amount, l_speed, f_speed, rate, s_rate, wait_done=True):
         if self.ems_active:
             return False
