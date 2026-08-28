@@ -205,6 +205,45 @@ def _expanding_bounce_deltas(budget: int) -> list[tuple[int, int]]:
     return deltas
 
 
+def estimate_gradient_dbm(pos: np.ndarray, cfg: GaussianFieldConfig, rng: np.random.Generator,
+                           probe_step: float) -> tuple[np.ndarray, int]:
+    """有限差分估計梯度：每一軸做一次中央差分量測（pos±probe_step），量到才用。
+
+    這是刻意取代 gradient_dbm() 解析梯度的地方——真實滑台演算法（fiber_scanner.py
+    的座標下降）沒有解析梯度可用，只能靠實際移動＋量測去估計方向，這裡讓模擬照做：
+    每一軸的方向分量都要付出真正的探測讀值（也可能讀不到，共用 read_power_dbm）。
+    單邊讀不到時退化成單邊差分（多打一次中心點）；兩邊都讀不到就把該軸分量記 0
+    （這一軸暫時沒有方向資訊，不是「沒有梯度」，下一次呼叫會重新探測）。
+    回傳 (grad_estimate, probes_used)：probes_used 是這次估計實際用掉的量測次數，
+    供呼叫端統計「探測成本」。"""
+    grad = np.zeros(cfg.n_axes)
+    probes = 0
+    center_ok: bool | None = None
+    center_val = 0.0
+    for i in range(cfg.n_axes):
+        pos_plus = pos.copy()
+        pos_plus[i] += probe_step
+        pos_minus = pos.copy()
+        pos_minus[i] -= probe_step
+        ok_plus, val_plus = read_power_dbm(pos_plus, cfg, rng)
+        ok_minus, val_minus = read_power_dbm(pos_minus, cfg, rng)
+        probes += 2
+        if ok_plus and ok_minus:
+            grad[i] = (val_plus - val_minus) / (2 * probe_step)
+        elif ok_plus or ok_minus:
+            if center_ok is None:
+                center_ok, center_val = read_power_dbm(pos, cfg, rng)
+                probes += 1
+            if center_ok:
+                if ok_plus:
+                    grad[i] = (val_plus - center_val) / probe_step
+                else:
+                    grad[i] = (center_val - val_minus) / probe_step
+            # 中心點也讀不到：這一軸沒有可用資訊，grad[i] 維持 0
+        # 兩側都讀不到：這一軸沒有可用資訊，grad[i] 維持 0
+    return grad, probes
+
+
 def _reading_step(pos: np.ndarray, cfg: GaussianFieldConfig, rng: np.random.Generator,
                    n_iter: int, mode: str, grad_mag: float | None, step_size: float | None) -> tuple[bool, dict]:
     """量一次目前位置，回傳 (ok, 該步的記錄 dict)。ok=False 時 power_dbm 記為 None（讀不到）。"""
@@ -220,17 +259,28 @@ def _reading_step(pos: np.ndarray, cfg: GaussianFieldConfig, rng: np.random.Gene
 def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], max_iter: int,
                      tol_pulse: float, step_gain: float, rng: np.random.Generator,
                      start_pos: np.ndarray | None = None, record_steps: bool = False) -> dict:
-    """單次沿梯度向量場爬升搜尋：每步先量測目前位置，量得到才用（含雜訊的）梯度方向走一步；
-    量不到（低於量測下限）時沒有方向資訊可用，改成方形螺旋（多軸時）或正負交替遞增
-    （單軸時）系統性地找訊號——跟 fiber_scanner.py 的 run_stage0_blind 同一套幾何，
-    保證涵蓋、不會像隨機方向那樣可能永遠走偏。找到訊號後螺旋作廢，回到梯度爬升。
+    """單次沿梯度向量場爬升搜尋：每步先量測目前位置，量得到才用有限差分（見
+    estimate_gradient_dbm()）估計出的方向走一步——不是解析梯度，真實滑台演算法
+    （fiber_scanner.py 的座標下降）本來就拿不到解析梯度，只能靠實際探測。
+    量不到目前位置、或探測完全沒有方向資訊時，改成方形螺旋（多軸時）或正負交替
+    遞增（單軸時）系統性地找訊號——跟 fiber_scanner.py 的 run_stage0_blind 同一套
+    幾何，保證涵蓋、不會像隨機方向那樣可能永遠走偏。找到訊號後螺旋作廢，回到梯度爬升。
+
+    探測距離（probe_step）刻意跟移動步長（step）分開、不隨迭代縮小：有限差分的
+    兩個探測點量測雜訊固定是 noise_std_db，探測距離變小時「訊號（功率差）」跟著
+    變小、但雜訊不變，會讓方向估計的訊噪比隨探測距離線性崩壞——探測距離縮到跟
+    雜訊同量級時，估出來的方向已經是雜訊而不是真正的梯度。這是典型的「有限差分
+    步長越小、雜訊放大越嚴重」問題，固定探測距離（用起始步長）才能維持穩定的
+    方向估計品質；移動步長仍然照常縮小，只影響「沿著這個方向走多遠」，兩者分開。
     record_steps=True 時額外記錄每一步的位置／量測功率／模式／梯度大小，供軌跡疊圖與逐步記錄用。"""
     pos = start_pos.copy() if start_pos is not None else rng.uniform(grid_range[0], grid_range[1], size=cfg.n_axes)
     step = step_gain * (grid_range[1] - grid_range[0])
+    probe_step = step  # 探測距離固定在起始步長，不隨 step 縮小（見上方 docstring）
     converged = False
     blind_deltas: list[tuple[int, int]] | None = None
     blind_idx = 0
     n_iter = 0
+    total_probes = 0
 
     if record_steps:
         _, step0 = _reading_step(pos, cfg, rng, 0, "起點", None, None)
@@ -240,7 +290,17 @@ def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], m
 
     for n_iter in range(1, max_iter + 1):
         ok, _value = read_power_dbm(pos, cfg, rng)
-        if not ok:
+        mag = 0.0
+        direction = None
+        if ok:
+            grad_est, probes = estimate_gradient_dbm(pos, cfg, rng, probe_step)
+            total_probes += probes
+            mag = float(np.linalg.norm(grad_est))
+            if mag >= 1e-9:
+                direction = grad_est / mag
+
+        if direction is None:
+            # 目前位置讀不到、或探測完全沒抓到方向：兩種情況都沒有梯度可用，走盲搜。
             if blind_deltas is None:
                 remaining = max_iter - n_iter + 1
                 blind_deltas = (_square_spiral_deltas(remaining) if cfg.n_axes >= 2
@@ -257,15 +317,9 @@ def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], m
             continue  # 盲搜階段不縮步長、不判斷收斂——沒訊號時談誤差沒有意義
 
         blind_deltas = None
-        grad = gradient_dbm(pos, cfg)
-        noisy_grad = grad + rng.normal(0.0, cfg.noise_std_db, size=grad.shape) / cfg.sigma
-        mag = np.linalg.norm(noisy_grad)
-        if mag < 1e-9:
-            break
-        direction = noisy_grad / mag
         pos = pos + direction * step
         if record_steps:
-            _, s = _reading_step(pos, cfg, rng, n_iter, "梯度", float(mag), float(step))
+            _, s = _reading_step(pos, cfg, rng, n_iter, "梯度", mag, float(step))
             steps.append(s)
         step *= 0.92  # 每步緩降，模擬座標下降的步長縮減
         err = float(np.linalg.norm(pos - cfg.center))
@@ -276,6 +330,7 @@ def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], m
     result = {
         "converged": converged,
         "iterations": n_iter,
+        "total_probes": total_probes,
         "final_error_euclid": float(np.linalg.norm(pos - cfg.center)),
         "final_error_per_axis": np.abs(pos - cfg.center).tolist(),
     }
@@ -303,6 +358,7 @@ def simulate_hill_climb(cfg: GaussianFieldConfig, grid_range: tuple[float, float
     n = len(results)
     success = sum(r["converged"] for r in results)
     iters = np.array([r["iterations"] for r in results])
+    probes = np.array([r["total_probes"] for r in results])
     errs = np.array([r["final_error_euclid"] for r in results])
     per_axis_err = np.array([r["final_error_per_axis"] for r in results])
 
@@ -311,6 +367,8 @@ def simulate_hill_climb(cfg: GaussianFieldConfig, grid_range: tuple[float, float
         "success_rate": success / n,
         "iterations_mean": float(iters.mean()),
         "iterations_std": float(iters.std()),
+        "probes_mean": float(probes.mean()),
+        "probes_std": float(probes.std()),
         "final_error_mean_pulse": float(errs.mean()),
         "final_error_std_pulse": float(errs.std()),
         "final_error_per_axis_mean_pulse": {
@@ -352,6 +410,7 @@ def run(cfg: GaussianFieldConfig, grid_range: tuple[float, float], grid_points: 
         "traced_run_steps_json": str(steps_path),
         "traced_run_converged": trace["converged"],
         "traced_run_iterations": trace["iterations"],
+        "traced_run_probes": trace["total_probes"],
         "hill_climb_stats": stats,
     }
     summary_path = outdir / "gaussian_vector_sim_summary.json"
@@ -403,6 +462,7 @@ def main() -> None:
     print(f"逐步記錄已存至: {summary['traced_run_steps_json']}")
     print(f"統計摘要已存至: {summary['summary_json']}")
     print(f"成功率: {stats['success_rate']:.1%}  平均步數: {stats['iterations_mean']:.1f} ± {stats['iterations_std']:.1f}")
+    print(f"平均探測次數(有限差分梯度估計的量測成本): {stats['probes_mean']:.1f} ± {stats['probes_std']:.1f}")
     print(f"最終誤差(歐氏距離, pulse): {stats['final_error_mean_pulse']:.1f} ± {stats['final_error_std_pulse']:.1f}")
     for axis, err in stats["final_error_per_axis_mean_pulse"].items():
         print(f"  {axis} 軸平均誤差: {err:.1f} pulse")

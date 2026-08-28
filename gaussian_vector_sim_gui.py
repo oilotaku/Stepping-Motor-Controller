@@ -236,9 +236,10 @@ class GaussianVectorSimApp:
         lines = [
             f"軸: {' '.join(cfg.axis_names)}    中心: {cfg.center.tolist()}    σ: {cfg.sigma.tolist()}",
             f"代表路徑（種子={cfg.seed}）：{'已收斂' if trace['converged'] else '未收斂'}，"
-            f"共 {trace['iterations']} 步，詳見「逐步記錄」分頁",
+            f"共 {trace['iterations']} 步、探測 {trace['total_probes']} 次，詳見「逐步記錄」分頁",
             f"批次統計（{stats['n_trials']} 次）成功率: {stats['success_rate']:.1%}    "
             f"平均步數: {stats['iterations_mean']:.1f} ± {stats['iterations_std']:.1f}",
+            f"平均探測次數(有限差分梯度估計的量測成本): {stats['probes_mean']:.1f} ± {stats['probes_std']:.1f}",
             f"最終誤差(歐氏距離, pulse): {stats['final_error_mean_pulse']:.1f} ± {stats['final_error_std_pulse']:.1f}",
         ]
         for axis, err in stats["final_error_per_axis_mean_pulse"].items():
