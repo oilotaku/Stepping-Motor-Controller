@@ -7,9 +7,15 @@
 
 模型：
     P_linear(x) = P_peak_linear * exp(-Σ (x_i - c_i)^2 / (2 σ_i^2))
-    P_dBm(x)    = 10 log10(P_linear(x))  （量測雜訊加在 dBm domain，再夾在 noise_floor 之下）
+    P_dBm(x)    = 10 log10(P_linear(x))  （量測雜訊加在 dBm domain）
     ∇P_dBm 為解析梯度，箭頭方向即「量測到的功率上升最快方向」——這就是尋光演算法
     （coordinate descent / Powell）實際在追的向量場。
+
+    量測下限（noise_floor_dbm）不是拿來夾住讀值的下限，而是「量測本身會失敗」的
+    門檻，對應 meter_GPIB.py 的 (ok, value) 慣例與 HP 8153A 實機在 underrange 時
+    回傳 sentinel（+9.9E+37）——見 read_power_dbm()。爬升搜尋在讀不到訊號時没有
+    梯度可用，會退化成沿隨機方向走固定步長的「盲搜」，直到重新進入可讀範圍，
+    對應真機的階段零盲搜粗掃。向量圖裡的灰色區域就是這個「讀不到」的範圍。
 
 用法範例：
     venv/Scripts/python.exe gaussian_vector_sim.py
@@ -29,6 +35,7 @@ from typing import Sequence
 import numpy as np
 import matplotlib
 from matplotlib.figure import Figure
+from matplotlib.patches import Patch
 
 # 刻意不 import matplotlib.pyplot：這個模組同時被 CLI（存 PNG）與
 # gaussian_vector_sim_gui.py（用 FigureCanvasTkAgg 直接內嵌）共用，
@@ -54,16 +61,30 @@ class GaussianFieldConfig:
         return len(self.axis_names)
 
 
-def power_dbm(pos: np.ndarray, cfg: GaussianFieldConfig, rng: np.random.Generator | None = None) -> np.ndarray:
-    """pos 最後一維為軸數，回傳同形狀（少最後一維）的 dBm 陣列。"""
+def true_power_dbm(pos: np.ndarray, cfg: GaussianFieldConfig) -> np.ndarray:
+    """理論上的真實耦光功率（無雜訊、不做量測下限判斷），pos 最後一維為軸數。"""
     peak_linear = 10 ** (cfg.peak_power_dbm / 10.0)
     exponent = -np.sum(((pos - cfg.center) ** 2) / (2 * cfg.sigma ** 2), axis=-1)
-    linear = peak_linear * np.exp(exponent)
-    linear = np.clip(linear, 10 ** (cfg.noise_floor_dbm / 10.0) * 1e-6, None)
-    dbm = 10 * np.log10(linear)
+    linear = np.clip(peak_linear * np.exp(exponent), 1e-300, None)
+    return 10 * np.log10(linear)
+
+
+def read_power_dbm(pos: np.ndarray, cfg: GaussianFieldConfig,
+                    rng: np.random.Generator | None) -> tuple[np.ndarray, np.ndarray]:
+    """模擬一次量測：真實功率加雜訊後，低於 noise_floor_dbm（量測下限）視為讀不到。
+
+    回傳 (ok, value)：ok=False 時 value 為 nan，呼叫端不可把它當成真實功率使用。
+    對應 meter_GPIB.py 的 get_power() (ok, value) 慣例與 HP 8153A 實機在 underrange
+    時回傳 sentinel（+9.9E+37）而非一個「看起來合理」的極低讀值——訊號太弱時，
+    量測本身就是失敗的，不是量到一個很小的數字。"""
+    true_dbm = true_power_dbm(pos, cfg)
     if rng is not None and cfg.noise_std_db > 0:
-        dbm = dbm + rng.normal(0.0, cfg.noise_std_db, size=dbm.shape)
-    return np.maximum(dbm, cfg.noise_floor_dbm)
+        noisy_dbm = true_dbm + rng.normal(0.0, cfg.noise_std_db, size=np.shape(true_dbm))
+    else:
+        noisy_dbm = true_dbm
+    ok = noisy_dbm >= cfg.noise_floor_dbm
+    value = np.where(ok, noisy_dbm, np.nan)
+    return ok, value
 
 
 def gradient_dbm(pos: np.ndarray, cfg: GaussianFieldConfig) -> np.ndarray:
@@ -98,14 +119,21 @@ def build_vector_field_figure(cfg: GaussianFieldConfig, grid_range: tuple[float,
         pos[..., ia] = A
         pos[..., ib] = B
 
-        power = power_dbm(pos, cfg, rng=None)
+        power = true_power_dbm(pos, cfg)
+        readable = power >= cfg.noise_floor_dbm
         grad = gradient_dbm(pos, cfg)
         Ga, Gb = grad[..., ia], grad[..., ib]
         mag = np.hypot(Ga, Gb)
         mag_safe = np.where(mag > 1e-12, mag, 1.0)
+        # 讀不到訊號的區域（低於量測下限）不畫等高線、也不畫箭頭——
+        # 真實情況下這裡連方向都拿不到，畫出來會讓人誤以為訊號可用。
+        Ga_plot = np.where(readable, Ga, np.nan)
+        Gb_plot = np.where(readable, Gb, np.nan)
+        power_masked = np.ma.masked_where(~readable, power)
 
-        cf = ax.contourf(A, B, power, levels=20, cmap="viridis")
-        ax.quiver(A, B, Ga / mag_safe, Gb / mag_safe, mag, cmap="autumn", scale=25, width=0.004)
+        ax.set_facecolor("#d9d9d9")
+        cf = ax.contourf(A, B, power_masked, levels=20, cmap="viridis")
+        ax.quiver(A, B, Ga_plot / mag_safe, Gb_plot / mag_safe, mag, cmap="autumn", scale=25, width=0.004)
         ax.plot(cfg.center[ia], cfg.center[ib], marker="*", color="white", markersize=14,
                 markeredgecolor="black", label="真實尖峰")
         if path is not None:
@@ -119,8 +147,10 @@ def build_vector_field_figure(cfg: GaussianFieldConfig, grid_range: tuple[float,
         ax.set_ylabel(f"{cfg.axis_names[ib]} 軸 (pulse)")
         ax.set_title(f"{cfg.axis_names[ia]}–{cfg.axis_names[ib]} 梯度向量圖")
         fig.colorbar(cf, ax=ax, label="功率 (dBm)")
-        if path is not None:
-            ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
+        handles, _labels = ax.get_legend_handles_labels()
+        if (~readable).any():
+            handles.append(Patch(facecolor="#d9d9d9", label="讀不到（低於量測下限）"))
+        ax.legend(handles=handles, fontsize=7, loc="upper right", framealpha=0.8)
 
     for idx in range(len(pairs), n_rows * n_cols):
         axes_arr[idx // n_cols][idx % n_cols].axis("off")
@@ -138,19 +168,50 @@ def save_vector_field_png(cfg: GaussianFieldConfig, grid_range: tuple[float, flo
     return out_path
 
 
+def _reading_step(pos: np.ndarray, cfg: GaussianFieldConfig, rng: np.random.Generator,
+                   n_iter: int, mode: str, grad_mag: float | None, step_size: float | None) -> tuple[bool, dict]:
+    """量一次目前位置，回傳 (ok, 該步的記錄 dict)。ok=False 時 power_dbm 記為 None（讀不到）。"""
+    ok, value = read_power_dbm(pos, cfg, rng)
+    return bool(ok), {
+        "iter": n_iter, "pos": pos.tolist(),
+        "power_dbm": float(value) if ok else None,
+        "readable": bool(ok), "mode": mode,
+        "grad_mag": grad_mag, "step_size": step_size,
+    }
+
+
 def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], max_iter: int,
                      tol_pulse: float, step_gain: float, rng: np.random.Generator,
                      start_pos: np.ndarray | None = None, record_steps: bool = False) -> dict:
-    """單次沿梯度向量場爬升搜尋：每步依當前（含雜訊的）梯度方向走一步，步長隨迭代緩降。
-    record_steps=True 時額外記錄每一步的位置／量測功率／梯度大小，供軌跡疊圖與逐步記錄用。"""
+    """單次沿梯度向量場爬升搜尋：每步先量測目前位置，量得到才用（含雜訊的）梯度方向走一步；
+    量不到（低於量測下限）時沒有方向資訊可用，改成沿一個隨機方向走固定步長「盲搜」，
+    直到重新進入可讀範圍——對應真機無光/訊號太弱時的 underrange 行為，不是灌一個假的低值。
+    record_steps=True 時額外記錄每一步的位置／量測功率／模式／梯度大小，供軌跡疊圖與逐步記錄用。"""
     pos = start_pos.copy() if start_pos is not None else rng.uniform(grid_range[0], grid_range[1], size=cfg.n_axes)
     step = step_gain * (grid_range[1] - grid_range[0])
     converged = False
+    blind_dir: np.ndarray | None = None
     n_iter = 0
-    steps = [{"iter": 0, "pos": pos.tolist(), "power_dbm": float(power_dbm(pos, cfg, rng=None)),
-              "grad_mag": None, "step_size": None}] if record_steps else None
+
+    if record_steps:
+        _, step0 = _reading_step(pos, cfg, rng, 0, "起點", None, None)
+        steps = [step0]
+    else:
+        steps = None
 
     for n_iter in range(1, max_iter + 1):
+        ok, _value = read_power_dbm(pos, cfg, rng)
+        if not ok:
+            if blind_dir is None:
+                blind_dir = rng.normal(size=cfg.n_axes)
+                blind_dir /= np.linalg.norm(blind_dir)
+            pos = pos + blind_dir * step
+            if record_steps:
+                _, s = _reading_step(pos, cfg, rng, n_iter, "盲搜", None, float(step))
+                steps.append(s)
+            continue  # 盲搜階段不縮步長、不判斷收斂——沒訊號時談誤差沒有意義
+
+        blind_dir = None
         grad = gradient_dbm(pos, cfg)
         noisy_grad = grad + rng.normal(0.0, cfg.noise_std_db, size=grad.shape) / cfg.sigma
         mag = np.linalg.norm(noisy_grad)
@@ -159,8 +220,8 @@ def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], m
         direction = noisy_grad / mag
         pos = pos + direction * step
         if record_steps:
-            steps.append({"iter": n_iter, "pos": pos.tolist(), "power_dbm": float(power_dbm(pos, cfg, rng=None)),
-                          "grad_mag": float(mag), "step_size": float(step)})
+            _, s = _reading_step(pos, cfg, rng, n_iter, "梯度", float(mag), float(step))
+            steps.append(s)
         step *= 0.92  # 每步緩降，模擬座標下降的步長縮減
         err = float(np.linalg.norm(pos - cfg.center))
         if err < tol_pulse:

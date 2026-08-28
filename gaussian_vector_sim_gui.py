@@ -115,11 +115,11 @@ class GaussianVectorSimApp:
 
         steps_tab = ttk.Frame(notebook)
         notebook.add(steps_tab, text="逐步記錄")
-        columns = ("iter", "pos", "power_dbm", "grad_mag", "step_size")
+        columns = ("iter", "mode", "pos", "power_dbm", "grad_mag", "step_size")
         self._steps_tree = ttk.Treeview(steps_tab, columns=columns, show="headings")
-        headings = {"iter": "步", "pos": "位置 (pulse)", "power_dbm": "量測功率 (dBm)",
+        headings = {"iter": "步", "mode": "模式", "pos": "位置 (pulse)", "power_dbm": "量測功率 (dBm)",
                     "grad_mag": "梯度大小", "step_size": "步長 (pulse)"}
-        widths = {"iter": 50, "pos": 340, "power_dbm": 120, "grad_mag": 100, "step_size": 100}
+        widths = {"iter": 50, "mode": 60, "pos": 340, "power_dbm": 120, "grad_mag": 100, "step_size": 100}
         for col in columns:
             self._steps_tree.heading(col, text=headings[col])
             self._steps_tree.column(col, width=widths[col], anchor=tk.CENTER if col != "pos" else tk.W)
@@ -227,9 +227,10 @@ class GaussianVectorSimApp:
         self._steps_tree.delete(*self._steps_tree.get_children())
         for s in trace["steps"]:
             pos_text = ", ".join(f"{cfg.axis_names[i]}={v:.1f}" for i, v in enumerate(s["pos"]))
+            power_text = f"{s['power_dbm']:.2f}" if s["power_dbm"] is not None else "讀不到"
             grad_text = f"{s['grad_mag']:.4f}" if s["grad_mag"] is not None else "—"
             step_text = f"{s['step_size']:.1f}" if s["step_size"] is not None else "—"
-            self._steps_tree.insert("", tk.END, values=(s["iter"], pos_text, f"{s['power_dbm']:.2f}",
+            self._steps_tree.insert("", tk.END, values=(s["iter"], s["mode"], pos_text, power_text,
                                                           grad_text, step_text))
 
         lines = [
