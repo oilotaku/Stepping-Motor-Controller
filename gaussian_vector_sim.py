@@ -8,19 +8,34 @@
 模型：
     P_linear(x) = P_peak_linear * exp(-Σ (x_i - c_i)^2 / (2 σ_i^2))
     P_dBm(x)    = 10 log10(P_linear(x))  （量測雜訊加在 dBm domain）
-    ∇P_dBm 為解析梯度，箭頭方向即「量測到的功率上升最快方向」——這就是尋光演算法
-    （coordinate descent / Powell）實際在追的向量場。
+    真實梯度 ∇P_dBm 只用來畫向量圖背景（見 gradient_dbm()）；搜尋演算法本身
+    用有限差分探測估計方向（見 estimate_gradient_dbm()），不偷看解析梯度。
 
     量測下限（noise_floor_dbm）不是拿來夾住讀值的下限，而是「量測本身會失敗」的
     門檻，對應 meter_GPIB.py 的 (ok, value) 慣例與 HP 8153A 實機在 underrange 時
-    回傳 sentinel（+9.9E+37）——見 read_power_dbm()。爬升搜尋在讀不到訊號時没有
-    梯度可用，會退化成沿隨機方向走固定步長的「盲搜」，直到重新進入可讀範圍，
-    對應真機的階段零盲搜粗掃。向量圖裡的灰色區域就是這個「讀不到」的範圍。
+    回傳 sentinel（+9.9E+37）——見 read_power_dbm()。爬升搜尋在讀不到訊號時沒有
+    梯度可用，會退化成方形螺旋（多軸）或正負交替遞增（單軸）系統性地找訊號，
+    對應真機的階段零盲搜粗掃；找到後每軸各自用 Rprop 風格自適應步長爬升（同號
+    加大、反號減半），不會被單一全域衰減排程拖累收斂快慢不同的軸。向量圖裡的
+    灰色區域就是「讀不到」的範圍。
+
+    grid_range／start_range 是兩件事：grid_range 只給畫圖用，start_range（預設
+    沿用 grid_range）決定起點取樣與步長尺度。單模光纖這類「可讀半徑（幾十 pulse）
+    遠小於滑台全行程（上萬 pulse）」的場景務必分開設定，否則步長會用全行程尺度
+    算出來、比可讀半徑大上好幾倍，盲搜螺旋直接跨過訊號區而漏掉。
 
 用法範例：
     venv/Scripts/python.exe gaussian_vector_sim.py
     venv/Scripts/python.exe gaussian_vector_sim.py --axes X Y Z --sigma 4000 6000 5000 \
         --center 1500 -800 0 --trials 200 --outdir gaussian_sim_output
+
+    單模光纖三軸實測校準場景（0.2um/pulse，9umx9um 耦光截面，X/Y/Z 各自全行程，
+    已於對話中驗證：成功率 98~100%、各軸誤差 0.1~2.8 pulse，見對話紀錄）：
+        venv/Scripts/python.exe gaussian_vector_sim.py --axes X Y Z \
+            --center 5300 5250 20500 --sigma 22.5 22.5 250 \
+            --grid-range 0 10600 0 10500 0 41000 \
+            --start-range 4500 6100 4450 6050 19700 21300 \
+            --step-gain 0.035 --tol-pulse 5 --max-iter 3500 --trials 300
 """
 from __future__ import annotations
 
@@ -93,6 +108,22 @@ def gradient_dbm(pos: np.ndarray, cfg: GaussianFieldConfig) -> np.ndarray:
     return -scale * (pos - cfg.center) / (cfg.sigma ** 2)
 
 
+def normalize_axis_ranges(grid_range, n_axes: int) -> np.ndarray:
+    """把 grid_range 統一成形狀 (n_axes, 2) 的每軸獨立範圍。
+
+    grid_range 可以是單一 (min,max)（向後相容，廣播到所有軸——舊呼叫方式跟這次
+    改動前完全一樣），也可以是每軸各自一組 (min,max) 的序列。真實三軸滑台常常
+    行程尺度差很多（例如 Z 軸單向對焦行程遠比 X/Y 橫向對準行程長），共用同一組
+    範圍會讓較小的軸搜尋範圍失真、或較大的軸範圍不夠，所以兩種輸入都要支援。"""
+    arr = np.asarray(grid_range, dtype=float)
+    if arr.shape == (2,):
+        return np.tile(arr, (n_axes, 1))
+    if arr.shape == (n_axes, 2):
+        return arr
+    raise ValueError(f"grid_range 形狀必須是 (2,)（所有軸共用）或 ({n_axes}, 2)（每軸各自），"
+                      f"實際收到 {arr.shape}")
+
+
 def _build_grid(a_range: tuple[float, float], b_range: tuple[float, float], n: int):
     a_vals = np.linspace(a_range[0], a_range[1], n)
     b_vals = np.linspace(b_range[0], b_range[1], n)
@@ -104,6 +135,7 @@ def build_vector_field_figure(cfg: GaussianFieldConfig, grid_range: tuple[float,
     """對每一對軸畫梯度向量圖（其餘軸固定在 fixed_values），多軸時排成子圖網格，回傳 Figure 供存檔或內嵌 GUI 共用。
     path 給定時（形狀 (n_steps, n_axes)），把該次爬升搜尋走過的每一步疊在對應軸對上，
     讓使用者實際看到每一步怎麼沿著向量場移動，不是只看最終統計。"""
+    ranges = normalize_axis_ranges(grid_range, cfg.n_axes)
     pairs = list(itertools.combinations(range(cfg.n_axes), 2))
     if not pairs:
         pairs = [(0, 0)]  # 單軸情況：退化成 1D，仍畫成一張圖以下方 1 軸函式呈現
@@ -114,7 +146,7 @@ def build_vector_field_figure(cfg: GaussianFieldConfig, grid_range: tuple[float,
 
     for idx, (ia, ib) in enumerate(pairs):
         ax = axes_arr[idx // n_cols][idx % n_cols]
-        A, B = _build_grid(grid_range, grid_range, grid_points)
+        A, B = _build_grid(ranges[ia], ranges[ib], grid_points)
         pos = np.tile(fixed_values, A.shape + (1,))
         pos[..., ia] = A
         pos[..., ib] = B
@@ -206,8 +238,12 @@ def _expanding_bounce_deltas(budget: int) -> list[tuple[int, int]]:
 
 
 def estimate_gradient_dbm(pos: np.ndarray, cfg: GaussianFieldConfig, rng: np.random.Generator,
-                           probe_step: float) -> tuple[np.ndarray, int]:
-    """有限差分估計梯度：每一軸做一次中央差分量測（pos±probe_step），量到才用。
+                           probe_step) -> tuple[np.ndarray, int]:
+    """有限差分估計梯度：每一軸做一次中央差分量測（pos±probe_step[i]），量到才用。
+
+    probe_step 可以是純量（所有軸共用同一探測距離）或每軸各自一個值的陣列——
+    軸的物理尺度差很多時（例如某軸行程是另一軸的好幾倍），每軸用自己尺度算出來
+    的探測距離才有意義，共用一個值要嘛對小尺度軸太粗、要嘛對大尺度軸太細。
 
     這是刻意取代 gradient_dbm() 解析梯度的地方——真實滑台演算法（fiber_scanner.py
     的座標下降）沒有解析梯度可用，只能靠實際移動＋量測去估計方向，這裡讓模擬照做：
@@ -216,29 +252,31 @@ def estimate_gradient_dbm(pos: np.ndarray, cfg: GaussianFieldConfig, rng: np.ran
     （這一軸暫時沒有方向資訊，不是「沒有梯度」，下一次呼叫會重新探測）。
     回傳 (grad_estimate, probes_used)：probes_used 是這次估計實際用掉的量測次數，
     供呼叫端統計「探測成本」。"""
+    probe_step_arr = np.broadcast_to(probe_step, (cfg.n_axes,))
     grad = np.zeros(cfg.n_axes)
     probes = 0
     center_ok: bool | None = None
     center_val = 0.0
     for i in range(cfg.n_axes):
+        h = probe_step_arr[i]
         pos_plus = pos.copy()
-        pos_plus[i] += probe_step
+        pos_plus[i] += h
         pos_minus = pos.copy()
-        pos_minus[i] -= probe_step
+        pos_minus[i] -= h
         ok_plus, val_plus = read_power_dbm(pos_plus, cfg, rng)
         ok_minus, val_minus = read_power_dbm(pos_minus, cfg, rng)
         probes += 2
         if ok_plus and ok_minus:
-            grad[i] = (val_plus - val_minus) / (2 * probe_step)
+            grad[i] = (val_plus - val_minus) / (2 * h)
         elif ok_plus or ok_minus:
             if center_ok is None:
                 center_ok, center_val = read_power_dbm(pos, cfg, rng)
                 probes += 1
             if center_ok:
                 if ok_plus:
-                    grad[i] = (val_plus - center_val) / probe_step
+                    grad[i] = (val_plus - center_val) / h
                 else:
-                    grad[i] = (center_val - val_minus) / probe_step
+                    grad[i] = (center_val - val_minus) / h
             # 中心點也讀不到：這一軸沒有可用資訊，grad[i] 維持 0
         # 兩側都讀不到：這一軸沒有可用資訊，grad[i] 維持 0
     return grad, probes
@@ -258,7 +296,8 @@ def _reading_step(pos: np.ndarray, cfg: GaussianFieldConfig, rng: np.random.Gene
 
 def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], max_iter: int,
                      tol_pulse: float, step_gain: float, rng: np.random.Generator,
-                     start_pos: np.ndarray | None = None, record_steps: bool = False) -> dict:
+                     start_pos: np.ndarray | None = None, record_steps: bool = False,
+                     start_range=None) -> dict:
     """單次沿梯度向量場爬升搜尋：每步先量測目前位置，量得到才用有限差分（見
     estimate_gradient_dbm()）估計出的方向走一步——不是解析梯度，真實滑台演算法
     （fiber_scanner.py 的座標下降）本來就拿不到解析梯度，只能靠實際探測。
@@ -272,10 +311,29 @@ def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], m
     雜訊同量級時，估出來的方向已經是雜訊而不是真正的梯度。這是典型的「有限差分
     步長越小、雜訊放大越嚴重」問題，固定探測距離（用起始步長）才能維持穩定的
     方向估計品質；移動步長仍然照常縮小，只影響「沿著這個方向走多遠」，兩者分開。
+    grid_range 可以是單一 (min,max)（所有軸共用）或每軸各自一組 (min,max)（形狀
+    (n_axes,2)）——見 normalize_axis_ranges()。軸的物理行程尺度差很多時（例如
+    某軸行程是另一軸的好幾倍）務必用後者，否則起點取樣與步長都會被錯誤尺度帶偏。
+
+    step／probe_step 都是「每軸各自一個值」的向量，不是共用一個純量：移動距離
+    =方向分量×該軸自己的步長，等於用每軸的行程尺度做對角線預條件（diagonal
+    preconditioning）——尺度大的軸（例如 Z 軸行程遠比 X/Y 長）自然走比較大步，
+    不會被尺度小的軸拖著只走一點點，也不會讓尺度小的軸被尺度大的步長沖過頭。
+    start_range（預設 None，沿用 grid_range）：起點取樣與步長計算改用這個範圍，
+    grid_range 則只留給呼叫端畫圖使用。兩者刻意分開：單模光纖的耦光可讀半徑
+    （幾十 pulse 量級）遠小於滑台整段機械行程（可能上萬 pulse），步長若用全行程
+    寬度算出來，會比可讀半徑大上好幾倍，方形螺旋直接跨過訊號區而漏掉（真機同一個
+    教訓見 docs/fiber-scan.md〈格距必須小於耦合光斑的尺度〉）。start_range 對應
+    真機的「使用者已粗略對準、盲搜半徑相對起點設定」（blind_max_radius 的概念），
+    不是要盲搜掃過整段行程。
     record_steps=True 時額外記錄每一步的位置／量測功率／模式／梯度大小，供軌跡疊圖與逐步記錄用。"""
-    pos = start_pos.copy() if start_pos is not None else rng.uniform(grid_range[0], grid_range[1], size=cfg.n_axes)
-    step = step_gain * (grid_range[1] - grid_range[0])
-    probe_step = step  # 探測距離固定在起始步長，不隨 step 縮小（見上方 docstring）
+    ranges = normalize_axis_ranges(grid_range, cfg.n_axes)
+    start_ranges = ranges if start_range is None else normalize_axis_ranges(start_range, cfg.n_axes)
+    pos = start_pos.copy() if start_pos is not None else rng.uniform(start_ranges[:, 0], start_ranges[:, 1])
+    step_max = step_gain * (start_ranges[:, 1] - start_ranges[:, 0])  # 每軸步長上限（見下方成長/縮小說明）
+    step = step_max.copy()  # 每軸各自的移動步長（向量）
+    probe_step = step_max.copy()  # 探測距離固定在起始步長，不隨 step 縮小（見上方 docstring）
+    prev_sign: np.ndarray | None = None
     converged = False
     blind_deltas: list[tuple[int, int]] | None = None
     blind_idx = 0
@@ -310,18 +368,35 @@ def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], m
                 axis_idx, sign = blind_deltas[blind_idx]
                 blind_idx += 1
                 pos = pos.copy()
-                pos[axis_idx] += sign * step
+                pos[axis_idx] += sign * step[axis_idx]  # 每軸用自己的步長，不是共用一個純量
             if record_steps:
-                _, s = _reading_step(pos, cfg, rng, n_iter, "盲搜", None, float(step))
+                moved = float(step[axis_idx]) if blind_idx > 0 else None
+                _, s = _reading_step(pos, cfg, rng, n_iter, "盲搜", None, moved)
                 steps.append(s)
             continue  # 盲搜階段不縮步長、不判斷收斂——沒訊號時談誤差沒有意義
 
         blind_deltas = None
-        pos = pos + direction * step
+        move = direction * step  # 每軸位移＝方向分量 × 該軸自己的步長（見上方 docstring）
+        pos = pos + move
         if record_steps:
-            _, s = _reading_step(pos, cfg, rng, n_iter, "梯度", mag, float(step))
+            _, s = _reading_step(pos, cfg, rng, n_iter, "梯度", mag, float(np.linalg.norm(move)))
             steps.append(s)
-        step *= 0.92  # 每步緩降，模擬座標下降的步長縮減
+
+        # 每軸各自的自適應步長（Rprop 風格），取代單一全域衰減率：
+        # 全軸共用同一個「每步 ×0.92」排程時，梯度陡的軸（訊噪比高，例如 σ 小的
+        # 橫向軸）幾步就逼近終點、方向開始來回擺盪；梯度緩的軸（σ 大的軸，例如
+        # 縱向對焦）需要走更多步才能縮短同樣的相對距離。共用排程縮到後段所有軸
+        # 步長都已經逼近 0，還沒收斂的軸從此再也動不了、永遠卡在當下的誤差——
+        # 這裡改成方向連續同號（還在朝同一邊前進）就放大步長，反號（已經跨過
+        # 終點、開始擺盪）才縮小，讓每一軸依自己的收斂進度各自決定何時該減速，
+        # 上限夾在 step_max 避免暴衝。
+        cur_sign = np.sign(direction)
+        if prev_sign is not None:
+            same = (cur_sign == prev_sign) & (cur_sign != 0)
+            flipped = (cur_sign != prev_sign) & (prev_sign != 0)
+            step = np.where(flipped, step * 0.5, np.where(same, step * 1.1, step))
+            step = np.minimum(step, step_max)
+        prev_sign = cur_sign
         err = float(np.linalg.norm(pos - cfg.center))
         if err < tol_pulse:
             converged = True
@@ -341,17 +416,21 @@ def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], m
 
 def trace_hill_climb(cfg: GaussianFieldConfig, grid_range: tuple[float, float], max_iter: int,
                       tol_pulse: float, step_gain: float, rng: np.random.Generator,
-                      start_pos: np.ndarray | None = None) -> dict:
-    """跑一次帶完整步進記錄的爬升搜尋，給 GUI 疊圖與「看得到每一步」的逐步表格用。"""
+                      start_pos: np.ndarray | None = None, start_range=None) -> dict:
+    """跑一次帶完整步進記錄的爬升搜尋，給 GUI 疊圖與「看得到每一步」的逐步表格用。
+    start_range 見 _hill_climb_one()：預設沿用 grid_range，只在單模光纖等「可讀
+    半徑遠小於全行程」的場景才需要另外指定。"""
     return _hill_climb_one(cfg, grid_range, max_iter, tol_pulse, step_gain, rng,
-                            start_pos=start_pos, record_steps=True)
+                            start_pos=start_pos, record_steps=True, start_range=start_range)
 
 
 def simulate_hill_climb(cfg: GaussianFieldConfig, grid_range: tuple[float, float], n_trials: int,
-                         max_iter: int, tol_pulse: float, step_gain: float, rng: np.random.Generator) -> dict:
-    """跑 n_trials 次爬升搜尋，統計成功率／步數／誤差（不記錄逐步軌跡，效能考量）。"""
+                         max_iter: int, tol_pulse: float, step_gain: float, rng: np.random.Generator,
+                         start_range=None) -> dict:
+    """跑 n_trials 次爬升搜尋，統計成功率／步數／誤差（不記錄逐步軌跡，效能考量）。
+    start_range 見 _hill_climb_one()。"""
     results = [
-        _hill_climb_one(cfg, grid_range, max_iter, tol_pulse, step_gain, rng)
+        _hill_climb_one(cfg, grid_range, max_iter, tol_pulse, step_gain, rng, start_range=start_range)
         for _ in range(n_trials)
     ]
 
@@ -378,9 +457,10 @@ def simulate_hill_climb(cfg: GaussianFieldConfig, grid_range: tuple[float, float
 
 
 def run(cfg: GaussianFieldConfig, grid_range: tuple[float, float], grid_points: int,
-        n_trials: int, max_iter: int, tol_pulse: float, step_gain: float, outdir: Path) -> dict:
+        n_trials: int, max_iter: int, tol_pulse: float, step_gain: float, outdir: Path,
+        start_range=None) -> dict:
     trace_rng = np.random.default_rng(cfg.seed)
-    trace = trace_hill_climb(cfg, grid_range, max_iter, tol_pulse, step_gain, trace_rng)
+    trace = trace_hill_climb(cfg, grid_range, max_iter, tol_pulse, step_gain, trace_rng, start_range=start_range)
     path = np.array([s["pos"] for s in trace["steps"]])
 
     fig = build_vector_field_figure(cfg, grid_range, grid_points, fixed_values=cfg.center, path=path)
@@ -392,7 +472,8 @@ def run(cfg: GaussianFieldConfig, grid_range: tuple[float, float], grid_points: 
     steps_path.write_text(json.dumps(trace["steps"], ensure_ascii=False, indent=2), encoding="utf-8")
 
     batch_rng = np.random.default_rng(cfg.seed + 1)
-    stats = simulate_hill_climb(cfg, grid_range, n_trials, max_iter, tol_pulse, step_gain, batch_rng)
+    stats = simulate_hill_climb(cfg, grid_range, n_trials, max_iter, tol_pulse, step_gain, batch_rng,
+                                 start_range=start_range)
 
     summary = {
         "config": {
@@ -402,7 +483,9 @@ def run(cfg: GaussianFieldConfig, grid_range: tuple[float, float], grid_points: 
             "peak_power_dbm": cfg.peak_power_dbm,
             "noise_floor_dbm": cfg.noise_floor_dbm,
             "noise_std_db": cfg.noise_std_db,
-            "grid_range": list(grid_range),
+            "grid_range": normalize_axis_ranges(grid_range, cfg.n_axes).tolist(),
+            "start_range": (normalize_axis_ranges(start_range, cfg.n_axes).tolist()
+                             if start_range is not None else None),
             "grid_points": grid_points,
             "seed": cfg.seed,
         },
@@ -427,7 +510,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--peak-power-dbm", type=float, default=-10.0)
     p.add_argument("--noise-floor-dbm", type=float, default=-60.0)
     p.add_argument("--noise-std-db", type=float, default=0.05)
-    p.add_argument("--grid-range", nargs=2, type=float, default=[-15000.0, 15000.0], metavar=("MIN", "MAX"))
+    p.add_argument("--grid-range", nargs="+", type=float, default=[-15000.0, 15000.0],
+                    help="繪圖範圍（沒給 --start-range 時起點取樣也用這個）。給 2 個值＝所有軸"
+                         "共用；給 2×軸數個值＝每軸各自一組 (min,max)，順序對應 --axes")
+    p.add_argument("--start-range", nargs="+", type=float, default=None,
+                    help="起點取樣與步長計算改用這個範圍（不給就沿用 --grid-range）。"
+                         "單模光纖等可讀半徑遠小於全行程的場景要用這個——對應真機"
+                         "「使用者已粗略對準、盲搜半徑相對起點設定」，不是盲搜掃過整段行程；"
+                         "格式同 --grid-range")
     p.add_argument("--grid-points", type=int, default=25)
     p.add_argument("--trials", type=int, default=200, help="爬升搜尋模擬次數，統計成功率／收斂步數用")
     p.add_argument("--max-iter", type=int, default=200)
@@ -445,6 +535,17 @@ def main() -> None:
     sigma = np.array(args.sigma if args.sigma is not None else [5000.0] * n, dtype=float)
     if len(center) != n or len(sigma) != n:
         raise SystemExit(f"--center/--sigma 數量必須與 --axes（{n} 軸）相同")
+    def _parse_range(values, flag_name):
+        if values is None:
+            return None
+        if len(values) not in (2, 2 * n):
+            raise SystemExit(f"{flag_name} 必須給 2 個值（所有軸共用）或 {2 * n} 個值（每軸各自一組），"
+                              f"實際給了 {len(values)} 個")
+        arr = np.array(values, dtype=float)
+        return arr if len(values) == 2 else arr.reshape(n, 2)
+
+    grid_range = _parse_range(args.grid_range, "--grid-range")
+    start_range = _parse_range(args.start_range, "--start-range")
 
     cfg = GaussianFieldConfig(
         axis_names=args.axes, center=center, sigma=sigma,
@@ -452,9 +553,9 @@ def main() -> None:
         noise_std_db=args.noise_std_db, seed=args.seed,
     )
     summary = run(
-        cfg, grid_range=tuple(args.grid_range), grid_points=args.grid_points,
+        cfg, grid_range=grid_range, grid_points=args.grid_points,
         n_trials=args.trials, max_iter=args.max_iter, tol_pulse=args.tol_pulse,
-        step_gain=args.step_gain, outdir=args.outdir,
+        step_gain=args.step_gain, outdir=args.outdir, start_range=start_range,
     )
 
     stats = summary["hill_climb_stats"]
