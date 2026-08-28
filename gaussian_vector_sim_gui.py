@@ -2,8 +2,9 @@
 高斯向量圖模擬 — 獨立 tkinter 小工具
 
 包一層介面在 gaussian_vector_sim.py 外面：勾選要模擬的軸、輸入各軸中心／
-高斯寬度與其餘條件，按下「執行模擬」後在視窗內直接顯示梯度向量圖與爬升
-搜尋統計。完全獨立於 main_ai.py，不連接硬體、不 import 任何 DS102 相關模組。
+高斯寬度與其餘條件，按下「執行模擬」後在視窗內直接顯示梯度向量圖與
+fiber_scanner.py 尋光演算法（階段零盲搜＋階段一座標下降）的忠實重現統計。
+完全獨立於 main_ai.py，不連接硬體、不 import 任何 DS102 相關模組。
 """
 from __future__ import annotations
 
@@ -15,7 +16,11 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from gaussian_vector_sim import AXES, GaussianFieldConfig, build_vector_field_figure, simulate_hill_climb, trace_hill_climb
+from gaussian_vector_sim import (
+    AXES, DEFAULT_BLIND_MAX_RADIUS, DEFAULT_BLIND_STEP, DEFAULT_MAX_CYCLES,
+    DEFAULT_NOISE_SIGMA_MULT, DEFAULT_STEP_MIN, GaussianFieldConfig,
+    build_vector_field_figure, simulate_search, trace_search,
+)
 
 DEFAULT_OUTDIR = Path("gaussian_sim_output")
 
@@ -75,12 +80,15 @@ class GaussianVectorSimApp:
         self._grid_max = self._add_field(cond_box, "繪圖範圍上限 (pulse)", "15000")
         self._grid_points = self._add_field(cond_box, "格點數（每軸）", "25")
 
-        sim_box = ttk.Labelframe(parent, text="爬升搜尋統計條件")
+        sim_box = ttk.Labelframe(parent, text="搜尋演算法條件（對照 fiber_scanner.py 同名參數）")
         sim_box.pack(fill=tk.X, pady=8)
         self._trials = self._add_field(sim_box, "模擬次數", "200")
-        self._max_iter = self._add_field(sim_box, "每次最大步數", "200")
-        self._tol_pulse = self._add_field(sim_box, "收斂誤差門檻 (pulse)", "50")
-        self._step_gain = self._add_field(sim_box, "初始步長比例", "0.05")
+        self._step_min = self._add_field(sim_box, "最小步長 step_min (pulse)", str(DEFAULT_STEP_MIN))
+        self._max_cycles = self._add_field(sim_box, "階段一最多輪數 max_cycles", str(DEFAULT_MAX_CYCLES))
+        self._noise_sigma_mult = self._add_field(sim_box, "雜訊底限倍數 noise_sigma_mult", str(DEFAULT_NOISE_SIGMA_MULT))
+        self._blind_step = self._add_field(sim_box, "盲搜格距 blind_step (pulse)", str(DEFAULT_BLIND_STEP))
+        self._blind_max_radius = self._add_field(sim_box, "盲搜最大半徑 (pulse)", str(DEFAULT_BLIND_MAX_RADIUS))
+        self._tol_pulse = self._add_field(sim_box, "對照真值算成功率用的誤差門檻 (pulse)", "5")
         self._seed = self._add_field(sim_box, "亂數種子", "42")
 
         outdir_box = ttk.Labelframe(parent, text="輸出資料夾")
@@ -115,11 +123,11 @@ class GaussianVectorSimApp:
 
         steps_tab = ttk.Frame(notebook)
         notebook.add(steps_tab, text="逐步記錄")
-        columns = ("iter", "mode", "pos", "power_dbm", "grad_mag", "step_size")
+        columns = ("no", "phase", "cycle", "axis", "pos", "power_dbm", "step_size")
         self._steps_tree = ttk.Treeview(steps_tab, columns=columns, show="headings")
-        headings = {"iter": "步", "mode": "模式", "pos": "位置 (pulse)", "power_dbm": "量測功率 (dBm)",
-                    "grad_mag": "梯度大小", "step_size": "步長 (pulse)"}
-        widths = {"iter": 50, "mode": 60, "pos": 340, "power_dbm": 120, "grad_mag": 100, "step_size": 100}
+        headings = {"no": "#", "phase": "階段", "cycle": "輪", "axis": "軸", "pos": "位置 (pulse)",
+                    "power_dbm": "量測功率 (dBm)", "step_size": "步長 (pulse)"}
+        widths = {"no": 50, "phase": 60, "cycle": 40, "axis": 40, "pos": 320, "power_dbm": 120, "step_size": 90}
         for col in columns:
             self._steps_tree.heading(col, text=headings[col])
             self._steps_tree.column(col, width=widths[col], anchor=tk.CENTER if col != "pos" else tk.W)
@@ -162,9 +170,12 @@ class GaussianVectorSimApp:
         run_params = {
             "grid_points": int(self._grid_points.get()),
             "n_trials": int(self._trials.get()),
-            "max_iter": int(self._max_iter.get()),
+            "step_min": int(self._step_min.get()),
+            "max_cycles": int(self._max_cycles.get()),
+            "noise_sigma_mult": float(self._noise_sigma_mult.get()),
+            "blind_step": int(self._blind_step.get()),
+            "blind_max_radius": int(self._blind_max_radius.get()),
             "tol_pulse": float(self._tol_pulse.get()),
-            "step_gain": float(self._step_gain.get()),
         }
         return cfg, grid_range, run_params
 
@@ -184,21 +195,23 @@ class GaussianVectorSimApp:
 
     def _run_worker(self, cfg: GaussianFieldConfig, grid_range: tuple[float, float], run_params: dict) -> None:
         try:
+            search_kwargs = {
+                "step_min": run_params["step_min"],
+                "max_cycles": run_params["max_cycles"],
+                "noise_sigma_mult": run_params["noise_sigma_mult"],
+                "blind_step": run_params["blind_step"],
+                "blind_max_radius": run_params["blind_max_radius"],
+                "tol_pulse": run_params["tol_pulse"],
+            }
             trace_rng = np.random.default_rng(cfg.seed)
-            trace = trace_hill_climb(
-                cfg, grid_range, run_params["max_iter"], run_params["tol_pulse"],
-                run_params["step_gain"], trace_rng,
-            )
-            path = np.array([s["pos"] for s in trace["steps"]])
+            trace = trace_search(cfg, grid_range, trace_rng, **search_kwargs)
+            path = np.array([s["pos"] for s in trace["steps"]]) if trace.get("steps") else None
 
             fig = build_vector_field_figure(cfg, grid_range, run_params["grid_points"],
                                              fixed_values=cfg.center, path=path)
 
             batch_rng = np.random.default_rng(cfg.seed + 1)
-            stats = simulate_hill_climb(
-                cfg, grid_range, run_params["n_trials"], run_params["max_iter"],
-                run_params["tol_pulse"], run_params["step_gain"], batch_rng,
-            )
+            stats = simulate_search(cfg, grid_range, run_params["n_trials"], batch_rng, **search_kwargs)
             outdir = Path(self._outdir_var.get() or DEFAULT_OUTDIR)
             outdir.mkdir(parents=True, exist_ok=True)
             png_path = outdir / "gaussian_vector_field.png"
@@ -225,21 +238,20 @@ class GaussianVectorSimApp:
         self._fig_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         self._steps_tree.delete(*self._steps_tree.get_children())
-        for s in trace["steps"]:
+        for no, s in enumerate(trace.get("steps") or [], start=1):
             pos_text = ", ".join(f"{cfg.axis_names[i]}={v:.1f}" for i, v in enumerate(s["pos"]))
             power_text = f"{s['power_dbm']:.2f}" if s["power_dbm"] is not None else "讀不到"
-            grad_text = f"{s['grad_mag']:.4f}" if s["grad_mag"] is not None else "—"
-            step_text = f"{s['step_size']:.1f}" if s["step_size"] is not None else "—"
-            self._steps_tree.insert("", tk.END, values=(s["iter"], s["mode"], pos_text, power_text,
-                                                          grad_text, step_text))
+            step_text = str(s["step_size"]) if s["step_size"] is not None else "—"
+            self._steps_tree.insert("", tk.END, values=(no, s["phase"], s["cycle"] or "—",
+                                                          s["axis"] or "—", pos_text, power_text, step_text))
 
         lines = [
             f"軸: {' '.join(cfg.axis_names)}    中心: {cfg.center.tolist()}    σ: {cfg.sigma.tolist()}",
             f"代表路徑（種子={cfg.seed}）：{'已收斂' if trace['converged'] else '未收斂'}，"
-            f"共 {trace['iterations']} 步、探測 {trace['total_probes']} 次，詳見「逐步記錄」分頁",
+            f"盲搜 {trace['blind_runs']} 次、探測 {trace['total_probes']} 次，詳見「逐步記錄」分頁",
             f"批次統計（{stats['n_trials']} 次）成功率: {stats['success_rate']:.1%}    "
-            f"平均步數: {stats['iterations_mean']:.1f} ± {stats['iterations_std']:.1f}",
-            f"平均探測次數(有限差分梯度估計的量測成本): {stats['probes_mean']:.1f} ± {stats['probes_std']:.1f}",
+            f"平均盲搜次數: {stats['blind_runs_mean']:.2f}",
+            f"平均探測次數: {stats['probes_mean']:.1f} ± {stats['probes_std']:.1f}",
             f"最終誤差(歐氏距離, pulse): {stats['final_error_mean_pulse']:.1f} ± {stats['final_error_std_pulse']:.1f}",
         ]
         for axis, err in stats["final_error_per_axis_mean_pulse"].items():
