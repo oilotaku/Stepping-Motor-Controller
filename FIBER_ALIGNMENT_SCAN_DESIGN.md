@@ -295,3 +295,89 @@ architect 收尾審查（`286aaea`）額外記錄三個**判定不影響安全�
 - **軟體限位與韌體限位在掃描期間的交互**——階段二的批次移動走 `check_sw_limits_batch`（Python 端），韌體端的限位（`CWSLE`）依 CLAUDE.md〈硬體連不上時〉2026-08-05 複測記載目前維持出廠預設（未啟用），這件事在正式跑真實掃描前需要重新確認，截至 2026-08-19 未見狀態變更的紀錄。
 - **GUI 整合層的端到端真機驗證**——`fiber_scanner.py` 演算法核心與「尋光」分頁各自都驗證過（前者真機、後者假物件），但「使用者在 GUI 按下開始尋光、完整跑完一輪」這條路徑**沒有真機驗證紀錄**，2026-08-19 新增的彈性選軸／即時軌跡圖重繪同樣只有假物件驗證。這是目前最大的驗證缺口。
 - **architect 對整個 `feat/fiber-search-gui` 分支的總覽式複審**——目前只有對整個分支的「第一輪」審查（`2648861`，最初「不建議合併」，修正後未見重新複審結論）與之後各子功能各自的審查，沒有「這個分支現在可以合併」的正式結論，見上方〈GUI 整合〉。
+
+## 第三輪：多軸尋光演算法候選評估（2026-08-27，純規劃階段，尚未落地）
+
+🔴 **本節是規劃／文獻回顧的紀錄，不是已完成的功能。** 沒有任何程式碼因本節而改動，`fiber_scanner.py` 現況仍是上方〈核心演算法：三階段混合〉描述的三階段設計。記錄目的是留下決策脈絡，供之後真的要落地時直接接續。
+
+**觸發動機**：現有三階段設計本質仍是「逐軸座標下降為主力」（見〈核心演算法〉），軸間耦合（旋轉橢圓型耦合誤差）要靠階段二額外量測才能從 208 pulse 誤差壓到 26 pulse（多花 18% 量測）。本輪評估其他候選演算法家族，作為替代或補強方向。
+
+### 候選演算法與文獻來源
+
+查詢了 PI（Physik Instrumente）FMPA 產品線、光纖對準期刊論文、2026 年 *Micromachines* 探針卡對準演算法比較研究（Bejani et al.）等業界／學術資料，確認以下候選家族：
+
+1. **SPSA（同步擾動隨機近似）**——每輪梯度估計只需 2 次量測，與軸數無關（座標下降是 O(軸數)），對「量測比移動貴、未來要撐到 6 軸」的場景理論效益最高，但是隨機演算法，收斂路徑不可解釋，`a_k`/`c_k` 步長排程需要多輪調參。
+2. **修改型 Simplex／Nelder-Mead**——光纖對準文獻中驗證最久、最常被提及的方法（King's modified simplex），天然處理多軸耦合，缺點是需要維護 N+1 個頂點，對雜訊量測敏感。
+3. **Powell 共軛方向法**——對現有階段一（座標下降）的直接升級：仍是一連串 1D 線搜，只是方向向量從座標軸換成任意方向（每輪結束用位移向量取代一個舊方向）。改動幅度最小。
+4. **局部貝氏最佳化（GP 代理模型）**——理論上樣本效率最高，`scikit-optimize`/`bayes_opt` 可封裝掉 GP 的實作複雜度，但需要事先給搜尋邊界（見下方「結構性限制」）。
+5. **有限差分最陡下降法（Fixed/Variable Gradient Ascent）**——PI FMPA 與探針卡論文的主力演算法之一，概念上是階段一的「聯合版」，但每次梯度估計要 2×軸數 次量測，量測成本仍隨軸數線性成長。
+6. **強化學習／Model-free 線上調整**——文獻確實存在（如 PPO 用於光學處理器線上訓練），但需要大量互動樣本才能收斂，與「每次量測都要等真實滑台移動＋GPIB」的成本結構完全不合，**不建議**列入候選。
+
+參考文獻：
+- Bejani et al., "Comparative Evaluation of Optical Alignment Algorithms for Integrated Probe Cards in Photonic Wafer Testing," *Micromachines* 17(5):592, 2026. https://www.mdpi.com/2072-666X/17/5/592
+- PI, "History and Future of Photonics Alignment Automation." https://www.pi-usa.us/en/tech-blog/history-and-future-of-photonics-alignment-automation-test-assembly-of-sip-components
+- PI FMPA 產品說明. https://www.pi-usa.us/en/products/photonics-alignment-solutions/
+- "A Novel Algorithm for Fiber-Optic Alignment Automation." https://www.researchgate.net/publication/3423526_A_Novel_Algorithm_for_Fiber-Optic_Alignment_Automation
+- "Automation of multi-degree-of-freedom fiber-optic alignment using a modified simplex method," *Mechatronics*. https://www.sciencedirect.com/science/article/abs/pii/S0890695505000040
+- "Fiber optic active alignment method based on a pattern search algorithm." https://www.researchgate.net/publication/238981793_Fiber_optic_active_alignment_method_based_on_a_pattern_search_algorithm
+- "Fuzzy simplex algorithm for active fiber-laser alignment." https://www.researchgate.net/publication/296736717_Fuzzy_simplex_algorithm_for_active_fiber-laser_alignment
+- Laser Focus World, "Simplex algorithm aligns quickly and simply." https://www.laserfocusworld.com/software-accessories/positioning-support-accessories/article/16556202/simplex-algorithm-aligns-quickly-and-simply
+
+### 兩種排序不一致：效益 vs 實現/驗證難易度
+
+按**預期效益**排序，SPSA 排第一（直接解決量測數隨軸數線性成長這個已記錄的結構性瓶頸）。但按**實現與驗證難易度**排序，SPSA 掉到中後段——它是隨機演算法，跟現有 `verify_*.py` 全走確定性斷言的測試風格不合，需要固定亂數種子或統計檢定，且步長排程調參本身需要多輪離線實驗。相對地，Powell 在兩種排序都排前段：`_search_axis_once()` 的 bracket→定向爬坡→三點拋物線骨架本來就是「沿一個向量做 1D 搜尋」，換成任意方向向量幾乎不用重寫，且能直接套用既有的旋轉橢圓耦合測試資料（208→26 pulse 那組）做對照，不必重新設計測試情境。
+
+### mathematician 意見（兩輪）
+
+**第一輪**（審過候選清單後）：
+- 光功率讀值是 **dBm（對數量）**，耦合曲面在 dBm 域是**全域二次型**（不是線性域直覺的「近峰陡遠峰平」）——這對 Powell、SPSA 等梯度類方法都是好消息，尤其 Powell 在二次型曲面上有 **n 輪有限終止**的理論保證，直接對應 208→26 pulse 那個耦合案例。
+- `calibrate_noise()` 的 σ（dB 單位）不能直接當 SPSA 的擾動幅度 `c_k`（pulse 單位），中間差一個局部斜率 |∂P/∂x|，且 `c_k` 需要一個 pulse 下限（建議 ≥5 pulse，對應機械重現性 2~3 倍），否則遞減步長會被機構殘差吃掉——這是 SPSA 一個容易被忽略的失效模式。
+- Powell 方向向量退化在 2~3 軸場景下要 3~5 輪才會真的發生，週期性重置為座標軸方向即可，不必實作 Brent 接受判別式；但 `PULS` 不接小數，沿方向走小步時會被整數量化偷偷打回座標軸，需要「分量 <3 pulse 就歸零重新正規化」這條規則，否則共軛性是假的。
+- SPSA 的確定性驗證其實做得到（帶種子的 `random.Random(seed)` 實例 + 可重現偽雜訊的合成 dBm 高斯曲面，斷言固定種子跑 N 輪後誤差 ≤ tol），難度沒有想像中高；真正的成本在 `a_k`/`c_k` 排程的離線調參輪數。
+- 結論：先深入設計 **Powell**（理論保證明確、改動面最小、可直接用既有耦合測試資料對照）。
+
+**第二輪**（確認放寬 numpy 限制、比較 Powell vs 貝氏最佳化的落地設計後）：
+- objective 函式需要一層 adapter（絕對座標 → round 成整數 pulse → 查快取 → miss 才移動+量測 → 回傳 −dBm）；快取是必需品，Powell 線搜末期會在 <1 pulse 範圍反覆試探，沒快取就是重複移動+量測白燒預算。
+- **異常處理是兩者最大分歧**：`scipy.optimize.minimize` 的 objective 一拋例外就整個中止、內部最佳點全丟——撞限位／`_targets_reachable` 否決絕不可用例外，要回「軟牆懲罰值」（`f(clip(x)) + λ·‖x−clip(x)‖₁`，不能用常數或 `inf`，否則三點拋物線內插會算出垃圾方向）。`skopt` 用 `dimensions=[Integer(lo,hi),...]` 結構性解決了整數量化與邊界，根本不會產生越界候選點——這是貝氏最佳化對本專案的真正結構優勢，比「樣本效率」更實在。
+- scipy `Powell` 的預設容差（`xtol=1e-4`/`ftol=1e-4`）對本專案座標量級（1e3~1e5 pulse）完全不合用，只會靠 `maxfev` 硬停；需客製化 `xtol≈5 pulse`、`ftol≈3σ`，且要手動設 `options={'direc':...}`（預設方向集合是 1 pulse 單位長度，第一輪線搜會泡在雜訊裡）。
+- 🔴 **貝氏最佳化有一個結構性水土不服**：它需要事先給搜尋邊界，但本專案的行程邊界（`_travel_bounds`）恰恰要撞過一次限位才會知道（`check_sw_limits_batch()` 實機是 no-op，見上方〈架構〉紅線）。給太寬會讓 GP 在巨大空域浪費全部預算，給太窄可能框不到峰——貝氏最佳化理論上最適合取代的階段零盲搜，正是本專案最沒有先驗邊界的階段。**應排在「行程邊界可事先建表」（一次完整 homing + 四側撞邊界建 `_travel_bounds` 持久化）之後**再重新評估，不是現在的優先項。
+- 整合方式建議「一段換一段」：**Powell 先取代階段一＋階段二**，階段零（盲搜起點）與階段三（收尾微擾）不動，可直接用既有旋轉橢圓耦合資料做可歸因的 A/B 對照。完全取代零+一+二會讓「起點」與「精修」同時改變，回歸無法歸因。
+- 最終建議仍是 **Powell**，理由比第一輪更強：dBm 域二次型的理論保證直接對應耦合案例、scipy 實作成熟、改動面最小，而貝氏最佳化目前卡在「沒有先驗邊界」這個結構性問題上，不是排序問題可以繞過的。
+
+### architect 意見（放寬「不依賴 numpy」的打包／相容性評估）
+
+- **事實修正**：`requirements.txt` 其實**已經有 `numpy`**（matplotlib 強制相依，`main_ai.py` 也直接 import 它）。「不依賴 numpy」原本就只是 `fiber_scanner.py` 單一檔案的自我約束，不是整個專案的原則。
+- 既有 onedir 打包已是 152MB（numpy+matplotlib 貢獻約 113MB）。加 scipy 估計拉高到 250~280MB；再加 scikit-optimize/bayes_opt（依賴 scikit-learn）估計到 300~380MB。體積本身在隨身碟/內網部署場景判斷不是否決理由。
+- 相容性風險分兩級：numpy 與現有 pyserial/PyVISA/tkinter 已共存並通過打包驗證，風險等於零；scipy 會帶一份**重複的 OpenBLAS**（`numpy.libs` 與 `scipy.libs` 各一份塞進同一 onedir 資料夾），是 `DLL load failed` 的典型來源，必須實際試打包一次驗證。🔴 **scikit-learn 會再引入一份 OpenMP runtime**，「Windows 上同時載入多個 OpenMP runtime」是比 BLAS 重複更嚴重的已知當機/掛死模式——這是對貝氏最佳化套件最大的保留，風險比 scipy 高一個等級。
+- 對既有 57 項假物件回歸測試：新增 scipy 的模組層級 import 成本可忽略（numpy 的成本現在已經在付，`conftest.py` 收集階段就 import `main_ai`）；唯一要守的規則是新模組**不可 import `matplotlib.pyplot`**（`main_ai.py` 已固定 TkAgg）。
+- **依賴分層建議**：`scipy` 放進主 `requirements.txt`；`scikit-optimize`/`bayes_opt`/`scikit-learn` 另立 `requirements-optimize.txt`，定位為離線回放實驗用，不進出貨的 frozen build。
+- **檔案切分建議：新開 `fiber_scanner_advanced.py`，不要改寫 `fiber_scanner.py`**。既有檔案承載的是一系列事故修正後的安全不變量（`_note_limit_hit()`、`_targets_reachable()`、只攔 `NoSignalAbort`、逐一檢查 `move_step()` 回傳值），為了一次演算法實驗去動它風險不對稱；新增依賴也需要能「裝不到就降級」（比照 matplotlib 的 try/except 模式）。**硬性條件：新檔不得複製那層安全邏輯**，移動/量測/行程邊界必須沿用既有 scanner 的 `scan_move_step()`／`_targets_reachable()`／中止語意，只把「決定下一個座標」抽成 objective adapter——安全邏輯一旦出現兩份實作，208 pulse 那類 bug 會從沒被修的那一份長回來。
+- 放行順序建議：先只加 scipy 做 Powell，跑一次真實 `--onedir` 試打包確認雙 OpenBLAS 無誤，再談貝氏最佳化那組。
+- `_move_multi_axis()` 在 `fiber_scanner.py` 已存在，多軸批次移動不是新建設成本（初評誤判為缺口，第二輪已更正）。
+
+### 本輪結論
+
+1. **首選落地方向：Powell 共軛方向法，用 `scipy.optimize.minimize(method='Powell')`**，先取代階段一＋階段二，階段零與階段三不動。
+2. 貝氏最佳化因「需要事先給搜尋邊界，但本專案邊界要撞過一次限位才知道」的結構性限制，排到「行程邊界可事先建表」之後再評估。
+3. SPSA、有限差分最陡下降、Simplex、強化學習暫不投入。
+4. 依賴分層：`scipy` 進主 `requirements.txt`；`scikit-optimize`/`bayes_opt`/`scikit-learn` 另立 `requirements-optimize.txt`。
+5. 檔案切分：新開 `fiber_scanner_advanced.py`，不改寫 `fiber_scanner.py`，且不得複製既有安全邏輯。
+6. **正式落地前缺三筆實測數據**（不到手，Powell 的容差與軟牆參數都釘不死）：峰附近 dB/pulse 斜率量級、單次量測 vs 單次移動的時間拆解、`calibrate_noise()` 在實機的 σ。
+7. CLAUDE.md「不依賴 numpy」的措辭需要修改：先講清楚 `requirements.txt` 其實已有 numpy 這個事實修正，再新增「允許 scipy 等成熟數值最佳化套件」的部分，並與「pulse-only、不做 um/mm 換算」那條完全不同層次的既有決策劃清界線。
+
+**尚待實際著手時才需要的動作**（本節只到規劃層級，均未執行）：草擬 CLAUDE.md 修改文字並定案、跑一次真實 `--onedir` 試打包驗證雙 OpenBLAS 無誤、安排上述三筆實測數據的量測。完整討論過程另存於使用者的 plan 檔（`fuzzy-drifting-thompson.md`），本節是收斂後的正式紀錄。
+
+### 落地實作（2026-08-27，假物件驗證，未真機驗證）
+
+`coder` 依上述規格實作 `fiber_scanner_advanced.py`（`run_stage_powell()`，用 `scipy.optimize.minimize(method='Powell')`），複審時發現並修正一個 bug（best_state 初始化被 `-inf` 污染，會讓撞限位的軟牆懲罰公式又炸出 `+inf`，違反設計時刻意要避開的那個問題）。`tester` 補上 `verify_scan_powell.py`（8 項假物件測試，涵蓋基本收斂、軸間耦合對照、撞限位軟牆懲罰、量測失敗、使用者中止回退、scipy 降級、objective 快取），全數通過，既有 362 項回歸套件同步跑過無破壞。
+
+**耦合案例對照數據**（旋轉橢圓曲面，長軸極淺 k=1e-4、短軸陡峭 k=5e-3，θ=30°）驗證了本節效益評估的核心宣稱：
+
+| 方法 | X 誤差 | Y 誤差 | 合計 |
+|---|---|---|---|
+| Powell（`run_stage_powell`） | 4.0 pulse | 2.0 pulse | 6.0 pulse |
+| 座標下降（`run_stage1`，不開階段二） | 40.0 pulse | 23.0 pulse | 63.0 pulse |
+
+在這個合成耦合曲面上 Powell 收斂精度約為座標下降的 10 倍，方向與〈本輪結論〉一致。**這是合成資料驗證，不是真機數據**——`xtol_pulse`/`ftol_sigma_mult`/`penalty_lambda` 仍是待校準的起跳值（見檔頭註解），也尚未接進 GUI（`main_ai.py` 沒有改動，範圍刻意排除在外，之後要接需要先過 `ui-designer`）。
+
+**尚待實際著手時才需要的動作，更新為**：CLAUDE.md 修改文字定案、真實 `--onedir` 試打包驗證雙 OpenBLAS、三筆待實測參數的真機量測、`main_ai.py` GUI 整合（`ui-designer` 提案先行）。

@@ -7,6 +7,7 @@ PyVISA==1.16.2      # GPIB 量測儀器控制，meter_GPIB.py
 requests==2.34.2    # HTTP 用戶端（間接/選用）
 matplotlib==3.11.1  # 尋光即時軌跡圖，main_ai.py 尋光分頁（fiber_scanner 整合）
 numpy==2.5.2         # matplotlib 的必要相依，main_ai.py 也直接用來組空陣列（set_offsets 需要）
+scipy==1.16.2        # fiber_scanner_advanced.py 的 Powell 共軛方向法（scipy.optimize.minimize），見 FIBER_ALIGNMENT_SCAN_DESIGN.md〈第三輪〉
 XlsxWriter==3.2.9   # 尋光樣本的 Excel 報表輸出，fiber_scanner.export_samples_xlsx（缺席時優雅降級，只影響 xlsx，不影響 JSON 樣本檔）
 
 # --- 開發/測試用相依（不影響 GUI 執行期）---
