@@ -378,6 +378,8 @@ architect 收尾審查（`286aaea`）額外記錄三個**判定不影響安全�
 | Powell（`run_stage_powell`） | 4.0 pulse | 2.0 pulse | 6.0 pulse |
 | 座標下降（`run_stage1`，不開階段二） | 40.0 pulse | 23.0 pulse | 63.0 pulse |
 
-在這個合成耦合曲面上 Powell 收斂精度約為座標下降的 10 倍，方向與〈本輪結論〉一致。**這是合成資料驗證，不是真機數據**——`xtol_pulse`/`ftol_sigma_mult`/`penalty_lambda` 仍是待校準的起跳值（見檔頭註解），也尚未接進 GUI（`main_ai.py` 沒有改動，範圍刻意排除在外，之後要接需要先過 `ui-designer`）。
+在這個合成耦合曲面上 Powell 收斂精度約為座標下降的 10 倍，方向與〈本輪結論〉一致。**這是合成資料驗證，不是真機數據**——`xtol_pulse`/`ftol_sigma_mult`/`penalty_lambda` 仍是待校準的起跳值（見檔頭註解）。
 
-**尚待實際著手時才需要的動作，更新為**：CLAUDE.md 修改文字定案、真實 `--onedir` 試打包驗證雙 OpenBLAS、三筆待實測參數的真機量測、`main_ai.py` GUI 整合（`ui-designer` 提案先行）。
+**2026-08-28 更新：已接進 GUI。** `main_ai.py`「尋光」分頁新增演算法下拉選單（座標下降 / Powell），`fiber_scanner.py` 的 `run()` 新增 `algorithm` 參數依此分流。落地時另外修正 architect 審查抓到的兩個問題：Powell 專屬 metadata（`_powell_param_snapshot()`）寫入失敗原本會炸穿 `persist_samples()` 的 `finally` 導致整輪 JSON 樣本檔不寫出，改成雙層防禦；無訊號偵測原本要等整輪 Powell 跑完才檢查，改成每次真實量測後即檢查。新增 `verify_scan_powell_integration.py`（17 項），連同既有套件共 379 項全數通過。完整記錄見 [docs/fiber-scan.md](docs/fiber-scan.md)〈Powell 尋光路徑接進 GUI〉。🔴 **仍只有假物件驗證，未真機驗證**——GUI 上會顯示對應警示文字。
+
+**尚待實際著手時才需要的動作，更新為**：CLAUDE.md 修改文字定案、真實 `--onedir` 試打包驗證雙 OpenBLAS、三筆待實測參數的真機量測（現在有真實 GUI 入口可以進行）。

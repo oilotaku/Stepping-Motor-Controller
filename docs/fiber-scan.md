@@ -196,3 +196,21 @@ self._write(f":SENS{self.ch}:POW:RANG -20DBM")
 **已一併修掉的不一致**：`_do_start_scan()` 組 `scanner_kwargs` 時，四個速度欄位若被使用者清空會退回救援預設值（[main_ai.py](../main_ai.py) 的 `scanner_kwargs` 建構處），原本這組救援值還停在舊的 10 倍前數字（"5"/"1000"/"100"/"5"），沒有跟著 Entry 的新預設一起改，正常路徑不會踩到（Entry 一開始就帶新預設），但使用者清空欄位時會悄悄退回分度調整前的舊速度。已同步改成 "50"/"10000"/"1000"/"50"。
 
 ⚠ **這次改動未附回歸測試**——四個值都是 UI 預設字串，`verify_blind_scan.py`／`verify_scan_export.py` 等既有測試都是自建 `FiberAlignmentScanner` 時直接傳入速度參數，不經過這條 GUI 預設值路徑，沒有測試需要同步更新，也沒有新增測試涵蓋「分度變更後速度預設是否正確换算」這件事本身（那屬於實機校正判斷，不是程式邏輯可驗證的範圍）。
+
+#### Powell 尋光路徑接進 GUI（2026-08-27～28）
+
+本節由 AI 協助撰寫（This document was AI-assisted）。
+
+**改了什麼**：新增第二套主搜尋演算法——[fiber_scanner_advanced.py](../fiber_scanner_advanced.py) 的 `run_stage_powell()`，用 `scipy.optimize.minimize(method='Powell')` 對已勾選的軸做聯合最佳化，取代 `fiber_scanner.py` 三階段設計的階段一＋階段二。合成旋轉橢圓耦合曲面測試中收斂誤差約為座標下降的 1/10（6 pulse vs 63 pulse），完整設計脈絡見 [FIBER_ALIGNMENT_SCAN_DESIGN.md](../FIBER_ALIGNMENT_SCAN_DESIGN.md)〈第三輪〉。2026-08-27 先落地演算法本身（純假物件驗證），2026-08-28 接進「尋光」分頁：`main_ai.py` 卡片一新增「演算法」下拉選單（座標下降 / Powell），選 Powell 時自動把「起始步長」與「啟用階段二局部精修」灰階（Powell 不吃這兩個設定，涵蓋了原本階段一＋二的範圍），並在選單下方顯示紅字警示「僅通過假物件測試，尚未真機驗證」；進階設定卡新增 Powell 專屬的 `max_iterations`（函式評估次數上限）輸入框——`xtol_pulse`／`ftol_sigma_mult`／`penalty_lambda` 三個容差參數維持不開放輸入（下一段說明原因）。
+
+**為什麼容差參數不開放 GUI 調整**：architect 審查結論——這三個值調錯了是**靜默失效**（搜尋提早停在錯的地方，或跑到 `max_iterations` 才停，介面上看不出差別），操作員在還沒拿到真機數據前也沒有回饋依據能判斷該往哪個方向調，開放輸入只會製造「調錯了也不知道」的風險。三個值改成模組層級具名常數 `DEFAULT_XTOL_PULSE` / `DEFAULT_FTOL_SIGMA_MULT` / `DEFAULT_PENALTY_LAMBDA`（`fiber_scanner_advanced.py`），要校準時直接改這三個常數，不經過 GUI。
+
+**scipy 缺席時的兩道防線**：`main_ai.py` 用 `fiber_scanner_advanced._SCIPY_AVAILABLE` 判斷——未安裝時演算法下拉的 `values` 直接不含 Powell 選項（使用者選不到），且啟動搜尋前 `_do_start_scan()` 另外二次攔截「`algorithm == "powell"` 但 `_SCIPY_AVAILABLE` 為 False」這個組合並跳出明確錯誤訊息。🔴 **這道二次攔截不是多餘的防禦性程式**：`scanner_config.json` 可能存過先前裝了 scipy 時選過的 `"powell"`，換到沒裝 scipy 的環境啟動時，若沒有這道檢查，錯誤只會在背景執行緒裡才炸出來，被 `_run()` 的 `except Exception` 接住，誤分類成「未預期例外」，使用者看不出真正原因是缺套件。
+
+**無訊號偵測必須掛在真實量測之後，不能等 `minimize()` 跑完**：座標下降在 `run_stage1()` 的 cycle==1 就會做訊號確認檢查，十幾筆樣本內就能判定無訊號並中止。Powell 若沒有對應的 hook，`abort_if_no_signal` 要等整輪 `minimize()` 跑完（最多 `max_iterations` 次移動＋量測，真機是數分鐘量級）才有機會觸發，形同虛設。落地方式：`run_stage_powell()` 新增 `early_signal_check` 參數，`objective()` 每完成一次**真正的測量**（不是快取命中、也不是撞限位／量測失敗的懲罰分支）就呼叫一次；`fiber_scanner.py` 的 `_run_primary_algorithm()` 包了一個呼叫 `_check_signal_detectable()` 的 closure 傳進去。它拋出的 `NoSignalAbort`／`ScanAbort` 刻意讓例外沿 `objective() → minimize() → run_stage_powell()` 自然往外傳，不透過 scipy 的 `callback=` 參數（那條路徑依賴 scipy 內部怎麼處理 callback 拋出的例外，不保證跨版本行為一致）。實測效果：無訊號判定從「等整輪跑完」提前到第 4 次量測。
+
+**`persist_samples()` 的雙層防禦**：Powell 這輪的 metadata（`_powell_param_snapshot()` 讀到的 xtol／ftol／penalty／max_iterations）要寫進 JSON 與 Excel 摘要。這個函式一度用 `inspect.signature()` 反射 `run_stage_powell()` 的參數預設值，理由是「怕另外硬編一份數字、跟簽章預設值不同步」——但這個呼叫點在 `persist_samples()`／`_persist_samples_xlsx()` 的 try 保護範圍**外**，日後若參數改名（`xtol_pulse` → `tol_pulse`，這正是待實測校準參數的常見下場），`sig.parameters["xtol_pulse"]` 會直接 `KeyError`，炸穿 `run()` 的 `finally`，導致整輪 JSON 樣本檔一個字都不會寫出。改成直接讀模組常數（見上）本身就不會因參數改名而 `KeyError`；呼叫端 `persist_samples()` 與 `_persist_samples_xlsx()` 各自再包一層 `try/except` 當第二道防線，metadata 寫入失敗只記 log、不影響樣本檔本體寫出——同一個理由跟〈尋光樣本的 Excel 報表〉一節的 xlsx 失敗處理原則一致。
+
+**演算法選擇如何存/取**：跟既有的 `_scan_blind_mode_labels` 慣例一致，Combobox 存**顯示標籤字串**，換算回內部代碼一律查反向 map `self._scan_algo_label_algos`，不可用 `.index()`（`ORG_MODES` 差一位是前車之鑑，見 CLAUDE.md 紅線速查）。`algorithm` 與 `powell_max_iterations` 存進 `scanner_config.json`，跟 `blind_mode` 同類——跨次搜尋穩定的設定，該存。🔴 若設定檔存了 `"powell"` 但目前環境沒裝 scipy，UI 建立階段就會把它退回 `"coordinate_descent"`（不改動存檔本身），下次啟動 `_do_start_scan()` 存檔時才會把這次「實際選了什麼」寫回去覆蓋掉——換句話說沒有「保留使用者原本選的 Powell、等裝回 scipy 自動恢復」這回事，裝回 scipy 後需要使用者重新手動選一次。
+
+**回歸測試**：[verify_scan_powell.py](../verify_scan_powell.py)（8 項，`run_stage_powell()` 本身：收斂行為、限位／量測失敗的懲罰分支、中止例外的傳遞）＋ [verify_scan_powell_integration.py](../verify_scan_powell_integration.py)（17 項，GUI 與 `fiber_scanner.py` 分流邏輯：演算法下拉切換時的欄位灰階、scipy 缺席時的雙重防線、`_powell_param_snapshot()` 的雙層防禦、無訊號早偵測的觸發時機），連同既有套件共 379 項全數通過。**全部是假物件驗證，尚未真機驗證**——`xtol_pulse`／`ftol_sigma_mult`／`penalty_lambda` 仍是待校準的起跳值，正式在真機上用 Powell 之前應先小範圍試跑並全程留意（GUI 上的紅字警示就是提醒這件事）。
