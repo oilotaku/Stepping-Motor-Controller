@@ -168,6 +168,43 @@ def save_vector_field_png(cfg: GaussianFieldConfig, grid_range: tuple[float, flo
     return out_path
 
 
+def _square_spiral_deltas(budget: int) -> list[tuple[int, int]]:
+    """方形螺旋的單軸位移序列（軸 0／軸 1 交替），每個元素是 (axis_idx, ±1 個 step)。
+    邊長序列 1,1,2,2,3,3,…，跟 fiber_scanner.py 的 run_stage0_blind 同一套幾何
+    （DS102 只有單軸相對步進、沒有插補，斜線畫不出來，所以每步只能動一軸）。
+    只沿第一、第二軸展開；第三軸以後（若有）在盲搜期間維持不動。"""
+    directions = [(0, 1), (1, 1), (0, -1), (1, -1)]  # +axis0, +axis1, -axis0, -axis1
+    deltas: list[tuple[int, int]] = []
+    leg_length = 1
+    dir_idx = 0
+    while len(deltas) < budget:
+        for _ in range(2):  # 每個邊長值連續用兩段（右→上、左→下…）才會長出正方形
+            axis_idx, sign = directions[dir_idx % 4]
+            for _ in range(leg_length):
+                deltas.append((axis_idx, sign))
+                if len(deltas) >= budget:
+                    return deltas
+            dir_idx += 1
+        leg_length += 1
+    return deltas
+
+
+def _expanding_bounce_deltas(budget: int) -> list[tuple[int, int]]:
+    """單軸版的「盲搜」：沒有第二軸可以展開螺旋時，沿軸 0 正負交替、距離遞增地找，
+    覆蓋 ±1,±2,±3,… 個 step，跟方形螺旋一樣保證涵蓋、不會漏掉任何整數格點。"""
+    deltas: list[tuple[int, int]] = []
+    n = 1
+    sign = 1
+    while len(deltas) < budget:
+        for _ in range(n):
+            deltas.append((0, sign))
+            if len(deltas) >= budget:
+                return deltas
+        sign *= -1
+        n += 1
+    return deltas
+
+
 def _reading_step(pos: np.ndarray, cfg: GaussianFieldConfig, rng: np.random.Generator,
                    n_iter: int, mode: str, grad_mag: float | None, step_size: float | None) -> tuple[bool, dict]:
     """量一次目前位置，回傳 (ok, 該步的記錄 dict)。ok=False 時 power_dbm 記為 None（讀不到）。"""
@@ -184,13 +221,15 @@ def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], m
                      tol_pulse: float, step_gain: float, rng: np.random.Generator,
                      start_pos: np.ndarray | None = None, record_steps: bool = False) -> dict:
     """單次沿梯度向量場爬升搜尋：每步先量測目前位置，量得到才用（含雜訊的）梯度方向走一步；
-    量不到（低於量測下限）時沒有方向資訊可用，改成沿一個隨機方向走固定步長「盲搜」，
-    直到重新進入可讀範圍——對應真機無光/訊號太弱時的 underrange 行為，不是灌一個假的低值。
+    量不到（低於量測下限）時沒有方向資訊可用，改成方形螺旋（多軸時）或正負交替遞增
+    （單軸時）系統性地找訊號——跟 fiber_scanner.py 的 run_stage0_blind 同一套幾何，
+    保證涵蓋、不會像隨機方向那樣可能永遠走偏。找到訊號後螺旋作廢，回到梯度爬升。
     record_steps=True 時額外記錄每一步的位置／量測功率／模式／梯度大小，供軌跡疊圖與逐步記錄用。"""
     pos = start_pos.copy() if start_pos is not None else rng.uniform(grid_range[0], grid_range[1], size=cfg.n_axes)
     step = step_gain * (grid_range[1] - grid_range[0])
     converged = False
-    blind_dir: np.ndarray | None = None
+    blind_deltas: list[tuple[int, int]] | None = None
+    blind_idx = 0
     n_iter = 0
 
     if record_steps:
@@ -202,16 +241,22 @@ def _hill_climb_one(cfg: GaussianFieldConfig, grid_range: tuple[float, float], m
     for n_iter in range(1, max_iter + 1):
         ok, _value = read_power_dbm(pos, cfg, rng)
         if not ok:
-            if blind_dir is None:
-                blind_dir = rng.normal(size=cfg.n_axes)
-                blind_dir /= np.linalg.norm(blind_dir)
-            pos = pos + blind_dir * step
+            if blind_deltas is None:
+                remaining = max_iter - n_iter + 1
+                blind_deltas = (_square_spiral_deltas(remaining) if cfg.n_axes >= 2
+                                 else _expanding_bounce_deltas(remaining))
+                blind_idx = 0
+            if blind_idx < len(blind_deltas):
+                axis_idx, sign = blind_deltas[blind_idx]
+                blind_idx += 1
+                pos = pos.copy()
+                pos[axis_idx] += sign * step
             if record_steps:
                 _, s = _reading_step(pos, cfg, rng, n_iter, "盲搜", None, float(step))
                 steps.append(s)
             continue  # 盲搜階段不縮步長、不判斷收斂——沒訊號時談誤差沒有意義
 
-        blind_dir = None
+        blind_deltas = None
         grad = gradient_dbm(pos, cfg)
         noisy_grad = grad + rng.normal(0.0, cfg.noise_std_db, size=grad.shape) / cfg.sigma
         mag = np.linalg.norm(noisy_grad)
