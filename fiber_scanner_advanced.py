@@ -27,7 +27,7 @@
 #     行程外沒關係」；太大則會把邊界附近的合法搜尋方向也一併打死）。
 # =============================================================================
 
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 # scipy 是這個模組唯一新增的相依（main requirements.txt 已含 scipy==1.16.2，
 # 見 FIBER_ALIGNMENT_SCAN_DESIGN.md〈architect 意見〉的依賴分層建議）。
@@ -59,6 +59,15 @@ if TYPE_CHECKING:
 # 意見）。
 DEFAULT_PENALTY_LAMBDA = 0.01
 
+# xtol／ftol_sigma_mult 的預設值。跟 DEFAULT_PENALTY_LAMBDA 同一個理由拉成
+# 具名常數：fiber_scanner.py 的 _powell_param_snapshot() 直接讀這三個模組
+# 常數組 metadata，不再用 inspect.signature 反射函式簽章預設值——這樣未來
+# 校準這兩個參數只需要改這裡，不會有「改了簽章預設值、忘記還有地方在讀
+# 簽章」這種對不上的風險（也不會在參數改名時讓 _powell_param_snapshot()
+# 因為 KeyError 炸穿 persist_samples() 的 finally 保證）。
+DEFAULT_XTOL_PULSE = 5.0
+DEFAULT_FTOL_SIGMA_MULT = 3.0
+
 # 量測本身失敗（非撞限位、非中止）時的固定懲罰（dB）。同樣是保守起跳值：
 # 只要比雜訊底限明顯大、又不會大到把整個搜尋方向帶偏即可。
 _MEASURE_FAIL_PENALTY_DB = 1.0
@@ -66,10 +75,11 @@ _MEASURE_FAIL_PENALTY_DB = 1.0
 
 def run_stage_powell(
     scanner: "FiberAlignmentScanner",
-    xtol_pulse: float = 5.0,
-    ftol_sigma_mult: float = 3.0,
+    xtol_pulse: float = DEFAULT_XTOL_PULSE,
+    ftol_sigma_mult: float = DEFAULT_FTOL_SIGMA_MULT,
     max_iterations: int = 200,
     penalty_lambda: Optional[float] = None,
+    early_signal_check: Optional[Callable[[], None]] = None,
 ) -> Dict[str, float]:
     """
     用 scipy.optimize.minimize(method='Powell') 取代階段一＋階段二，對
@@ -89,6 +99,20 @@ def run_stage_powell(
         絕不拋例外中斷 minimize()。
       - 使用者中止／EMS（ScanAbort、NoSignalAbort）則相反：一律自然
         往外傳，但外層會先把滑台移回目前看過的最佳座標，才重新拋出。
+
+    `early_signal_check`：每次 objective() 真正完成一次測量（不是快取
+    命中、也不是撞限位/量測失敗的懲罰分支）之後呼叫一次，通常是呼叫端
+    包好的 `scanner._check_signal_detectable(...)`。用途：座標下降在
+    `run_stage1()` 的 cycle==1 就會做這個檢查，十幾筆樣本內就能判定
+    無訊號並中止；Powell 若沒有這個 hook，要等 `minimize()` 整個跑完
+    （最多 `max_iterations` 次移動＋量測，真機是數分鐘量級）才有機會
+    觸發，`abort_if_no_signal` 對 Powell 路徑形同虛設。它若拋例外
+    （NoSignalAbort／ScanAbort），刻意讓例外沿 objective() → minimize()
+    → 本函式的呼叫鏈自然往外傳，不透過 scipy 的 `callback=` 參數——
+    那條路徑依賴 scipy 內部怎麼處理 callback 拋出的例外，不保證跨版本
+    行為一致，直接在我們自己控制的 objective() 內呼叫才可靠。是否要
+    「至少跑 N 次才檢查」這類門檻邏輯不在這裡做——`_check_signal_detectable()`
+    本身已經有「有效樣本 <4 時不誤殺」的保護，不重複造第二套判斷。
     """
     if not _SCIPY_AVAILABLE:
         raise RuntimeError(
@@ -153,6 +177,15 @@ def run_stage_powell(
             return penalty
 
         _record_best(target, sample.power)
+
+        # 真正完成一次測量之後才觸發無訊號偵測（撞限位/量測失敗的懲罰
+        # 分支、快取命中都不算）——早偵測的意義就是在這裡，讓判定跑在
+        # 真實樣本累積的節奏上，不是等 minimize() 整個跑完。刻意不接
+        # try/except：拋出的例外（NoSignalAbort/ScanAbort）要原樣往外
+        # 傳，讓外層的 try/except (ScanAbort, NoSignalAbort) 接手善後。
+        if early_signal_check is not None:
+            early_signal_check()
+
         value = -sample.power
         cache[int_coords] = value
         return value

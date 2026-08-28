@@ -690,6 +690,14 @@ class FiberAlignmentScanner:
         # docstring 說明為什麼光靠 ctrl.sw_limits 擋不住。
         self._travel_bounds: Dict[str, List[Optional[float]]] = {}
 
+        # ── 主搜尋演算法選擇（2026-08-28 新增，見 fiber_scanner_advanced.py）──
+        # run() 才會依呼叫端傳入的值覆寫；這裡先給預設值，讓
+        # persist_samples() 在 run() 都還沒跑過（例如測試直接塞 samples
+        # 呼叫 persist_samples）時也不會因為屬性不存在而炸掉。
+        self.algorithm: str = "coordinate_descent"
+        self._powell_max_iterations: int = 200
+        self.enable_stage2: bool = False
+
     # ------------------------------------------------------------------
     # 對外控制
     # ------------------------------------------------------------------
@@ -704,9 +712,19 @@ class FiberAlignmentScanner:
         stage2_local_radius: Optional[Dict[str, int]] = None,
         axis_scale: Optional[Dict[str, float]] = None,
         scan_dir: Optional[Path] = None,
+        algorithm: str = "coordinate_descent",
+        powell_max_iterations: int = 200,
     ) -> Dict[str, float]:
         """
         完整跑三階段（階段二可選，按需啟用——見設計文件〈折衷方案〉）。
+
+        `algorithm` 選擇主搜尋方式：
+          - "coordinate_descent"（預設）：階段一座標下降＋可選階段二 K 近鄰精修，
+            即改動前的行為，完全不變。
+          - "powell"：改跑 fiber_scanner_advanced.run_stage_powell()，涵蓋原本
+            階段一＋階段二的範圍（見該模組 docstring）。此時 `enable_stage2`
+            會被忽略（只記一筆 log，不當成錯誤）。實驗性功能，未經真機驗證，
+            見 FIBER_ALIGNMENT_SCAN_DESIGN.md〈第三輪〉。
 
         完成、中止、或任何未預期例外都會在 finally 清掉 scanning_active
         並寫出已收集的樣本（persist_samples）——中止時的資料是唯一能
@@ -734,6 +752,11 @@ class FiberAlignmentScanner:
                 )
 
         self.ctrl.scanning_active = True
+        # 白名單驗證，不合法值一律退回預設——比照 blind_mode 既有寫法
+        # （BLIND_MODES 那行），不可用 .index() 之類的位置換算。
+        self.algorithm = algorithm if algorithm in ("coordinate_descent", "powell") else "coordinate_descent"
+        self._powell_max_iterations = max(1, int(powell_max_iterations))
+        self.enable_stage2 = enable_stage2
         self.last_abort_reason = None  # 重置：這個實例若被重複呼叫 run()，不能沿用上一輪的中止原因
         self.last_xlsx_path = None  # 同上，不能讓 GUI 指到上一輪的報表
         self.last_abort_kind = None
@@ -785,13 +808,7 @@ class FiberAlignmentScanner:
             # 13:08 正是如此——X 軸撞限位使該輪只收到 11 筆樣本、有效的
             # 更少，於是「階段一收斂」→ 沒有例外 → 沒有盲搜 → 階段二丟出
             # 「起點量測失敗」。用旗標判斷同時涵蓋這兩條路徑。
-            stage1_aborted_no_signal = False
-            try:
-                self.run_stage1(initial_step)
-            except NoSignalAbort:
-                if self.blind_mode != "auto":
-                    raise
-                stage1_aborted_no_signal = True
+            stage1_aborted_no_signal = self._run_primary_algorithm(initial_step)
 
             if (
                 self.blind_mode == "auto"
@@ -820,9 +837,14 @@ class FiberAlignmentScanner:
                 self._log(f"{reason} → 回到起點改跑階段零盲搜")
                 self.run_stage0_blind(center=start_pos)
                 self.calibrate_noise()
-                self.run_stage1(initial_step)
+                # swallow_no_signal=False：這是盲搜後的重跑，已經沒有下一次
+                # 補救機會了，第二次還是沒訊號就要讓 NoSignalAbort 照原本
+                # 行為（改動前 run_stage1(initial_step) 沒被 try/except 包住）
+                # 直接往外傳、走到 run() 的 except ScanAbort 中止收尾，不能
+                # 靜默吞掉繼續跑下去。
+                self._run_primary_algorithm(initial_step, swallow_no_signal=False)
 
-            if enable_stage2:
+            if enable_stage2 and self.algorithm != "powell":
                 axes = self._active_axes()
                 radius = stage2_local_radius or {
                     ax: self.step_min * REOPEN_STEP_MULT for ax in axes
@@ -852,6 +874,108 @@ class FiberAlignmentScanner:
             self.ctrl.scanning_active = False
             self.persist_samples(completed=completed, scan_dir=scan_dir)
         return dict(self.ctrl.positions_machine)
+
+    def _run_primary_algorithm(
+        self, initial_step: Dict[str, int], swallow_no_signal: bool = True
+    ) -> bool:
+        """
+        依 self.algorithm 分流主搜尋（座標下降的階段一，或 Powell）。
+
+        run() 內部有兩處要跑主演算法：第一次正常嘗試，以及 auto 盲搜模式
+        下訊號未確認時補一次盲搜之後的重跑。兩處都呼叫這個方法，不可以
+        各寫一份分流邏輯——那會讓其中一處在改動時忘記同步跟著 algorithm
+        走（見 CLAUDE.md 落地規格的踩雷紀錄）。
+
+        回傳 True 表示「這一輪判定為訊號未確認，可能需要（或已經）補盲搜」，
+        對應改動前內聯的 stage1_aborted_no_signal 旗標語意。
+
+        `swallow_no_signal` 控制 NoSignalAbort 在 blind_mode=="auto" 時是否
+        吞掉、回傳 True（讓呼叫端接著跑盲搜補救），還是照樣往外傳：
+          - 第一次呼叫（swallow_no_signal=True，預設）：允許吞掉，觸發後續
+            的盲搜補救。
+          - 補盲搜之後的第二次呼叫（swallow_no_signal=False）：改動前的
+            寫法在這裡完全沒有 try/except，第二次還偵測不到訊號就必須讓
+            NoSignalAbort 真的往外傳、把整輪搜尋中止掉，不能再吞第二次
+            靜默跑去 run_stage3——這裡用參數保留同一段語意，而不是讓
+            這個方法在兩個呼叫點表現不一致。
+        """
+        if self.algorithm == "powell":
+            if self.enable_stage2:
+                self._log("⚠ Powell 已涵蓋階段一＋二範圍，忽略「啟用階段二局部精修」設定")
+            # 模組層級 import 會與 fiber_scanner_advanced.py 對 fiber_scanner
+            # 的 import 形成循環相依，所以刻意延遲到這裡才 import；用模組
+            # 別名（而非 from ... import run_stage_powell）方便測試對這個
+            # 模組屬性做 monkeypatch。
+            import fiber_scanner_advanced as _fsa
+            idx = len(self.samples)
+
+            def _early_check() -> None:
+                # Powell 完全繞過 run_stage1() 內建的訊號確認檢查（那個
+                # 檢查只在 run_stage1() 的 cycle==1 觸發）。這個 hook 讓
+                # run_stage_powell() 每完成一次真正的測量就檢查一次
+                # （見該函式 early_signal_check 參數的文件字串）——等
+                # minimize() 整個跑完（最多 max_iterations 次移動＋量測，
+                # 真機是數分鐘量級）才檢查，會讓 abort_if_no_signal 對
+                # Powell 路徑形同虛設，_signal_confirmed／量程鎖定也全程
+                # 不會觸發。
+                self._check_signal_detectable(
+                    self.samples[idx:], raise_on_no_signal=self.abort_if_no_signal
+                )
+
+            # run_stage_powell()（含 _early_check hook）只會自然往外傳
+            # ScanAbort／NoSignalAbort（使用者中止／EMS／_check_abort()／
+            # _check_signal_detectable() 判定無訊號），這裡的 try/except
+            # 就是原本等著接 NoSignalAbort 的同一個位置——不需要另外在
+            # run_stage_powell() 呼叫前後分兩段接。
+            try:
+                _fsa.run_stage_powell(
+                    self,
+                    max_iterations=self._powell_max_iterations,
+                    early_signal_check=_early_check,
+                )
+            except NoSignalAbort:
+                if not swallow_no_signal or self.blind_mode != "auto":
+                    raise
+                return True
+            return False
+        else:
+            try:
+                self.run_stage1(initial_step)
+            except NoSignalAbort:
+                if not swallow_no_signal or self.blind_mode != "auto":
+                    raise
+                return True
+            return False
+
+    def _powell_param_snapshot(self) -> Dict[str, object]:
+        """
+        Powell 本輪實際生效的容差／懲罰參數快照，供 persist_samples() 的
+        JSON metadata 與 Excel〈摘要〉共用。這三個值目前沒有開放 GUI 輸入
+        （architect 結論：錯了會靜默失效，操作員也沒有回饋依據能校準），
+        一律讀 fiber_scanner_advanced.py 的模組層級常數（DEFAULT_XTOL_PULSE
+        / DEFAULT_FTOL_SIGMA_MULT / DEFAULT_PENALTY_LAMBDA）——這些常數
+        同時也是 run_stage_powell() 函式簽章的預設值來源，兩處保證同步。
+
+        🔴 2026-08-28 之前這裡是用 `inspect.signature()` 反射函式簽章預設
+        值，理由是「怕這裡另外硬編一份數字、跟簽章預設值不同步」。但這個
+        呼叫點在 persist_samples()／_persist_samples_xlsx() 的 try 保護
+        範圍**外**——若日後 run_stage_powell() 的參數改名（例如
+        xtol_pulse → tol_pulse，這正是待實測校準參數的常見下場），
+        `sig.parameters["xtol_pulse"]` 會直接 KeyError，炸穿 run() 的
+        finally，導致整輪 JSON 樣本檔一個字都不會寫出。改讀模組常數本身
+        就不會因為參數改名而 KeyError（常數名稱與函式參數名稱各自獨立、
+        改動時是兩個顯式的賦值語句，不是反射查找）；呼叫端另外包了一層
+        try/except 當第二道防線，見 persist_samples() 與
+        _persist_samples_xlsx()。
+        """
+        import fiber_scanner_advanced as _fsa
+
+        return {
+            "xtol_pulse": _fsa.DEFAULT_XTOL_PULSE,
+            "ftol_sigma_mult": _fsa.DEFAULT_FTOL_SIGMA_MULT,
+            "penalty_lambda": _fsa.DEFAULT_PENALTY_LAMBDA,
+            "max_iterations": self._powell_max_iterations,
+        }
 
     # ------------------------------------------------------------------
     # 階段零：盲搜粗掃（無訊號時才用得上）
@@ -1991,8 +2115,21 @@ class FiberAlignmentScanner:
             "sample_count": len(self.samples),
             "abort_reason": self.last_abort_reason,
             "abort_kind": self.last_abort_kind,
+            "algorithm": self.algorithm,
             "samples": [s.to_dict() for s in self.samples],
         }
+        # 供之後真機校準時回推「這輪用了什麼參數」——見 _powell_param_snapshot
+        # docstring。座標下降沒有對應的可調參數，不寫這個鍵，維持 JSON 精簡。
+        if self.algorithm == "powell":
+            # 第二層防禦：_powell_param_snapshot() 內部已經改成讀模組常數、
+            # 理論上不會再 KeyError，但這裡仍包一層 try/except——任何未
+            # 預期的失敗都只能記 log、略過這個欄位，不可讓例外炸穿本函式，
+            # 否則呼叫端 run() 的 finally 會連 JSON 樣本檔都寫不出來
+            # （CLAUDE.md 明文紅線：尋光樣本落地失敗只能記 log，不可外拋）。
+            try:
+                data["powell_params"] = self._powell_param_snapshot()
+            except Exception as e:
+                self._log(f"Powell 參數快照讀取失敗（不影響樣本存檔）: {e}")
         tmp = path.with_suffix(path.suffix + ".tmp")
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -2020,12 +2157,27 @@ class FiberAlignmentScanner:
         的報表還開著），就讓例外炸穿 finally、蓋掉原本要回傳的結果。
         """
         xlsx_path = json_path.with_suffix(".xlsx")
+        extra_meta: Dict[str, object] = {"演算法": self.algorithm}
+        if self.algorithm == "powell":
+            # 同 persist_samples() 的第二層防禦：_powell_param_snapshot()
+            # 失敗只記 log、extra_meta 就略過 Powell 那幾個欄位（保留
+            # 「演算法」那一項），不可讓例外往外傳（見上方 JSON 端同一
+            # 段防禦的理由）。
+            try:
+                p = self._powell_param_snapshot()
+                extra_meta["Powell xtol (pulse)"] = p["xtol_pulse"]
+                extra_meta["Powell ftol_sigma_mult"] = p["ftol_sigma_mult"]
+                extra_meta["Powell penalty_lambda"] = p["penalty_lambda"]
+                extra_meta["Powell max_iterations"] = p["max_iterations"]
+            except Exception as e:
+                self._log(f"Powell 參數快照讀取失敗（不影響 Excel 報表其餘內容）: {e}")
         try:
             export_samples_xlsx(
                 self.samples,
                 xlsx_path,
                 completed=completed,
                 abort_reason=self.last_abort_reason,
+                extra_meta=extra_meta,
             )
         except RuntimeError as e:
             # 沒裝 xlsxwriter：講一次就好，不必每輪都當成錯誤

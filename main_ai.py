@@ -55,6 +55,12 @@ from fiber_scanner import (
     export_samples_xlsx,
     _XLSXWRITER_AVAILABLE,
 )
+# 尋光的 Powell 共軛方向法（實驗性替代演算法）獨立在這個模組，見該檔開頭
+# 說明。單向 import：fiber_scanner_advanced.py 本身不 import main_ai.py，
+# 不會循環相依。這裡只讀 `_SCIPY_AVAILABLE` / `_SCIPY_IMPORT_ERROR` 兩個
+# 模組屬性決定 GUI 要不要讓使用者選到這個選項，不直接呼叫模組內的函式
+# （那是 fiber_scanner.FiberAlignmentScanner.run() 內部的事）。
+import fiber_scanner_advanced
 # DS102Controller 與其專屬的模組層級常數／函式已抽到 ds102_ctrl.py
 # （2026-08-17，架構拆分第一階段 1a，機械式搬移，行為不變）。
 # 這裡把 GUI 端仍需要的名字重新引入自己的命名空間，其餘只有
@@ -265,6 +271,15 @@ def _save_scanner_config(data: dict, log=None) -> None:
 # 復歸樣式被永久覆蓋（實機值 X=2/Y=1/Z=2）、以及把 controller_config.json
 # 剛還原回去的設定當場毀掉。這個下拉的預設值以前就是 ORG 0。
 ORG_MODES = [f"ORG {i}" for i in range(1, 13)]
+
+# 尋光「演算法」下拉選單：代碼（存進 scanner_config.json、傳給
+# FiberAlignmentScanner.run(algorithm=...)）→ 顯示標籤。與 ORG_MODES 不同的
+# 既有慣例（見 _scan_blind_mode_labels）：Combobox 存的是**顯示標籤字串**，
+# 換算回代碼一律查反向 map，不可用 .index()（ORG_MODES 差一位就是前車之鑑）。
+ALGO_LABELS = {
+    "coordinate_descent": "座標下降（三階段，含可選階段二精修）",
+    "powell": "Powell 共軛方向法（實驗性，未真機驗證）",
+}
 
 # _FINITE_MOVE_RE / _is_finite_move / MAX_RETRY / WAIT_TIMEOUT /
 # WAIT_INTERVAL / JOG_WATCH_INTERVAL / _POLL_QUERIES / HISTORY_MAX /
@@ -3578,19 +3593,59 @@ class DS102GUI:
         if not hasattr(self, "_scan_axis_selected_vars"):
             return
         stage2_on = self._scan_stage2_var.get()
+        is_powell = self._scan_algo_is_powell()
         for ax in AXES:
             axis_on = self._scan_axis_selected_vars[ax].get()
-            step_state = "normal" if axis_on else "disabled"
+            # Powell 不吃「起始步長」（它自己決定初始方向集合的量級），
+            # 選 Powell 時整排灰階，避免使用者以為調這個欄位有效果。
+            step_state = "normal" if (axis_on and not is_powell) else "disabled"
             for w in self._scan_axis_step_entries.get(ax, []):
                 w.config(state=step_state)
-            stage2_state = "normal" if (axis_on and stage2_on) else "disabled"
+            # Powell 已涵蓋原本階段一＋二的範圍，不論階段二勾選框本身
+            # 是什麼狀態，這排 Entry 一律鎖住（勾選框本身的鎖定在下面）。
+            stage2_state = "normal" if (axis_on and stage2_on and not is_powell) else "disabled"
             for w in self._scan_axis_stage2_entries.get(ax, []):
                 w.config(state=stage2_state)
+        if hasattr(self, "_scan_stage2_cb"):
+            self._scan_stage2_cb.config(state="disabled" if is_powell else "normal")
         # 盲搜平面的可選配對完全由「這次勾了哪些軸」決定，跟階段二無關，
         # 但觸發時機一模一樣（軸勾選變動），所以掛在同一個重算入口，
         # 不另外綁一組 command——那正是本函式 docstring 警告的「兩個
         # handler 各自改狀態、互相覆蓋」的來源。
         self._refresh_blind_plane_options()
+
+    def _scan_algo_is_powell(self) -> bool:
+        """目前演算法下拉是否選到 Powell。UI 建立過程中可能被提早呼叫
+        （_scan_algo_var 尚未建立），一律先判斷 hasattr 再讀，不誤判成 False
+        以外的例外狀況（False 是安全的預設：一律當成座標下降處理）。"""
+        if not hasattr(self, "_scan_algo_var"):
+            return False
+        return self._scan_algo_label_algos.get(self._scan_algo_var.get()) == "powell"
+
+    def _on_scan_algo_changed(self):
+        """
+        演算法下拉切換：起始步長／階段二相關 Entry 的可編輯狀態改走
+        `_refresh_scan_entry_states()`（不在這裡另外局部 `.config`，理由
+        跟該函式 docstring 一樣），這裡只處理它不管的兩件事——警示文字
+        與 Powell 專屬進階參數子區塊的顯示/隱藏。
+        """
+        self._refresh_scan_entry_states()
+        is_powell = self._scan_algo_is_powell()
+        if is_powell:
+            # 🔴 用預設的 pack() 重新顯示會被接到 card1 最尾端（此時
+            # self._scan_stage2_cb 已經 pack 過），警示文字會跑到勾選框
+            # 下面而非原本設計的位置。用 before= 釘回它原本建立時的位置
+            # （階段二 checkbox 之前）。
+            self._scan_algo_warn_lbl.pack(
+                before=self._scan_stage2_cb, anchor="w", padx=12, pady=(0, 8)
+            )
+        else:
+            self._scan_algo_warn_lbl.pack_forget()
+        if hasattr(self, "_scan_powell_params_frame"):
+            if is_powell:
+                self._scan_powell_params_frame.pack(fill="x", padx=12, pady=(4, 8))
+            else:
+                self._scan_powell_params_frame.pack_forget()
 
     def _refresh_blind_plane_options(self):
         """
@@ -3823,11 +3878,59 @@ class DS102GUI:
             bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
         ).pack(anchor="w", padx=12, pady=(2, 8))
 
+        # =================== 演算法選擇（2026-08-28 新增）===================
+        # 與 ORG_MODES 相反、跟 _scan_blind_mode_labels 同一個既有慣例：
+        # Combobox 存**顯示標籤字串**，換算回代碼一律查反向 map
+        # （self._scan_algo_label_algos），不可用 .index()。
+        self._scan_algo_label_algos = {v: k for k, v in ALGO_LABELS.items()}
+        _saved_algo = cfg.get("algorithm", "coordinate_descent")
+        if _saved_algo not in ALGO_LABELS or (
+            _saved_algo == "powell" and not fiber_scanner_advanced._SCIPY_AVAILABLE
+        ):
+            # 不合法的存檔值，或存的是 powell 但目前環境沒裝 scipy：一律
+            # 退回座標下降。不偷偷把存檔值本身改掉——_do_start_scan 存檔
+            # 時仍會照使用者「這次實際選了什麼」寫回去，環境裝好 scipy
+            # 後應該要能自動恢復先前選過的 powell（見 CLAUDE.md 落地規格）。
+            _saved_algo = "coordinate_descent"
+        algo_f = tk.Frame(card1, bg=CLR_CARD)
+        algo_f.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(
+            algo_f, text="演算法", bg=CLR_CARD, fg=CLR_TEXT, font=("Segoe UI", 9)
+        ).pack(anchor="w")
+        self._scan_algo_var = tk.StringVar(value=ALGO_LABELS[_saved_algo])
+        # 未裝 scipy 時 Combobox 的 values 只放座標下降這一項，不讓使用者
+        # 選到裝不了的選項（readonly Combobox 仍可能被程式或設定檔塞進
+        # 不在 values 裡的字串，所以上面的白名單驗證仍是必要的第二道防線）。
+        _algo_values = [ALGO_LABELS["coordinate_descent"]]
+        if fiber_scanner_advanced._SCIPY_AVAILABLE:
+            _algo_values.append(ALGO_LABELS["powell"])
+        self._scan_algo_combo = ttk.Combobox(
+            algo_f, textvariable=self._scan_algo_var, state="readonly", width=40,
+            values=_algo_values,
+        )
+        self._scan_algo_combo.pack(anchor="w", pady=(2, 2))
+        self._scan_algo_combo.bind("<<ComboboxSelected>>", lambda e: self._on_scan_algo_changed())
+        if not fiber_scanner_advanced._SCIPY_AVAILABLE:
+            tk.Label(
+                algo_f,
+                text=f"未安裝 scipy，Powell 選項暫不可用（{fiber_scanner_advanced._SCIPY_IMPORT_ERROR}）",
+                bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
+            ).pack(anchor="w", pady=(0, 4))
+        self._scan_algo_warn_lbl = tk.Label(
+            card1,
+            text="⚠ Powell 共軛方向法目前僅通過假物件測試，尚未真機驗證；"
+                 "xtol/ftol/懲罰係數皆為保守起跳值。建議先在低風險行程小範圍試跑並全程留意。",
+            bg=CLR_CARD, fg=CLR_WARN, font=("Segoe UI", 8), justify="left", wraplength=300,
+        )
+        if self._scan_algo_label_algos.get(self._scan_algo_var.get()) == "powell":
+            self._scan_algo_warn_lbl.pack(anchor="w", padx=12, pady=(0, 8))
+
         self._scan_stage2_var = tk.BooleanVar(value=cfg.get("enable_stage2", False))
-        ttk.Checkbutton(
+        self._scan_stage2_cb = ttk.Checkbutton(
             card1, text="啟用階段二局部精修（K 近鄰）",
             variable=self._scan_stage2_var, command=self._on_scan_stage2_toggle,
-        ).pack(anchor="w", padx=12, pady=(0, 10))
+        )
+        self._scan_stage2_cb.pack(anchor="w", padx=12, pady=(0, 10))
 
         # =================== 左欄卡片二：訊號有效性判準 ===================
         card2 = self._card(left, "訊號有效性判準")
@@ -4105,6 +4208,39 @@ class DS102GUI:
             text="以上皆為函式庫內建的保守預設值，尚未以真機校準；調整前建議先以預設值跑過至少一次完整搜尋。",
             bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
         ).pack(anchor="w", padx=12, pady=(4, 8))
+
+        # Powell 專屬進階參數：只開放 max_iterations（maxfev）。xtol_pulse／
+        # ftol_sigma_mult／penalty_lambda 刻意不開放輸入框——architect 明確
+        # 結論：這三個值錯了會靜默失效（搜尋提早停在錯的地方或跑到
+        # maxfev 才停），且操作員目前沒有回饋依據能校準它們，開放輸入
+        # 只會製造「調錯了也不知道」的風險。這個子區塊只在選 Powell 時
+        # 顯示，由 _on_scan_algo_changed() 控制 pack/pack_forget。
+        self._scan_powell_params_frame = tk.Frame(self._scan_adv_frame, bg=CLR_CARD)
+        tk.Label(
+            self._scan_powell_params_frame, text="Powell 專用",
+            bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w", pady=(0, 2))
+        iter_row = tk.Frame(self._scan_powell_params_frame, bg=CLR_CARD)
+        iter_row.pack(fill="x")
+        tk.Label(
+            iter_row, text="最多函式評估次數 max_iterations", bg=CLR_CARD, fg=CLR_TEXT,
+            font=("Segoe UI", 9), width=26, anchor="w",
+        ).pack(side="left")
+        self._scan_powell_max_iter_var = tk.StringVar(
+            value=cfg.get("powell_max_iterations", "200")
+        )
+        ttk.Entry(iter_row, textvariable=self._scan_powell_max_iter_var, width=10).pack(
+            side="left", padx=8
+        )
+        tk.Label(
+            self._scan_powell_params_frame,
+            text="xtol／ftol／懲罰係數皆為函式庫內建起跳值，暫不開放調整（見上方警示）。",
+            bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8), justify="left", wraplength=300,
+        ).pack(anchor="w", pady=(2, 0))
+        if self._scan_algo_is_powell():
+            self._scan_powell_params_frame.pack(fill="x", padx=12, pady=(4, 8))
+        # is_powell 若為 False 就不 pack——維持與其餘按需顯示的子區塊一致
+        # 的「預設收合」慣例。
 
         # =================== 右欄：即時圖表（第三階段既有邏輯，不動）===================
         self._build_scan_plot(right)
@@ -4650,6 +4786,30 @@ class DS102GUI:
         axis_summary = " ".join(f"{ax}={self._scan_axis_step_vars[ax].get()}" for ax in selected_axes)
         axes_txt = "、".join(selected_axes)
         stage2_txt = "啟用" if self._scan_stage2_var.get() else "不啟用"
+        # 演算法：跟 blind_mode 同一個既有慣例，Combobox 存標籤字串，這裡
+        # 反解成內部代碼。不合法的值（理論上不會發生，防禦用）一律退回
+        # 座標下降；「選了 Powell 但 scipy 不可用」這個情況刻意不在這裡
+        # 靜默降級——留給下面 self._scanning.set() 之前那道明確的防線，
+        # 讓使用者看到清楚的錯誤訊息，而不是被悄悄改成別的演算法。
+        algo_label = self._scan_algo_var.get()
+        algorithm = self._scan_algo_label_algos.get(algo_label, "coordinate_descent")
+        if algorithm not in ("coordinate_descent", "powell"):
+            algorithm = "coordinate_descent"
+        if algorithm == "powell":
+            algo_line = "Powell 共軛方向法（⚠ 未真機驗證，起跳參數）"
+            # Powell 不吃「起始步長」（見 _refresh_scan_entry_states 的
+            # 註解），對使用者顯示那一行是誤導；真正生效的是這裡的
+            # max_iterations（函式評估次數上限），改列這個才對得上實際
+            # 行為。跟下面 _run() 讀 powell_max_iter 時同一個變數來源，
+            # 這裡提早、獨立解析一次只是給確認對話框看，不影響那邊。
+            try:
+                _powell_max_iter_preview = int(self._scan_powell_max_iter_var.get())
+            except (ValueError, AttributeError):
+                _powell_max_iter_preview = 200
+            step_or_iter_line = f"最多函式評估次數：{_powell_max_iter_preview}\n"
+        else:
+            algo_line = f"座標下降（階段二精修：{stage2_txt}）"
+            step_or_iter_line = f"起始步長：{axis_summary}\n"
         floor_val = self._scan_min_valid_power_var.get().strip()
         floor_txt = "未設定（僅依讀值相對變化判斷）" if not floor_val else f"{floor_val} dBm"
         abort_txt = "是" if self._scan_abort_no_signal_var.get() else "否"
@@ -4674,8 +4834,8 @@ class DS102GUI:
             "確認開始尋光",
             f"搜尋軸：{axes_txt}\n\n"
             f"即將開始自動尋光，滑台會依演算法自主移動並持續量測光功率。\n\n"
-            f"起始步長：{axis_summary}\n"
-            f"階段二精修：{stage2_txt}\n"
+            f"{step_or_iter_line}"
+            f"演算法：{algo_line}\n"
             f"訊號有效性下限：{floor_txt}\n"
             f"無訊號時中止：{abort_txt}\n"
             f"階段零盲搜：{blind_txt}\n"
@@ -4708,6 +4868,16 @@ class DS102GUI:
                 "abort_if_no_signal": self._scan_abort_no_signal_var.get(),
                 "min_valid_power_dbm": self._scan_min_valid_power_var.get(),
                 "enable_stage2": self._scan_stage2_var.get(),
+                # 跟 blind_mode 同類——跨次搜尋穩定的設定，該存。
+                # 🔴 scipy 不可用時 Combobox 的 values 根本不包含 Powell
+                # 選項（見下方 UI 建立處），使用者不可能選到它，這裡存的
+                # `algorithm` 因此必定已經是 coordinate_descent——不存在
+                # 「保留使用者原本選的 Powell、等裝回 scipy 再恢復」這回事，
+                # 若設定檔裡原本有 "powell"，每次在 scipy 不可用的環境啟動
+                # 都會被這裡覆寫掉。若之後裝回 scipy，使用者需要重新手動
+                # 選一次 Powell。
+                "algorithm": algorithm,
+                "powell_max_iterations": self._scan_powell_max_iter_var.get(),
                 "selected_axes": selected_axes,
                 # 盲搜參數跟 l_speed／step_min 同類：跟裝置物理配置綁定、
                 # 跨次搜尋穩定，該存。（initial_step／stage2 半徑那種依當次
@@ -4721,6 +4891,21 @@ class DS102GUI:
             },
             log=self.ctrl._log,
         )
+
+        # 🔴 最後一道防線：選了 Powell 但這個環境沒裝 scipy。UI 端的
+        # Combobox 已經不讓使用者選到這個組合（未裝 scipy 時 values 只有
+        # 座標下降），但設定檔可能存過舊的 powell 選擇、或未來 UI 邏輯
+        # 有漏洞——一律在啟動背景執行緒之前擋下並給清楚訊息，不要讓它
+        # 進到 _run() 裡才炸：那會被 _run() 的 `except Exception` 接住，
+        # 誤分類成「未預期例外」，使用者看不出真正原因是缺套件。
+        if algorithm == "powell" and not fiber_scanner_advanced._SCIPY_AVAILABLE:
+            messagebox.showerror(
+                "缺少 scipy",
+                "已選擇 Powell 共軛方向法，但目前環境未安裝 scipy，無法執行"
+                f"（{fiber_scanner_advanced._SCIPY_IMPORT_ERROR}）。\n\n"
+                "請安裝 scipy 後再試，或改選「座標下降」演算法。",
+            )
+            return
 
         self._scanning.set()  # 早於執行緒啟動，避免 _update_stat_ui 的窗口期把按鈕解鎖
         self._scan_start_btn.config(state="disabled")
@@ -4770,6 +4955,12 @@ class DS102GUI:
                 return int(s)
             except (ValueError, AttributeError):
                 return default
+
+        # Powell 專用：maxfev。跟 enable_stage2 一樣必須在主執行緒讀出來，
+        # algorithm 本身已經在確認對話框那段讀過、驗證過，這裡直接沿用
+        # 同一個變數，不重新反解一次 Combobox（同一個理由：那時已經進不
+        # 了主執行緒，兩次讀取也有機會不一致）。
+        powell_max_iter = _parse_int(self._scan_powell_max_iter_var.get(), 200)
 
         # 型別刻意混雜（str/int/float/bool），Pylance 對 **kwargs 展開會因此
         # 把每個參數都推論成聯集型別而報一串資訊等級提示——都是誤報，
@@ -4879,7 +5070,13 @@ class DS102GUI:
 
         def _run():
             try:
-                result = scanner.run(initial_step=initial_step, enable_stage2=enable_stage2, **run_kwargs)
+                result = scanner.run(
+                    initial_step=initial_step,
+                    enable_stage2=enable_stage2,
+                    algorithm=algorithm,
+                    powell_max_iterations=powell_max_iter,
+                    **run_kwargs,
+                )
                 # 🔴 fiber_scanner.FiberAlignmentScanner.run() 內部把所有中止事件
                 # （使用者停止／EMS／無訊號判定，_check_abort()／
                 # _check_signal_detectable() 拋出的 ScanAbort）都自己接住、
