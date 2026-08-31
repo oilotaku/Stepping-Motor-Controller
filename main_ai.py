@@ -35,7 +35,8 @@ import re
 import itertools
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Callable
+from dataclasses import dataclass
 
 from meter_GPIB import HP8153APowerMeter
 from fiber_scanner import (
@@ -87,6 +88,23 @@ from ds102_ctrl import (
     _app_setting_num,
     _safety_setting_rejections,
     save_homing_repeat_result,
+)
+# UI 色票（2026-08-31，模組化前置工作 3，見 docs/modularization.md〈八〉）。
+# 單向 import：ui_theme.py 只 import ds102_ctrl.py，不 import 本檔，
+# 所以依賴鏈是 ds102_ctrl → ui_theme → main_ai，沒有環。
+# 這裡刻意逐一列名而非 `import *`：main_ai.py 底下有 445 處引用，
+# 用 `import *` 會讓靜態分析完全查不到這些名字從哪來。
+from ui_theme import (
+    CLR_BG,
+    CLR_CARD,
+    CLR_BORDER,
+    CLR_ACCENT,
+    CLR_DANGER,
+    CLR_INFO,
+    CLR_WARN,
+    CLR_TEXT,
+    CLR_MUTED,
+    CLR_LOG_BG,
 )
 
 # matplotlib 是尋光分頁的即時軌跡圖用的，非本程式核心相依（序列通訊與其餘
@@ -328,19 +346,19 @@ SCAN_PLOT_REDRAW_INTERVAL = _app_setting_num(
     _app_settings, "scan_plot_redraw_interval", 250, int
 )
 
-# 顏色主題。可由 app_settings.json 的 clr_* 欄位個別覆寫（字串型別，
-# 不做色碼格式驗證——格式錯的後果跟直接改這裡打錯字一樣，會在
-# tkinter 建立元件時才報錯，與硬編碼時期的風險相同）。
-CLR_BG = _app_settings.get("clr_bg", "#F4F3F0")
-CLR_CARD = _app_settings.get("clr_card", "#FFFFFF")
-CLR_BORDER = _app_settings.get("clr_border", "#DEDBD3")
-CLR_ACCENT = _app_settings.get("clr_accent", "#1D9E75")
-CLR_DANGER = _app_settings.get("clr_danger", "#D93025")
-CLR_INFO = _app_settings.get("clr_info", "#1A73E8")
-CLR_WARN = _app_settings.get("clr_warn", "#F9AB00")
-CLR_TEXT = _app_settings.get("clr_text", "#1F1F1E")
-CLR_MUTED = _app_settings.get("clr_muted", "#80807A")
-CLR_LOG_BG = _app_settings.get("clr_log_bg", "#1B1B1B")
+# 顏色主題已搬到 ui_theme.py（2026-08-31，模組化前置工作 3），上方的
+# `from ui_theme import ...` 區塊把十個名字重新引入本模組的命名空間，
+# 底下 445 處 `CLR_*` 引用與 monkeypatch `main_ai.CLR_*` 的寫法都不受影響。
+# 搬出去的理由（一句話版）：CLR_* 是唯一橫跨全部七個分頁的 UI 常數，
+# 留在 main_ai.py 會讓任何想搬出 main_ai.py 的 GUI 程式碼（StatusBar、
+# 將來的 *TabMixin）反過來 import main_ai.py，形成循環相依。
+# 完整說明與依賴方向見 ui_theme.py 的模組 docstring。
+#
+# ⚠ `_app_settings` / `_app_setting_num` **沒有**跟著搬去 ui_theme.py：
+# 它們定義在 ds102_ctrl.py（HISTORY_MAX 需要），搬走會讓 ds102_ctrl.py
+# 反過來 import ui_theme.py 而 ui_theme.py 又需要 ds102_ctrl 的
+# _load_json_settings／RECORDING_DIR，變成新的環。上方各項 UI 節奏常數
+# 因此維持原樣，繼續用 import 回來的 _app_setting_num 求值。
 
 
 
@@ -480,6 +498,100 @@ class StatusBar(tk.Frame):
 
 
 # =============================================================================
+# 長時間背景作業註冊表
+# =============================================================================
+@dataclass(frozen=True)
+class LongOperation:
+    """
+    一項「長時間背景作業」的註冊項目（2026-08-31 前置1，見
+    docs/modularization.md）。
+
+    在這之前，每新增一種長時間作業（重播／全軸原點復歸／原點復歸重現性
+    量測／尋光），作者都必須自己記得手動接進 6 個散落的位置：
+    `_update_stat_ui` 的 busy 判斷、`_start_poller` 的經過時間、`_do_stop`、
+    `_on_escape`、`_toggle_connect` 的中斷分支、`_on_close`。實際上**已經
+    漏過**——尋光在前四個位置裡漏了三個（architect 2026-08-31 複審抓到，
+    症狀是尋光中按 Esc／■ Stop 滑台停一下又自己繼續走）。改成註冊表之後，
+    新增作業只要在 `_register_long_ops()` 多寫一筆，漏接在結構上不可能發生。
+
+    🔴 **這張表只服務兩件事：「UI 忙碌顯示」與「停止請求分派」。**
+    絕不可以拿它當移動守衛，也不可以把 `ctrl.motion_active` /
+    `ctrl.scanning_active` 併進來——那是 docs/fiber-scan.md 明列的紅線
+    （`motion_active` 只判斷「要不要占用其他硬體資源」；把 `scanning_active`
+    放進移動守衛曾讓所有收斂測試卡死）。
+
+    🔴 **除了 `key` / `label`，每個欄位都是 callable，這是刻意的。**
+    註冊發生在 `__init__` 早期，而部分依賴物件（例如
+    `_org_repeat_elapsed_var` 要等 `_build_card_origin_repeatability()`、
+    `_active_scanner` 要等使用者按下開始）當下根本還不存在。全部走 callable
+    表示每個欄位都在「被呼叫的當下」才解析 `self` 的屬性，註冊表因此完全
+    不受 `__init__` 內的建構順序影響——這正是 docs/modularization.md 第 21
+    行點名的那類初始化順序相依，這裡從一開始就避開，而不是靠註解提醒。
+
+    欄位：
+      key          內部識別字串（log 與測試用，不顯示給使用者）
+      label        給人看的作業名稱，`_busy_reasons()` 用它組訊息
+      is_running   () -> bool，作業是否進行中（唯一的 busy 判準）
+      request_stop () -> None，請求該作業收工；**None 代表這項作業沒有
+                   軟體停止機制**（全軸原點復歸就是這種：`origin_all()`
+                   不收 stop_event，只能靠 `ctrl.stop()` 讓當下那一軸的
+                   `_wait_origin_done()` 結束）。呼叫端一律要判斷 None。
+      started_at   () -> float，本輪起算的 time.time() 基準；與
+                   `show_elapsed` 必須成對出現，其一為 None 就不計時。
+      show_elapsed (str) -> None，把格式化好的 "MM:SS" 寫進對應的 StringVar。
+    """
+
+    key: str
+    label: str
+    is_running: Callable[[], bool]
+    request_stop: Optional[Callable[[], None]] = None
+    started_at: Optional[Callable[[], float]] = None
+    show_elapsed: Optional[Callable[[str], None]] = None
+
+
+@dataclass(frozen=True)
+class PowerReading:
+    """
+    「最近一次成功的光功率讀值」快取（2026-08-31 前置2，見
+    docs/modularization.md〈九〉）。
+
+    在這之前，這份快取是 `_pm_last_value` / `_pm_last_ok_time` 兩個裸欄位，
+    由「光功率」與「尋光」**兩個分頁各自直接指派**。2026-08-31 的模組化複審
+    把它列為專案裡唯一一組「跨分頁共用的未命名可變狀態」——比「互相呼叫對方
+    的私有方法」更難查，因為連呼叫點都 grep 不到，只能靠記得去搜欄位名。
+    收斂成一個具名物件之後，寫入只走 `_pm_note_reading()` /
+    `_pm_clear_reading()`，讀取只走 `self._pm_reading`。
+
+    🔴 **frozen（不可變）是刻意的，而且是這個設計唯一真正的技術理由。**
+    寫入端全部在 Tk 主執行緒（背景輪詢與單次查詢都走 `root.after` 回主
+    執行緒；`_scan_plot_extend` 掛在 `_redraw_scan_plot` 這條 `root.after`
+    鏈上），但**讀取端不是**：`_get_last_pm_value()` 由
+    `DS102Controller._record_data_point()` 在 `_wait_axis_stop()` 的等待
+    迴圈裡呼叫，跑在移動執行緒上。原本 value 與 ok_time 是兩行各自指派，
+    移動執行緒有機會讀到「新的 value 配舊的 ok_time」這種撕裂組合；換成
+    frozen dataclass 後，更新是**單一次屬性重新指派**（GIL 下不可分割），
+    讀取端拿到的必定是同一次讀值的完整快照。
+
+    ⚠ 這只是把原本就存在的跨執行緒讀取變得一致，**沒有**、也不宣稱新增
+    任何鎖保護。不要因為它現在有名字就假設它是執行緒安全的容器——真正的
+    保證只有「單一寫入執行緒 ＋ 不可變快照」這一條。
+
+    欄位：
+      value    最近一次成功讀值（dBm）。None＝從未讀到過可信讀值
+      ok_time  該次讀值當下的 time.time()。0.0＝從未成功讀到（`_pm_update_age_label`
+               用 `<= 0` 判斷要不要顯示「—」，沿用原本 `_pm_last_ok_time` 的語意）
+      source   "meter"＝光功率分頁自己的查詢／背景輪詢；"scan"＝尋光分頁的
+               sample callback 轉貼。**純診斷用**，沒有任何邏輯依它分流——
+               加這個欄位是為了讓將來看到一筆可疑讀值時，能直接知道它從哪
+               條路徑進來，不必回頭推理當下 scanning_active 是什麼狀態。
+    """
+
+    value: Optional[float] = None
+    ok_time: float = 0.0
+    source: str = ""
+
+
+# =============================================================================
 # 主 GUI
 # =============================================================================
 class DS102GUI:
@@ -549,8 +661,11 @@ class DS102GUI:
         self._pm_auto_poll = tk.BooleanVar(value=False)
         self._pm_poll_interval = tk.StringVar(value=str(METER_POLL_INTERVAL))
         self._pm_comm_failures = 0
-        self._pm_last_ok_time = 0.0
-        self._pm_last_value: Optional[float] = None  # 最近一次成功讀值（原始 float，供 CSV 記錄取用）
+        # 最近一次成功讀值（供 CSV 記錄與「幾秒前」標籤取用）。
+        # 🔴 唯一寫入者是 _pm_note_reading() / _pm_clear_reading()，不要在
+        # 任何地方直接指派這個欄位——「尋光」分頁曾經直接寫舊的兩個裸欄位，
+        # 那正是前置2 要消滅的東西（見 PowerReading 的 docstring）。
+        self._pm_reading = PowerReading()
         self._pm_power_var = tk.StringVar(value="—")
         self._pm_unit_var = tk.StringVar(value="")
         self._pm_status_var = tk.StringVar(value="未連線")
@@ -596,6 +711,12 @@ class DS102GUI:
         self._org_repeat_running = threading.Event()
         self._org_repeat_stop_event = threading.Event()
         self._org_repeat_start_time = 0.0
+
+        # 長時間背景作業註冊表（見 LongOperation 的說明）。
+        # 放在這裡純粹是為了可讀性——上面四種作業的旗標剛好都在眼前；
+        # 正確性上它可以放在 __init__ 的任何位置，因為每個欄位都是
+        # callable、一律延後到被呼叫的當下才解析 self 的屬性。
+        self._register_long_ops()
 
         # 按鈕組（多分頁同步更新）
         self._all_axis_btn_groups: List[Dict[str, tk.Button]] = []
@@ -668,6 +789,132 @@ class DS102GUI:
             )
 
         self.ctrl._log("INFO", "DS102  圖形化控制器啟動")
+
+    # =========================================================================
+    # 長時間背景作業註冊表
+    #
+    # 🔴 新增任何「跑在自己的背景執行緒、會持續驅動硬體」的作業時，
+    #    **唯一該做的事就是在 _register_long_ops() 多寫一筆**。不要再自己
+    #    去 _update_stat_ui / _start_poller / _do_stop / _on_escape /
+    #    _toggle_connect / _on_close 手動接線——那六個位置現在全部改成
+    #    走這張表，手動接線只會製造第二份會走鐘的真相來源。
+    # =========================================================================
+    def _register_long_ops(self):
+        """
+        建立長時間背景作業註冊表。欄位語意見 LongOperation 的 docstring。
+
+        目前四項，與改用註冊表之前 `_update_stat_ui` 的 busy 判斷逐項對應
+        （playback_running / _homing / _scanning / _org_repeat_running），
+        沒有新增也沒有移除任何一項。
+        """
+        # ⚠ 每個欄位一律包成 lambda，不要寫成 `self._stop_playback.set` 這種
+        # 綁定方法。綁定方法會在註冊當下就把 Event/StringVar 實例抓進閉包，
+        # 於是這張表反過來要求「註冊必須排在那些物件建立之後」——正是本次
+        # 重構要消滅的那種初始化順序相依；更糟的是若日後有人重新指派
+        # `self._scanning = threading.Event()`，註冊表會靜默地繼續盯著舊物件。
+        self._long_ops: Tuple[LongOperation, ...] = (
+            LongOperation(
+                key="playback",
+                label="行程重播",
+                is_running=lambda: self.ctrl.playback_running,
+                request_stop=lambda: self._stop_playback.set(),
+                # 重播沒有經過時間顯示（它有自己的 x/y 步數進度），
+                # started_at / show_elapsed 留 None。
+            ),
+            LongOperation(
+                key="homing",
+                label="全軸原點復歸",
+                is_running=lambda: self._homing.is_set(),
+                # 🔴 request_stop 是 None，不是漏寫：ctrl.origin_all() 不收
+                # stop_event，沒有任何軟體旗標能讓它提前收工。唯一能縮短它的
+                # 是呼叫端本來就會送的 ctrl.stop()——那會讓當下那一軸的
+                # _wait_origin_done() 提早結束，但整批仍會依序跑完其餘軸。
+                # 要改成可中止必須動 ds102_ctrl.origin_all() 的簽章，屬於
+                # 另一件事，不在前置1 的範圍內。
+            ),
+            LongOperation(
+                key="scan",
+                label="尋光",
+                is_running=lambda: self._scanning.is_set(),
+                request_stop=lambda: self._request_stop_scanner(),
+                started_at=lambda: self._scan_start_time,
+                show_elapsed=lambda txt: self._scan_elapsed_var.set(txt),
+            ),
+            LongOperation(
+                key="org_repeat",
+                label="原點復歸重現性量測",
+                is_running=lambda: self._org_repeat_running.is_set(),
+                request_stop=lambda: self._org_repeat_stop_event.set(),
+                started_at=lambda: self._org_repeat_start_time,
+                # ⚠ 這一項是延後求值最有感的地方：_org_repeat_elapsed_var
+                # 要等 _build_card_origin_repeatability() 才建立，而
+                # _register_long_ops() 跑在 _build_notebook() 之前。
+                show_elapsed=lambda txt: self._org_repeat_elapsed_var.set(txt),
+            ),
+        )
+
+    def _request_stop_scanner(self):
+        """
+        請求尋光背景執行緒收工。
+
+        `_active_scanner` 是 Optional 且會動態變成 None（_on_scan_done 收尾
+        時放掉 scanner 實例），所以 None 判斷必須留在這裡、而不是留給
+        `_request_stop_long_ops()` 的迴圈——註冊表對外的約定是
+        「request_stop 不為 None 時，任何時候呼叫都必須是安全且冪等的」。
+        """
+        scanner = self._active_scanner
+        if scanner is not None:
+            scanner.request_stop()
+
+    def _busy_reasons(self) -> List[str]:
+        """目前進行中的長時間作業名稱（給人看的），沒有則回空 list。"""
+        return [op.label for op in self._long_ops if op.is_running()]
+
+    def _any_long_op_running(self) -> bool:
+        """是否有任何長時間作業進行中。`_update_stat_ui` 的 busy 判準。"""
+        return any(op.is_running() for op in self._long_ops)
+
+    def _request_stop_long_ops(self):
+        """
+        把停止請求分派給所有長時間背景作業。
+
+        **刻意不先判斷 `is_running()`**，理由有二：
+        1. 三個 request_stop 都是冪等的旗標設定，而且各自的啟動流程
+           （`_do_play_rec` 的 `_stop_playback.clear()`、
+           `_do_start_org_repeat` 的 `_org_repeat_stop_event.clear()`）
+           都會在下一輪開始前把旗標清掉，殘留的 set 不會誤殺下一輪。
+        2. 「進行中旗標」與「停止目標」不是同一個物件，兩者的 set/clear
+           時序有極短的交錯窗口（例如 `_scanning.set()` 早於
+           `_active_scanner = scanner`）。用 is_running() 當閘門等於把這個
+           窗口變成漏接窗口，而漏接正是這張表要消滅的東西。
+
+        每一項各自 try/except：這是「使用者按下停止」的路徑，任何一項
+        request_stop 拋例外都不可以吃掉其餘作業的停止請求。
+        """
+        for op in self._long_ops:
+            if op.request_stop is None:
+                continue
+            try:
+                op.request_stop()
+            except Exception:  # 停止路徑不可因單一作業失敗而中斷
+                logger.exception(f"請求停止長時間作業 [{op.key}] 失敗")
+
+    def _update_long_op_elapsed(self):
+        """
+        更新各長時間作業的經過時間顯示。由 `_start_poller` 每輪呼叫。
+
+        只在作業進行中更新，收工後 StringVar 保留最後一次的值——
+        `_on_scan_done()` 的完成橫幅會去讀 `_scan_elapsed_var.get()`
+        把總耗時寫進訊息，歸零會讓那則訊息永遠顯示 00:00。
+        """
+        now = time.time()
+        for op in self._long_ops:
+            if op.started_at is None or op.show_elapsed is None:
+                continue
+            if not op.is_running():
+                continue
+            elapsed = int(now - op.started_at())
+            op.show_elapsed(f"{elapsed // 60:02d}:{elapsed % 60:02d}")
 
     # =========================================================================
     # 提醒橫幅（非強制，取代 modal messagebox）
@@ -1915,7 +2162,13 @@ class DS102GUI:
             or self._homing.is_set()
             or self._scanning.is_set()
         ):
-            self._flash_banner("已有其他作業（重播／尋光／復歸／量測）進行中，請稍後再試")
+            # ⚠ 上面的條件刻意**不**改成 _any_long_op_running()：它額外含有
+            # ctrl.measuring_active / ctrl.scanning_active 這兩個控制器層級
+            # 旗標，那是註冊表（只服務 UI 忙碌顯示與停止分派）不該涵蓋的。
+            # 這裡只借用 _busy_reasons() 讓訊息說出實際在忙什麼；若擋下來的
+            # 是那兩個控制器旗標，_busy_reasons() 會是空的，退回原本的通稱。
+            reasons = "／".join(self._busy_reasons()) or "重播／尋光／復歸／量測"
+            self._flash_banner(f"已有其他作業（{reasons}）進行中，請稍後再試")
             return
 
         selected_axes = [ax for ax in AXES if self._org_repeat_axis_vars[ax].get()]
@@ -2491,22 +2744,23 @@ class DS102GUI:
             self.ctrl.stop()
 
     def _do_stop(self):
+        """
+        「■ Stop」：送出硬體停止指令，並請求所有長時間背景作業收工。
+
+        ctrl.stop() 只讓馬達停下來，攔不住那些跑在自己的背景執行緒、
+        只認旗標的作業（重播、原點復歸重現性量測、尋光）——少了下面那行，
+        滑台會停一下、然後被背景執行緒送出的下一組指令帶著繼續走。
+        逐項接線的舊寫法漏過三次，現在統一走註冊表（見 _register_long_ops）。
+        """
         self.ctrl.stop()
-        # 原點復歸重現性量測跑在自己的背景迴圈裡，沒有現成旗標可用
-        # （跟 _stop_playback 是同一類）。全域停止鍵理應也能讓它收工，
-        # 否則按下「■ Stop」滑台停了，量測執行緒卻繼續送下一輪指令。
-        if self._org_repeat_running.is_set():
-            self._org_repeat_stop_event.set()
+        self._request_stop_long_ops()
 
     def _on_escape(self, event=None):
-        """Escape：停止所有軸，並中止進行中的重播／量測。"""
+        """Escape：停止所有軸，並中止進行中的重播／量測／尋光。"""
         if not self.ctrl.connected:
             return
         self.ctrl.stop()
-        if self.ctrl.playback_running:
-            self._stop_playback.set()
-        if self._org_repeat_running.is_set():
-            self._org_repeat_stop_event.set()
+        self._request_stop_long_ops()
         self._flash_banner("■ 已送出停止指令（Esc）", 4000)
 
     def _do_set_position(self):
@@ -4596,24 +4850,19 @@ class DS102GUI:
         if self._scan_best_power is not None:
             self._scan_best_power_var.set(f"{self._scan_best_power:.2f}")
 
-        # 這批樣本裡最新一筆有效讀值也回寫光功率分頁的顯示變數——尋光
-        # 期間背景輪詢已暫停（見 _start_meter_poll_worker 的
-        # scanning_active 判斷），光功率分頁不會有其他資料來源。呈現規則
-        # 照抄 _on_meter_reading 的成功分支，只是換了資料來源，不要另立
-        # 一套。刻意不動 _pm_comm_failures——那是背景輪詢自己的失聯計數，
-        # 尋光中它本來就沒在跑，不該被這裡累加或歸零，避免尋光結束後
-        # 失聯判斷的行為被污染。
+        # 這批樣本裡最新一筆有效讀值也轉貼給光功率分頁——尋光期間背景輪詢
+        # 已暫停（見 _pm_should_poll() 的 motion_active 判斷），光功率分頁
+        # 不會有其他資料來源。
+        #
+        # 🔴 這裡**只呼叫一個具名方法**，不直接碰光功率分頁的任何欄位或
+        # widget（2026-08-31 前置2）。改成這樣之前，這段是專案裡唯一一處
+        # 「A 分頁的繪圖函式直接指派 B 分頁的快取欄位＋三個 widget」，共 7
+        # 個寫入點；其中「尋光中…」那兩行還跟 _pm_refresh_status_line() 的
+        # scanning_active 分支重複，是兩份會走鐘的真相來源。狀態文字與前景
+        # 色現在完全由 _pm_refresh_status_line() 決定（_pm_note_reading 會
+        # 呼叫它），這裡不再自己判斷。
         if valid_samples := [s for s in samples if s.ok and s.power is not None]:
-            latest = valid_samples[-1]
-            self._pm_last_ok_time = time.time()
-            self._pm_last_value = latest.power
-            self._pm_power_var.set(f"{latest.power:.2f}")
-            self._pm_unit_var.set("dBm")
-            self._pm_power_lbl.config(fg=CLR_TEXT)
-            self._pm_status_var.set("尋光中（讀值由尋光分頁提供）")
-            self._pm_status_lbl.config(fg=CLR_ACCENT)
-            self._pm_set_status_dot(CLR_ACCENT)
-            self._pm_update_age_label()
+            self._pm_note_reading(valid_samples[-1].power, source="scan")
 
         if _MATPLOTLIB_AVAILABLE:
             self._scan_redraw_figure()
@@ -5147,10 +5396,12 @@ class DS102GUI:
         return "aborted_other"
 
     def _do_stop_scan(self):
+        """尋光分頁自己的停止鍵：只停尋光，不動其他長時間作業。"""
         if self.ctrl.connected:
             self.ctrl.stop()
-        if self._active_scanner is not None:
-            self._active_scanner.request_stop()
+        # 走 _request_stop_scanner() 而非自己再判一次 None：_active_scanner
+        # 的生命週期判斷只留一份，跟註冊表用的是同一條路徑。
+        self._request_stop_scanner()
         self._scan_status_var.set("停止中…")
         self._scan_stop_btn.config(state="disabled")
 
@@ -5490,14 +5741,14 @@ class DS102GUI:
 
     def _toggle_connect(self):
         if self.ctrl.connected:
-            # 原點復歸重現性量測若還在跑，中斷連線前要先讓它收工——
-            # 它跑在自己的背景迴圈裡，沒有現成旗標可用（跟 _stop_playback
-            # 是同一類）。少了這行，量測執行緒會繼續對已經 disconnect()
-            # 的序列埠打指令，最壞情況空等一輪 30s（_wait_axis_stop）
-            # 加一輪 180s（_wait_origin_done）逾時才會發現，卡住一個多
-            # 小時（architect 2026-08-21 審查建議）。
-            if self._org_repeat_running.is_set():
-                self._org_repeat_stop_event.set()
+            # 所有長時間背景作業都要在 disconnect() 之前收到停止請求：它們
+            # 只認自己的旗標、不看連線狀態，少了這步就會繼續對已經關閉的
+            # 序列埠打指令。原點復歸重現性量測最壞情況會空等一輪 30s
+            # （_wait_axis_stop）加一輪 180s（_wait_origin_done）逾時才發現，
+            # 卡住一個多小時（architect 2026-08-21 審查）；尋光則是同一個
+            # bug 的第二個入口（_on_close 修過、這裡以前漏了，2026-08-31 審查）。
+            # 分派放在 ctrl.stop() 之前，讓背景執行緒盡早知道要收工。
+            self._request_stop_long_ops()
             # 先停再斷。少了這行，移動中按「中斷」會關掉 port 卻讓馬達繼續跑，
             # 程式從此失去對它的控制（_on_close 有做，這裡以前漏了）。
             self.ctrl.stop()
@@ -5630,7 +5881,7 @@ class DS102GUI:
         self._pm_status_lbl.config(fg=CLR_ACCENT)
         self._pm_set_status_dot(CLR_ACCENT)
         self._pm_comm_failures = 0
-        self._pm_last_ok_time = 0.0
+        self._pm_clear_reading()
         self._pm_power_var.set("—")
         self._pm_unit_var.set("")
         self._pm_power_lbl.config(fg=CLR_MUTED)
@@ -5648,7 +5899,7 @@ class DS102GUI:
                 self.ctrl._log("ERROR", f"HP8153A close 失敗: {e}")
             self.meter = None
         self._pm_comm_failures = 0
-        self._pm_last_value = None
+        self._pm_clear_reading()
         self._pm_conn_btn.config(text="連線", state="normal", bg=CLR_ACCENT)
         self._pm_conn_dot.itemconfig(self._pm_conn_dot_id, fill=CLR_DANGER)
         self._pm_conn_lbl.config(text="未連線")
@@ -5941,10 +6192,11 @@ class DS102GUI:
                 self.ctrl._log("INFO", "光功率讀取已恢復正常")
                 self._pm_set_status_dot(CLR_ACCENT)
             self._pm_comm_failures = 0
-            self._pm_last_ok_time = time.time()
-            self._pm_last_value = val
-            self._pm_power_var.set(f"{val:.2f}")
-            self._pm_unit_var.set("dBm")
+            # 先歸零 _pm_comm_failures 再記錄讀值：_pm_note_reading() 內部
+            # 會呼叫 _pm_refresh_status_line()，而那支的第二順位分支就是看
+            # _pm_comm_failures，順序反過來會讓恢復當下的那一輪仍顯示
+            # 「⚠ 已停止更新」，多等一輪 100ms 才校正回來。
+            self._pm_note_reading(val, source="meter")
         else:
             self._pm_comm_failures += 1
             if self._pm_comm_failures == COMM_FAIL_THRESHOLD:
@@ -5973,10 +6225,15 @@ class DS102GUI:
         把單次約 110~130ms 的 I/O 延遲疊加進軸的到位判斷。連續失敗達
         COMM_FAIL_THRESHOLD（畫面已顯示「已停止更新」）時視為不可信，
         回傳 None 讓 CSV 該欄留空，而不是寫入一個過期的舊數值。
+
+        🔴 **這是 `self._pm_reading` 唯一的跨執行緒讀取點**（跑在移動執行緒
+        上，其餘讀寫全在 Tk 主執行緒）。`PowerReading` 是 frozen 的，所以
+        這裡拿到的必定是某一次讀值的完整快照，不會出現「新的 value 配舊的
+        ok_time」——但沒有鎖，也不需要鎖，理由見 PowerReading 的 docstring。
         """
         if self.meter is None or self._pm_comm_failures >= COMM_FAIL_THRESHOLD:
             return None
-        return self._pm_last_value
+        return self._pm_reading.value
 
     def _scanner_power_query(self) -> Tuple[bool, float]:
         """
@@ -6047,11 +6304,62 @@ class DS102GUI:
             return
         self.ctrl._log("INFO", f"[尋光] 已量到訊號 {power:.4f} dBm，光功率計改為鎖定量程以加快讀值")
 
+    def _pm_note_reading(self, value: float, source: str) -> None:
+        """
+        記錄一筆成功的光功率讀值——`self._pm_reading` 與數值顯示的唯一寫入者。
+
+        兩個資料來源共用這一個入口：
+          source="meter"  光功率分頁自己的「立即查詢」與背景輪詢（`_on_meter_reading`）
+          source="scan"   尋光分頁的 sample callback 轉貼（`_scan_plot_extend`）
+
+        🔴 **這個方法存在的目的就是讓「尋光」分頁不必知道光功率分頁有哪些
+        欄位與 widget。** 尋光期間背景輪詢因 `_pm_should_poll()` 的
+        `motion_active` 判斷而暫停，光功率分頁沒有其他資料來源，所以尋光
+        必須把讀值轉貼過來——但轉貼的方式應該是呼叫一個具名方法，不是伸手
+        進另一個分頁改五個欄位。
+
+        刻意**不碰** `_pm_comm_failures`：那是背景輪詢自己的失聯計數。尋光
+        期間它本來就沒在跑，被這裡累加或歸零都會污染尋光結束後的失聯判斷
+        （這是搬進來之前 `_scan_plot_extend` 就已經寫明的既有約定，不是新
+        規則）。文字說明與前景色一律交給 `_pm_refresh_status_line()`（它
+        自己是那一組的唯一寫入者），這裡只負責數值與狀態燈。
+        """
+        self._pm_reading = PowerReading(value=value, ok_time=time.time(), source=source)
+        self._pm_power_var.set(f"{value:.2f}")
+        self._pm_unit_var.set("dBm")
+        # 讀到值就代表通訊正常。原本只有「從失聯狀態恢復」時才改燈號，但
+        # 可達狀態只有 ACCENT／DANGER／MUTED 三種，成功讀值時燈號本來就
+        # 只可能是 ACCENT（正常）或剛從 DANGER 恢復，無條件設 ACCENT 與
+        # 原行為等價，且少一個「忘了恢復燈號」的分支。
+        self._pm_set_status_dot(CLR_ACCENT)
+        self._pm_refresh_status_line()
+        self._pm_update_age_label()
+
+    def _pm_clear_reading(self) -> None:
+        """
+        清掉快取，回到「沒有任何可信讀值」的初始狀態。
+
+        連線成功與中斷連線兩條路徑共用。⚠ **這裡順帶修掉一處不對稱**：
+        原本 `_on_meter_connect_result` 只把 `_pm_last_ok_time` 歸零、
+        沒有清 `_pm_last_value`，而 `_disconnect_meter` 只清 `_pm_last_value`、
+        沒有歸零 `_pm_last_ok_time`。前者的後果是「連上新的光功率計、還沒
+        讀到第一筆值之前，`_get_last_pm_value()` 會回傳上一個 session 的舊
+        數值」，那個值會直接寫進 data/*.csv 的 dbm 欄位而沒有任何標記。
+        實務上很難踩到（UI 上連線鍵是 toggle，連線前必定經過
+        `_disconnect_meter`），但既然兩條路徑本來就該表達同一件事，就沒有
+        理由讓它們各清一半。
+
+        不碰 `_pm_power_var` / `_pm_unit_var` / 燈號：那兩條路徑對這些
+        widget 的處理各不相同（連線成功要顯示「—」＋MUTED、中斷還要改連線
+        鈕與整批 widget 狀態），維持各自處理，這裡只管快取本身。
+        """
+        self._pm_reading = PowerReading()
+
     def _pm_update_age_label(self):
-        if self.meter is None or self._pm_last_ok_time <= 0:
+        if self.meter is None or self._pm_reading.ok_time <= 0:
             self._pm_age_var.set("—")
             return
-        age = time.time() - self._pm_last_ok_time
+        age = time.time() - self._pm_reading.ok_time
         self._pm_age_var.set("剛更新" if age < 1.5 else f"{age:.0f}s 前")
 
     def _pm_refresh_status_line(self):
@@ -6603,14 +6911,9 @@ class DS102GUI:
         # 以前只認得 playback_running 與 ems_active，不認得「復歸中」，
         # 所以 _do_home_all 剛鎖上的按鈕會在 100ms 後全部復活——包含那顆
         # 文字還停在「🏠 復歸中…」的按鈕，再按一次就疊出第二條復歸執行緒。
-        # 任何新增的「作業進行中」狀態都必須同步加進這個判斷。
-        busy = (
-            self.ctrl.playback_running
-            or self._homing.is_set()
-            or self._scanning.is_set()
-            or self._org_repeat_running.is_set()
-        )
-        if busy:
+        # 現在改由長時間作業註冊表供應：新增作業只要在 _register_long_ops()
+        # 註冊一筆，這裡自動涵蓋，不需要（也不應該）再手動加旗標。
+        if self._any_long_op_running():
             self._set_drive_buttons_state("disabled")
         elif self.ctrl.connected and not self.ctrl.ems_active:
             self._set_drive_buttons_state("normal")
@@ -6709,12 +7012,9 @@ class DS102GUI:
                 for sb in self._status_bars:
                     sb.update_coords()
                 self._update_stat_ui()
-                if self._scanning.is_set():
-                    elapsed = int(time.time() - self._scan_start_time)
-                    self._scan_elapsed_var.set(f"{elapsed // 60:02d}:{elapsed % 60:02d}")
-                if self._org_repeat_running.is_set():
-                    elapsed = int(time.time() - self._org_repeat_start_time)
-                    self._org_repeat_elapsed_var.set(f"{elapsed // 60:02d}:{elapsed % 60:02d}")
+                # 各長時間作業的經過時間顯示，統一由註冊表驅動
+                # （見 _update_long_op_elapsed / _register_long_ops）。
+                self._update_long_op_elapsed()
                 # 這兩個都不做 I/O，純畫面同步。掛在這裡（而非
                 # _redraw_scan_plot）是因為那條鏈只在裝了 matplotlib 時
                 # 才會執行；這裡是唯一保證一定會跑的節奏。
@@ -6763,19 +7063,13 @@ class DS102GUI:
     # =========================================================================
     def _on_close(self):
         self._shutting_down.set()
-        self._stop_playback.set()
-        # 原點復歸重現性量測跑在自己的迴圈裡（不是靠 _shutting_down 這類
-        # 現成旗標），關窗時要讓它知道視窗正在關閉才會主動收工，避免
-        # 背景執行緒繼續對已經 disconnect() 的序列埠打指令。
-        self._org_repeat_stop_event.set()
-        if self._active_scanner is not None:
-            # 比照 _stop_playback.set() 的既有模式：尋光執行中關窗，要讓
-            # 背景執行緒知道視窗正在關閉才會主動收工。沒有這行，_run()
-            # 仍會繼續跑 scanner.run()，下一步對已經 disconnect() 的序列埠
-            # 操作大機率拋例外，且 _run() 例外處理排的 root.after(0, ...)
-            # 這時 root 可能已經 destroy()，會在背景執行緒炸出未接住的例外
-            # （architect 審查抓到的問題）。
-            self._active_scanner.request_stop()
+        # 所有長時間背景作業都跑在自己的迴圈裡（不是靠 _shutting_down 這類
+        # 現成旗標），關窗時要讓它們知道視窗正在關閉才會主動收工。少了這步，
+        # 例如尋光的 _run() 會繼續跑 scanner.run()，下一步對已經 disconnect()
+        # 的序列埠操作大機率拋例外，且 _run() 例外處理排的 root.after(0, ...)
+        # 這時 root 可能已經 destroy()，會在背景執行緒炸出未接住的例外
+        # （architect 審查抓到的問題）。
+        self._request_stop_long_ops()
         if self.ctrl.connected:
             self.ctrl.stop()
             self.ctrl.disconnect()

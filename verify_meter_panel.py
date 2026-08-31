@@ -416,7 +416,7 @@ class TestMeterConnectSuccess:
     def test_last_ok_time_reset(self, connected_result):
         """案例 4e：連線後 last_ok_time 歸零（不殘留上段連線時間戳）。"""
         g, _ = connected_result
-        assert g._pm_last_ok_time == 0.0
+        assert g._pm_reading.ok_time == 0.0
 
     def test_ch_wl_var_shows_channel_and_wavelength(self, connected_result):
         """案例 4f：ch_wl_var 顯示 Ch1·1550nm。"""
@@ -772,27 +772,27 @@ class TestGetLastPmValue:
         fake_meter = FakeMeter()
         g.meter = fake_meter
         g._pm_comm_failures = 0
-        g._pm_last_value = -8.5
+        g._pm_note_reading(-8.5, source="meter")
         try:
             assert g._get_last_pm_value() == -8.5
         finally:
             g.meter = None
             g._pm_comm_failures = 0
-            g._pm_last_value = None
+            g._pm_clear_reading()
 
     def test_failures_at_threshold_returns_none(self, gui):
         """案例 12c：連續失敗達門檻 -> 回傳 None（不把過期數值當成當下讀值）。"""
         root, g = gui
         fake_meter = FakeMeter()
         g.meter = fake_meter
-        g._pm_last_value = -8.5
+        g._pm_note_reading(-8.5, source="meter")
         g._pm_comm_failures = main_ai.COMM_FAIL_THRESHOLD
         try:
             assert g._get_last_pm_value() is None
         finally:
             g.meter = None
             g._pm_comm_failures = 0
-            g._pm_last_value = None
+            g._pm_clear_reading()
 
 
 class TestRecordDataPointDbm:
@@ -803,7 +803,7 @@ class TestRecordDataPointDbm:
         root, g = gui
         g.meter = None
         g._pm_comm_failures = 0
-        g._pm_last_value = None
+        g._pm_clear_reading()
         g.ctrl._data_log = []
         g.ctrl._record_data_point()
         assert g.ctrl._data_log[-1]["dbm"] == ""
@@ -814,14 +814,14 @@ class TestRecordDataPointDbm:
         fake_meter = FakeMeter()
         g.meter = fake_meter
         g._pm_comm_failures = 0
-        g._pm_last_value = -3.21
+        g._pm_note_reading(-3.21, source="meter")
         g.ctrl._data_log = []
         g.ctrl._record_data_point()
         entry = g.ctrl._data_log[-1]
         yield entry
         g.meter = None
         g._pm_comm_failures = 0
-        g._pm_last_value = None
+        g._pm_clear_reading()
         g.ctrl._data_log = []
 
     def test_cached_reading_fills_dbm_field(self, recorded_point_with_reading):
@@ -1257,3 +1257,90 @@ class TestPmFloatPosition:
         """
         x, y = self._pos((2000, 100, 1200, 800))
         assert x + self.W <= self.SCREEN[0]
+
+
+# =============================================================================
+# 案例 29：PowerReading —— 「最近一次讀值」的具名共用狀態
+#
+# 2026-08-31 模組化前置2（見 docs/modularization.md〈九〉）。這一組鎖住的是
+# **介面約定**，不是顯示細節：`self._pm_reading` 只能由 `_pm_note_reading()`
+# 與 `_pm_clear_reading()` 寫入，「尋光」分頁不再直接指派光功率分頁的欄位。
+# =============================================================================
+class TestPowerReading:
+    """案例 29a ~ 29f：PowerReading 快取與其唯二寫入者。"""
+
+    def test_initial_state_is_empty(self, gui):
+        """案例 29a：初始狀態 -> value=None、ok_time=0.0（沿用舊裸欄位的初值語意）。"""
+        root, g = gui
+        assert g._pm_reading.value is None
+        assert g._pm_reading.ok_time == 0.0
+
+    def test_note_reading_writes_complete_snapshot(self, gui):
+        """案例 29b：_pm_note_reading() 一次寫齊 value / ok_time / source。
+
+        鎖住的是「不會出現新 value 配舊 ok_time」——那是把兩個裸欄位換成
+        frozen dataclass 的唯一技術理由（_get_last_pm_value() 跑在移動執行緒）。
+        """
+        root, g = gui
+        g.meter = FakeMeter()
+        try:
+            before = time.time()
+            g._pm_note_reading(-4.25, source="meter")
+            snap = g._pm_reading
+            assert snap.value == -4.25
+            assert snap.source == "meter"
+            assert snap.ok_time >= before
+            assert g._pm_power_var.get() == "-4.25"
+            assert g._pm_unit_var.get() == "dBm"
+        finally:
+            g.meter = None
+            g._pm_clear_reading()
+
+    def test_reading_is_frozen(self, gui):
+        """案例 29c：PowerReading 不可變 -> 拿到快照後不可能被就地改寫。"""
+        root, g = gui
+        snap = g._pm_reading
+        with pytest.raises(Exception):
+            snap.value = -1.0
+
+    def test_clear_reading_resets_both_fields(self, gui):
+        """案例 29d：_pm_clear_reading() 同時清 value 與 ok_time。
+
+        舊版兩條路徑各清一半（連線只歸零 ok_time、中斷只清 value），這裡
+        鎖住修正後的對稱行為。
+        """
+        root, g = gui
+        g.meter = FakeMeter()
+        g._pm_note_reading(-4.25, source="meter")
+        g.meter = None
+        g._pm_clear_reading()
+        assert g._pm_reading.value is None
+        assert g._pm_reading.ok_time == 0.0
+
+    def test_disconnect_clears_cached_value(self, gui):
+        """案例 29e：中斷連線 -> 快取清空，_get_last_pm_value() 不再吐舊值。"""
+        root, g = gui
+        g.meter = FakeMeter()
+        g._pm_note_reading(-4.25, source="meter")
+        assert g._get_last_pm_value() == -4.25
+        g._disconnect_meter()
+        assert g._get_last_pm_value() is None
+        assert g._pm_reading.ok_time == 0.0
+
+    def test_note_reading_does_not_touch_comm_failures(self, gui):
+        """案例 29f：_pm_note_reading() 不動 _pm_comm_failures。
+
+        失效情境：若這裡順手把失聯計數歸零，尋光期間（背景輪詢暫停、讀值
+        由尋光轉貼）每一筆樣本都會把光功率分頁自己的失聯計數洗掉，尋光結束
+        後「連續讀不到就示警」的判斷等於被停用。
+        """
+        root, g = gui
+        g.meter = FakeMeter()
+        g._pm_comm_failures = 2
+        try:
+            g._pm_note_reading(-4.25, source="scan")
+            assert g._pm_comm_failures == 2
+        finally:
+            g.meter = None
+            g._pm_comm_failures = 0
+            g._pm_clear_reading()

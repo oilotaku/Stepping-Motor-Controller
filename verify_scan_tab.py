@@ -899,16 +899,59 @@ class TestPmSyncScanNotice:
             g._scan_plot_reset()
 
     def test_scan_plot_extend_syncs_pm_last_value(self, gui):
-        """案例 20b：_pm_last_value 隨樣本同步更新。"""
+        """案例 20b：_pm_reading.value 隨樣本同步更新（前置2 後改由 _pm_note_reading 寫入）。"""
         root, g = gui
         g.meter = FakeMeter()
         g._scan_plot_reset()
         sample = Sample(coords={"X": 10.0, "Y": 20.0, "Z": 30.0}, ok=True, power=-5.0)
         g._scan_plot_extend([sample])
         try:
-            assert g._pm_last_value == -5.0
+            assert g._pm_reading.value == -5.0
         finally:
             g._scan_plot_reset()
+
+    def test_scan_plot_extend_tags_reading_source(self, gui):
+        """案例 20c：尋光轉貼的讀值 source 標成 "scan"。
+
+        純診斷欄位，沒有邏輯依它分流；鎖住它是為了讓將來看到一筆可疑讀值時
+        能直接知道它從哪條路徑進來（前置2，見 docs/modularization.md〈九〉）。
+        """
+        root, g = gui
+        g.meter = FakeMeter()
+        g._scan_plot_reset()
+        sample = Sample(coords={"X": 10.0, "Y": 20.0, "Z": 30.0}, ok=True, power=-5.0)
+        g._scan_plot_extend([sample])
+        try:
+            assert g._pm_reading.source == "scan"
+        finally:
+            g._scan_plot_reset()
+
+    def test_scan_plot_extend_delegates_status_text(self, gui):
+        """案例 20d：_scan_plot_extend() 不再自己寫光功率分頁的狀態文字。
+
+        🔴 這是前置2 真正要鎖住的東西。改動前，尋光的繪圖函式直接把
+        `_pm_status_var` 設成「尋光中…」，而 `_pm_refresh_status_line()` 的
+        scanning_active 分支也設同一句話——兩份會走鐘的真相來源。現在狀態文字
+        完全由 `_pm_refresh_status_line()` 依 `ctrl.scanning_active` 決定。
+
+        失效情境（若有人把那兩行加回去）：尋光結束後最後一批樣本才進到繪圖
+        函式，`scanning_active` 已經是 False，畫面卻會被改回「尋光中」，而
+        `_pm_sync_scan_notice()` 的還原分支這一輪已經跑過，要等下一輪 100ms
+        才會校正——使用者會看到狀態文字閃一下「尋光中」。
+        """
+        root, g = gui
+        g.meter = FakeMeter()
+        g.ctrl.scanning_active = False
+        g._scan_plot_reset()
+        sample = Sample(coords={"X": 10.0, "Y": 20.0, "Z": 30.0}, ok=True, power=-5.0)
+        g._scan_plot_extend([sample])
+        try:
+            assert g._pm_status_var.get() == "已連線"
+        finally:
+            g._scan_plot_reset()
+            g.meter = None
+            g.ctrl.scanning_active = False
+            g._pm_clear_reading()
 
 
 # =============================================================================
@@ -1186,3 +1229,253 @@ class TestOnCloseNotifiesScanner:
         """案例 26：_on_close() 呼叫了 _active_scanner.request_stop()。"""
         fake_scanner, _ = closed_gui
         assert fake_scanner.stop_requested is True
+
+
+# =============================================================================
+# 十二、全域停止／中斷連線入口通知背景尋光執行緒（案例 27）
+# =============================================================================
+class TestGlobalStopEntriesNotifyScanner:
+    """
+    architect 2026-08-31 審查抓到：_on_close() 已經會呼叫
+    _active_scanner.request_stop()（案例 26），但 _do_stop()（移動控制分頁
+    「■ Stop」）、_on_escape()（Esc 快捷鍵）、_toggle_connect() 的中斷連線
+    分支這三個入口原本漏接。尋光背景執行緒（fiber_scanner._check_abort()）
+    只看 request_stop() 設的 _stop_event，不看 ctrl.stop() 有沒有送出，
+    少了這行，使用者按下停止/中斷後尋光仍會在下一輪迴圈送出下一步指令。
+    """
+
+    class FakeScanner:
+        def __init__(self):
+            self.stop_requested = False
+
+        def request_stop(self):
+            self.stop_requested = True
+
+    def test_do_stop_requests_scanner_stop(self, gui):
+        """案例 27a：_do_stop() 呼叫了 _active_scanner.request_stop()。"""
+        root, g = gui
+        fake_scanner = self.FakeScanner()
+        g._active_scanner = fake_scanner
+        try:
+            g._do_stop()
+            assert fake_scanner.stop_requested is True
+        finally:
+            g._active_scanner = None
+
+    def test_on_escape_requests_scanner_stop(self, gui):
+        """案例 27b：_on_escape() 呼叫了 _active_scanner.request_stop()。"""
+        root, g = gui
+        fake_scanner = self.FakeScanner()
+        g._active_scanner = fake_scanner
+        saved_connected = g.ctrl.connected
+        g.ctrl.connected = True
+        try:
+            with patch.object(g, "_flash_banner"):
+                g._on_escape()
+            assert fake_scanner.stop_requested is True
+        finally:
+            g._active_scanner = None
+            g.ctrl.connected = saved_connected
+
+    def test_toggle_connect_disconnect_requests_scanner_stop(self, gui):
+        """案例 27c：_toggle_connect() 的中斷連線分支呼叫了 _active_scanner.request_stop()。"""
+        root, g = gui
+        fake_scanner = self.FakeScanner()
+        g._active_scanner = fake_scanner
+        saved_connected = g.ctrl.connected
+        g.ctrl.connected = True
+        try:
+            g._toggle_connect()
+            assert fake_scanner.stop_requested is True
+        finally:
+            g._active_scanner = None
+            # _toggle_connect() 的中斷連線分支自己會把 ctrl.connected 設回
+            # False（disconnect() 內部邏輯），這裡明確還原，不依賴該行為。
+            g.ctrl.connected = saved_connected
+
+
+# =============================================================================
+# 十三、長時間背景作業註冊表（案例 28，2026-08-31 前置1）
+# =============================================================================
+class TestLongOperationRegistry:
+    """
+    architect 2026-08-31 前置1：把「長時間背景作業」變成第一類概念
+    （main_ai.LongOperation ＋ DS102GUI._register_long_ops()）。
+
+    在這之前，每種長時間作業都要作者自己記得手動接進 6 個散落的位置
+    （_update_stat_ui 的 busy、_start_poller 的經過時間、_do_stop、
+    _on_escape、_toggle_connect、_on_close），而且實際上已經漏過三次
+    （案例 26／27 就是在補那些漏接）。這一組測試鎖住註冊表的三個約定：
+
+      1. 四項既有作業都在表上（少一項就等於某個入口又會漏接）；
+      2. 停止分派是「無條件、逐項獨立」的——不先看 is_running()，
+         且任何一項拋例外都不可以吃掉其餘作業的停止請求；
+      3. 經過時間只在作業進行中更新，收工後保留最後一次的值
+         （_on_scan_done 的完成橫幅要讀 _scan_elapsed_var.get()）。
+    """
+
+    EXPECTED_KEYS = {"playback", "homing", "scan", "org_repeat"}
+
+    def test_registry_covers_all_known_long_ops(self, gui):
+        """案例 28a：註冊表涵蓋重播／全軸復歸／尋光／原點復歸重現性量測四項。"""
+        _, g = gui
+        assert {op.key for op in g._long_ops} == self.EXPECTED_KEYS
+
+    def test_homing_has_no_request_stop(self, gui):
+        """
+        案例 28b：全軸原點復歸的 request_stop 是 None（不是漏寫）。
+
+        ctrl.origin_all() 不收 stop_event，沒有任何軟體旗標能讓它提前收工；
+        註冊表必須把「沒有停止機制」表達出來，而不是假裝有。
+        """
+        _, g = gui
+        homing = next(op for op in g._long_ops if op.key == "homing")
+        assert homing.request_stop is None
+
+    def test_any_long_op_running_follows_each_flag(self, gui):
+        """案例 28c：四個旗標分別 set 時，_any_long_op_running() 都要成立。"""
+        _, g = gui
+        assert g._any_long_op_running() is False
+        for ev in (g._homing, g._scanning, g._org_repeat_running):
+            ev.set()
+            try:
+                assert g._any_long_op_running() is True
+            finally:
+                ev.clear()
+        assert g._any_long_op_running() is False
+
+    def test_busy_reasons_reports_labels(self, gui):
+        """案例 28d：_busy_reasons() 說得出正在忙哪一項。"""
+        _, g = gui
+        g._scanning.set()
+        try:
+            assert g._busy_reasons() == ["尋光"]
+        finally:
+            g._scanning.clear()
+        assert g._busy_reasons() == []
+
+    def test_request_stop_dispatches_to_all_targets(self, gui):
+        """
+        案例 28e：_request_stop_long_ops() 一次分派到三個停止目標，
+        且**不以 is_running() 為前提**（旗標全部是 clear 的狀態下仍分派）。
+
+        這是刻意的設計：進行中旗標與停止目標不是同一個物件，兩者的
+        set/clear 有極短的交錯窗口（_scanning.set() 早於 _active_scanner
+        指派），拿 is_running() 當閘門等於把該窗口變成漏接窗口。
+        """
+        _, g = gui
+        fake_scanner = TestGlobalStopEntriesNotifyScanner.FakeScanner()
+        g._active_scanner = fake_scanner
+        g._stop_playback.clear()
+        g._org_repeat_stop_event.clear()
+        try:
+            g._request_stop_long_ops()
+            assert g._stop_playback.is_set() is True
+            assert g._org_repeat_stop_event.is_set() is True
+            assert fake_scanner.stop_requested is True
+        finally:
+            g._active_scanner = None
+            g._stop_playback.clear()
+            g._org_repeat_stop_event.clear()
+
+    def test_one_failing_stop_does_not_block_the_others(self, gui):
+        """
+        案例 28f：某一項 request_stop 拋例外時，其餘作業仍收得到停止請求。
+
+        失效情境：尋光的 request_stop 因任何原因拋例外（例如 scanner 物件
+        狀態異常），若分派迴圈沒有逐項 try/except，排在它後面的
+        原點復歸重現性量測就永遠等不到停止旗標——使用者按下停止之後，
+        量測執行緒會繼續對硬體送下一輪指令。
+        """
+        _, g = gui
+
+        class ExplodingScanner:
+            def request_stop(self):
+                raise RuntimeError("故意炸給測試看")
+
+        g._active_scanner = ExplodingScanner()
+        g._stop_playback.clear()
+        g._org_repeat_stop_event.clear()
+        try:
+            g._request_stop_long_ops()  # 不可往外拋
+            assert g._stop_playback.is_set() is True
+            assert g._org_repeat_stop_event.is_set() is True
+        finally:
+            g._active_scanner = None
+            g._stop_playback.clear()
+            g._org_repeat_stop_event.clear()
+
+    def test_elapsed_updates_only_while_running(self, gui):
+        """
+        案例 28g：經過時間只在作業進行中更新，收工後保留最後一次的值。
+
+        後半段是真的會出事的部分：_on_scan_done() 的完成橫幅會讀
+        _scan_elapsed_var.get() 把總耗時寫進訊息，若收工時歸零或繼續累加，
+        那則訊息就會顯示錯誤的耗時。
+        """
+        _, g = gui
+        g._scan_elapsed_var.set("--:--")
+        g._update_long_op_elapsed()
+        assert g._scan_elapsed_var.get() == "--:--", "未進行中不該被更新"
+
+        g._scan_start_time = time.time() - 125  # 2 分 5 秒前開始
+        g._scanning.set()
+        try:
+            g._update_long_op_elapsed()
+            assert g._scan_elapsed_var.get() == "02:05"
+        finally:
+            g._scanning.clear()
+            g._scan_start_time = 0.0
+
+        # 收工後再跑一輪，值必須原地不動（而不是被歸零或繼續累加）
+        g._update_long_op_elapsed()
+        assert g._scan_elapsed_var.get() == "02:05"
+
+    def test_org_repeat_elapsed_var_is_late_bound(self, gui):
+        """
+        案例 28h：原點復歸重現性量測的 show_elapsed 是延後求值。
+
+        _org_repeat_elapsed_var 要等 _build_card_origin_repeatability() 才
+        建立，而 _register_long_ops() 跑在 _build_notebook() 之前。若當初
+        寫成 `self._org_repeat_elapsed_var.set`（綁定方法），註冊當下就會
+        AttributeError；寫成 lambda 才能在這裡真的把值寫進去。
+        """
+        _, g = gui
+        g._org_repeat_elapsed_var.set("--:--")
+        g._org_repeat_start_time = time.time() - 61
+        g._org_repeat_running.set()
+        try:
+            g._update_long_op_elapsed()
+            assert g._org_repeat_elapsed_var.get() == "01:01"
+        finally:
+            g._org_repeat_running.clear()
+            g._org_repeat_start_time = 0.0
+            g._org_repeat_elapsed_var.set("00:00")
+
+    def test_global_stop_entries_go_through_the_registry(self, gui):
+        """
+        案例 28i：_do_stop() / _on_escape() 都會讓重播與量測旗標一起被設。
+
+        案例 27 只驗了尋光那一項；這裡補驗同一次呼叫也涵蓋另外兩項，
+        確認三個入口確實改走註冊表、而不是又各自接了一份手動接線。
+        """
+        _, g = gui
+        saved_connected = g.ctrl.connected
+        g.ctrl.connected = True
+        g._stop_playback.clear()
+        g._org_repeat_stop_event.clear()
+        try:
+            g._do_stop()
+            assert g._stop_playback.is_set() is True
+            assert g._org_repeat_stop_event.is_set() is True
+
+            g._stop_playback.clear()
+            g._org_repeat_stop_event.clear()
+            with patch.object(g, "_flash_banner"):
+                g._on_escape()
+            assert g._stop_playback.is_set() is True
+            assert g._org_repeat_stop_event.is_set() is True
+        finally:
+            g._stop_playback.clear()
+            g._org_repeat_stop_event.clear()
+            g.ctrl.connected = saved_connected
