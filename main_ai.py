@@ -785,7 +785,17 @@ class DS102GUI:
         # 擠壓成需要捲動。用 state("zoomed")（Windows 專用，非真正全螢幕，
         # 保留標題列/工作列）自動吃滿目前螢幕的可用空間，不受解析度影響，
         # 使用者仍可自行拖曳還原成任意大小。
-        self.root.state("zoomed")
+        # 🔴 "zoomed" 是 Windows 專用 state，Linux（含無視窗管理器的 Xvfb
+        # 測試環境）會丟 TclError。try 失敗時退回 Linux 常見的
+        # attributes("-zoomed", True)，兩者都不支援時保持預設視窗大小即可
+        # （不影響功能，只是開窗不是最大化）。
+        try:
+            self.root.state("zoomed")
+        except tk.TclError:
+            try:
+                self.root.attributes("-zoomed", True)
+            except tk.TclError:
+                pass
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Escape = 停止所有軸。機台旁操作時滑鼠不一定在手上，而停止鍵
