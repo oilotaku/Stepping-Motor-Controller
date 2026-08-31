@@ -324,7 +324,7 @@ class TestDeadMeterAbortsImmediately:
         scanner, ctrl = make_scanner(q, ctrl=FakeCtrl(axes=("X", "Y", "Z")))
         scanner.run(initial_step={"X": 100, "Y": 100, "Z": 100}, scan_dir=tmp_path)
 
-        assert q.calls["n"] <= 6  # calibrate_noise 預設 5 次，容一次餘裕
+        assert q.calls["n"] <= 13  # calibrate_noise 預設 12 次，容一次餘裕
         assert ctrl.move_log == []  # 一步都不該動
 
     def test_off_mode_message_points_at_range_setting(self, tmp_path):
@@ -368,8 +368,8 @@ class TestUnreadableBaseline:
 
         def q():
             state["n"] += 1
-            # 前 8 次（含雜訊校準的 5 次）全部讀不到，之後開始讀得到
-            if state["n"] <= 8:
+            # 前 13 次（含雜訊校準的 12 次）全部讀不到，之後開始讀得到
+            if state["n"] <= 13:
                 return False, 0.0
             return True, -55.0
 

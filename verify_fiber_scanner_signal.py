@@ -128,10 +128,11 @@ def make_scanner(power_query, ctrl=None, **kwargs):
 
 
 # 決定性、有界的「無訊號」擾動樣式（避免用真隨機造成測試偶發性）。
-# calibrate_noise() 預設取 5 次樣本，這裡故意也只放 5 個值，讓校準用的
-# 統計量與後續搜尋過程反覆取用的是「同一個母體」，range/sigma 比例才有
-# 意義（見 scratchpad 的調參紀錄：實測 range≈0.014、threshold≈0.039，
-# 安全邊界約 2.8 倍）。
+# calibrate_noise() 預設取 12 次樣本（2026-08-31 從 5 調高，見該方法
+# docstring），這裡刻意只放 5 個值、靠取模循環湊出 12 筆——校準與後續
+# 搜尋過程反覆取用的仍是「同一個母體」，range/sigma 比例才有意義（見
+# scratchpad 的調參紀錄：實測 range≈0.014、threshold≈0.039，安全邊界
+# 約 2.8 倍；筆數從 5 變 12 後 σ 估計值會略有變化，但仍是同一個量級）。
 _FLAT_NOISE_PATTERN = [0.008, -0.006, 0.007, -0.004, 0.005]
 
 
@@ -340,3 +341,367 @@ class TestRegressionGuard:
         if scan_files:
             data = json.loads(scan_files[0].read_text(encoding="utf-8"))
             assert data.get("completed") is True  # 正常跑完，未被中止
+
+
+# =============================================================================
+# 五、calibrate_noise() 預設 n_samples（2026-08-31：5 → 12）
+# =============================================================================
+class TestCalibrateNoiseDefault:
+    def test_default_takes_twelve_samples(self):
+        """空參數呼叫（run() 內部所有呼叫點都是空參數）要吃到新預設。"""
+        calls = {"n": 0}
+
+        def q():
+            calls["n"] += 1
+            return True, -50.0
+
+        scanner, _ = make_scanner(q)
+        scanner.calibrate_noise()
+        assert calls["n"] == 12
+
+    def test_explicit_n_samples_still_overrides(self):
+        """呼叫端仍可覆寫，不是被寫死。"""
+        calls = {"n": 0}
+
+        def q():
+            calls["n"] += 1
+            return True, -50.0
+
+        scanner, _ = make_scanner(q)
+        scanner.calibrate_noise(n_samples=6)
+        assert calls["n"] == 6
+
+
+# =============================================================================
+# 六、殘差診斷 `_diagnose_residual_curvature()`（純事後統計，不移動不量測）
+# =============================================================================
+def _sample(coords, power, ok=True):
+    return fs.Sample(coords=dict(coords), ok=ok, power=power)
+
+
+def _true_quadratic_db(x, sigma_true, peak_db=-10.0):
+    """dB 域的高斯耦光曲線二次近似：P(x) = peak - (4.343/(2σ²))·x²。"""
+    a = 4.343 / (2 * sigma_true ** 2)
+    return peak_db - a * x * x
+
+
+class TestResidualDiagnosticsWindowFiltering:
+    """
+    驗證取樣窗口正確濾掉遠處的盲搜級樣本，不讓它們污染二次擬合。
+    直接構造 scanner.samples，不需要真的跑一輪搜尋——擬合本身是純函式，
+    這樣測試才能對擬合結果做精確的數值斷言（比照 _mk_samples 的既有寫法）。
+    """
+
+    def test_pollution_far_outside_window_has_zero_effect(self):
+        """混入盲搜級大範圍樣本（座標可達數千 pulse），擬合結果必須跟
+        完全不加這些樣本時一模一樣——不是「差不多」，是真的被濾掉。"""
+        ctrl = FakeCtrl(axes=("X",))
+        scanner, _ = make_scanner(lambda: (True, 0.0), ctrl=ctrl)
+        scanner.active_axes = ["X"]
+
+        sigma_true = 30.0
+        xs_clean = [-15, -12, -8, -5, -2, 0, 2, 5, 8, 12, 15]
+        clean_samples = [_sample({"X": x}, _true_quadratic_db(x, sigma_true)) for x in xs_clean]
+        pollution = [_sample({"X": x}, 999.0) for x in (-5000, -1000, 1000, 5000)]
+
+        scanner.samples = clean_samples + pollution
+        scanner._diagnose_residual_curvature()
+        with_pollution = scanner.residual_diagnostics.get("X")
+
+        scanner2, _ = make_scanner(lambda: (True, 0.0), ctrl=ctrl)
+        scanner2.active_axes = ["X"]
+        scanner2.samples = list(clean_samples)
+        scanner2._diagnose_residual_curvature()
+        without_pollution = scanner2.residual_diagnostics.get("X")
+
+        assert with_pollution is not None
+        assert without_pollution is not None
+        assert with_pollution["sigma_pulse"] == pytest.approx(without_pollution["sigma_pulse"], abs=1e-9)
+        assert with_pollution["sigma_pulse"] == pytest.approx(sigma_true, rel=1e-6)
+
+    def test_single_axis_selection_self_window_is_still_enforced(self):
+        """只選 1 軸搜尋時 other_axes 是空清單——那層窗口檢查形同虛設，
+        被擬合軸自己的窗口限制才是唯一防線。用刻意設計成「若沒有這層
+        自身窗口限制、擬合會被拉走」的污染樣本驗證它真的有作用。"""
+        ctrl = FakeCtrl(axes=("X",))
+        scanner, _ = make_scanner(lambda: (True, 0.0), ctrl=ctrl)
+        scanner.active_axes = ["X"]  # 只選 1 軸
+
+        sigma_true = 30.0
+        xs_clean = [-15, -12, -8, -5, -2, 0, 2, 5, 8, 12, 15]
+        clean_samples = [_sample({"X": x}, _true_quadratic_db(x, sigma_true)) for x in xs_clean]
+        # 座標遠超過窗口（tol = step_min(2) x REOPEN_STEP_MULT(8) = 16），
+        # 功率刻意設得比乾淨樣本都高，若自身窗口沒發揮作用，這幾點會
+        # 主導最小平方擬合，讓 sigma 估計完全跑掉。
+        pollution = [_sample({"X": x}, -1.0) for x in (200, -200, 400, -400)]
+        scanner.samples = clean_samples + pollution
+
+        scanner._diagnose_residual_curvature()
+        diag = scanner.residual_diagnostics.get("X")
+        assert diag is not None
+        assert diag["sigma_pulse"] == pytest.approx(sigma_true, rel=1e-6)
+
+    def test_other_axis_outside_window_is_excluded(self):
+        """多軸情境：即使被擬合軸自己的座標在窗口內，只要另一軸偏離最終
+        收斂位置超過 tol，這筆樣本也要被排除。"""
+        ctrl = FakeCtrl(axes=("X", "Y"))
+        scanner, _ = make_scanner(lambda: (True, 0.0), ctrl=ctrl)
+        scanner.active_axes = ["X", "Y"]
+
+        sigma_true = 30.0
+        xs_clean = [-15, -12, -8, -5, -2, 0, 2, 5, 8, 12, 15]
+        clean_samples = [
+            _sample({"X": x, "Y": 0.0}, _true_quadratic_db(x, sigma_true)) for x in xs_clean
+        ]
+        # X 座標在窗口內，但 Y 偏移遠超過 tol——應該被排除，不能拿來擬合 X。
+        contaminated = [_sample({"X": x, "Y": 500.0}, -1.0) for x in (-10, -3, 3, 10)]
+        scanner.samples = clean_samples + contaminated
+
+        scanner._diagnose_residual_curvature()
+        diag = scanner.residual_diagnostics.get("X")
+        assert diag is not None
+        assert diag["sigma_pulse"] == pytest.approx(sigma_true, rel=1e-6)
+        assert diag["n_samples"] == len(xs_clean)  # 污染樣本確實一筆都沒進來
+
+
+class TestResidualDiagnosticsEdgeCases:
+    def test_insufficient_samples_skips_axis_without_exception(self):
+        ctrl = FakeCtrl(axes=("X",))
+        scanner, _ = make_scanner(lambda: (True, 0.0), ctrl=ctrl)
+        scanner.active_axes = ["X"]
+        scanner.samples = [_sample({"X": x}, _true_quadratic_db(x, 30.0)) for x in (-5, 0, 5)]
+        scanner._diagnose_residual_curvature()  # 不應拋例外
+        assert "X" not in scanner.residual_diagnostics
+
+    def test_one_sided_samples_skips_axis(self):
+        """窗口內只有單側樣本（min(x) 與 max(x) 沒有跨過 0）時不可靠外插。"""
+        ctrl = FakeCtrl(axes=("X",))
+        scanner, _ = make_scanner(lambda: (True, 0.0), ctrl=ctrl)
+        scanner.active_axes = ["X"]
+        scanner.samples = [_sample({"X": x}, _true_quadratic_db(x, 30.0)) for x in (2, 5, 8, 12)]
+        scanner._diagnose_residual_curvature()
+        assert "X" not in scanner.residual_diagnostics
+
+    def test_upward_opening_fit_skips_axis(self):
+        """擬合開口非向下（a>=0，物理上不合理，例如雜訊主導）要跳過。"""
+        ctrl = FakeCtrl(axes=("X",))
+        scanner, _ = make_scanner(lambda: (True, 0.0), ctrl=ctrl)
+        scanner.active_axes = ["X"]
+        xs = [-15, -12, -8, -5, -2, 0, 2, 5, 8, 12, 15]
+        scanner.samples = [_sample({"X": x}, 0.001 * x * x) for x in xs]  # 開口向上
+        scanner._diagnose_residual_curvature()
+        assert "X" not in scanner.residual_diagnostics
+
+    def test_failure_never_raises_and_is_logged(self):
+        """run() 把整段包在 try/except 裡是防禦措施，但方法本身遇到擬合
+        失敗時也應該乾淨地跳過並記 log，不是靠外層 try/except 兜底。"""
+        ctrl = FakeCtrl(axes=("X",))
+        logs = []
+        scanner, _ = make_scanner(lambda: (True, 0.0), ctrl=ctrl, progress_cb=lambda m: logs.append(m))
+        scanner.active_axes = ["X"]
+        scanner.samples = [_sample({"X": x}, _true_quadratic_db(x, 30.0)) for x in (2, 5, 8, 12)]
+        scanner._diagnose_residual_curvature()
+        assert any("略過" in m for m in logs)
+
+
+# =============================================================================
+# 七、收尾曲率擬合微調 `run_stage_curvature_refine()`
+# =============================================================================
+def make_gaussian_query(ctrl, axis="X", center=0.0, sigma_true=50.0, peak_db=-10.0,
+                         noise_pattern=None):
+    """dB 域高斯耦光曲線的合成功率函式，疊上決定性、有界的擾動樣式
+    （比照 make_flat_power_query 的既有寫法，避免真隨機造成測試偶發性）。
+    """
+    pattern = noise_pattern if noise_pattern is not None else _FLAT_NOISE_PATTERN
+    idx = {"i": -1}
+
+    def q():
+        idx["i"] += 1
+        x = ctrl.positions_machine[axis]
+        p = _true_quadratic_db(x - center, sigma_true, peak_db)
+        return True, p + pattern[idx["i"] % len(pattern)]
+
+    return q
+
+
+class TestCurvatureRefineConvergence:
+    def test_reduces_residual_compared_to_stage1_and_3_alone(self):
+        """合成高斯場下，開啟曲率微調要比只跑階段一＋三的殘差更小。
+
+        用固定種子的偽亂數（非本檔慣用的決定性擾動樣式）疊加雜訊，取多組
+        種子的平均殘差比較——單一種子偶爾會被階段一的三點內插直接命中
+        （見 scratchpad 的原型腳本），平均才能穩定看出曲率微調的效果，
+        避免測試對單一種子的巧合命中敏感。
+        """
+        import random
+
+        def run_once(enable_curvature, seed, center, sigma_true):
+            ctrl = FakeCtrl(axes=("X",))
+            rng = random.Random(seed)
+
+            def q():
+                x = ctrl.positions_machine["X"]
+                p = _true_quadratic_db(x - center, sigma_true)
+                return True, p + rng.gauss(0, 0.05)
+
+            scanner, _ = make_scanner(q, ctrl=ctrl, selected_axes=["X"])
+            scanner.run(initial_step={"X": 40}, enable_curvature_fit=enable_curvature, scan_dir=None)
+            return abs(ctrl.positions_machine["X"] - center)
+
+        center, sigma_true = 23.0, 60.0
+        seeds = range(12)
+        residuals_off = [run_once(False, s, center, sigma_true) for s in seeds]
+        residuals_on = [run_once(True, s, center, sigma_true) for s in seeds]
+
+        mean_off = sum(residuals_off) / len(residuals_off)
+        mean_on = sum(residuals_on) / len(residuals_on)
+        # 實測（見 scratchpad 原型腳本）：約 2.05 → 0.5 pulse，取一半當保守門檻。
+        assert mean_on < mean_off * 0.7, (
+            f"曲率微調沒有明顯改善平均殘差：off={mean_off:.3f}, on={mean_on:.3f}"
+        )
+
+
+class TestCurvatureRefinePureNoise:
+    def test_pure_noise_field_moves_nothing(self):
+        """最重要的一條：完全沒有真實訊號峰值時，曲率微調一步都不該移動
+        （訊噪比門檻必須擋下所有由雜訊算出來的「修正量」）。"""
+        ctrl = FakeCtrl(axes=("X",))
+        logs = []
+        scanner, _ = make_scanner(
+            make_flat_power_query(), ctrl=ctrl, selected_axes=["X"],
+            progress_cb=lambda m: logs.append(m),
+        )
+        scanner.active_axes = ["X"]
+        scanner.calibrate_noise()
+        assert scanner._noise_sigma is not None and scanner._noise_sigma > 0
+
+        before = dict(ctrl.positions_machine)
+        scanner.run_stage_curvature_refine({"X": 20})
+        after = dict(ctrl.positions_machine)
+        assert after == before  # 淨位移為 0：探測用的往返移動即使發生也必須完全退回
+        # 確認真的跑到探測／門檻判斷這一步，而不是在更早期就因為某個
+        # 無關原因（例如 active_axes 是空的）而整個方法直接 no-op。
+        assert any("曲率微調" in m for m in logs)
+
+
+class TestCurvatureRefineLowValidReadings:
+    def test_mostly_invalid_readings_skip_axis_without_applying_correction(self):
+        """每組只有 1~2 筆有效讀值時，不可以假裝有 m=4 筆去算門檻——
+        必須整軸放棄，不套用任何修正。"""
+        ctrl = FakeCtrl(axes=("X",))
+        calls = {"n": 0}
+
+        def q():
+            calls["n"] += 1
+            x = ctrl.positions_machine["X"]
+            if calls["n"] % 5 == 0:  # 每 5 次只有 1 次讀得到
+                return True, _true_quadratic_db(x, 30.0, peak_db=-10.0)
+            return False, 0.0
+
+        scanner, _ = make_scanner(q, ctrl=ctrl, selected_axes=["X"])
+        scanner.active_axes = ["X"]
+        scanner.calibrate_noise()
+
+        before = dict(ctrl.positions_machine)
+        scanner.run_stage_curvature_refine({"X": 20})
+        after = dict(ctrl.positions_machine)
+        assert after == before
+
+
+class TestCurvatureRefineZeroSigma:
+    def test_zero_noise_sigma_skips_entire_stage(self):
+        """_noise_sigma == 0.0（校準時有效讀值太少，見 calibrate_noise）
+        時要整段跳過，不能讓門檻退化成 0 而失去防護。"""
+        ctrl = FakeCtrl(axes=("X",))
+
+        def q():
+            x = ctrl.positions_machine["X"]
+            return True, -50.0 + 1.0 * x  # 明顯梯度、完全無雜訊
+
+        scanner, _ = make_scanner(q, ctrl=ctrl, selected_axes=["X"])
+        scanner.active_axes = ["X"]
+        scanner._noise_sigma = 0.0  # 模擬校準時只拿到 <2 筆有效讀值的情況
+
+        before = dict(ctrl.positions_machine)
+        scanner.run_stage_curvature_refine({"X": 20})
+        after = dict(ctrl.positions_machine)
+        assert after == before
+
+
+class TestCurvatureRefineLimitHit:
+    def test_known_travel_bound_gives_clean_skip_without_any_move(self):
+        """單側探測撞限位（模擬這一輪稍早已經撞過一次、_travel_bounds 已
+        記住行程邊界）——_move_relative() 會在送指令前就被 _targets_reachable()
+        擋下，一次都不會真的動，乾淨跳過該軸、不做單側外推。"""
+        ctrl = FakeCtrl(axes=("X",))
+        scanner, _ = make_scanner(make_peaked_power_query(ctrl, center=5.0), ctrl=ctrl,
+                                   selected_axes=["X"])
+        scanner.active_axes = ["X"]
+        scanner.calibrate_noise()
+        # 模擬「這一輪稍早已經撞過一次」留下的行程邊界：CW 側行程末端在 10。
+        scanner._travel_bounds["X"] = [None, 10.0]
+
+        before = dict(ctrl.positions_machine)
+        scanner.run_stage_curvature_refine({"X": 20})
+        after = dict(ctrl.positions_machine)
+        assert after == before
+        assert ctrl.move_log == []  # 一步都沒有真的送出去
+
+
+class TestCurvatureRefineAbortPropagates:
+    def test_check_abort_during_refine_raises_scan_abort(self):
+        """使用者中止／EMS 觸發時要讓 ScanAbort 原樣往外傳，不可以在這個
+        階段內部被吞掉——交給 run() 最外層的 except ScanAbort 收尾。"""
+        ctrl = FakeCtrl(axes=("X",))
+        scanner, _ = make_scanner(lambda: (True, -10.0), ctrl=ctrl, selected_axes=["X"])
+        scanner.active_axes = ["X"]
+        scanner.calibrate_noise()
+
+        state = {"n": 0}
+
+        def q():
+            state["n"] += 1
+            if state["n"] > 3:
+                ctrl.ems_active = True
+            x = ctrl.positions_machine["X"]
+            return True, _true_quadratic_db(x, 30.0, peak_db=-10.0)
+
+        scanner._power_query = q
+        with pytest.raises(fs.ScanAbort, match="EMS"):
+            scanner.run_stage_curvature_refine({"X": 20})
+
+
+class TestCurvatureRefineMoveFailureRobustness:
+    """
+    掃過每一個可能的移動失敗時機（去程/回程/最終正負探測/套用修正），
+    確認 `_move_relative()` 的回傳值在每一處都被檢查、失敗時乾淨放棄該軸，
+    不會讓例外往外炸或讓內部狀態（座標、樣本）進入不一致的狀態。
+    """
+
+    @pytest.mark.parametrize("fail_from_call", [1, 2, 3, 4, 5, 6, 7])
+    def test_move_failure_at_any_point_is_handled_gracefully(self, fail_from_call):
+        class FakeCtrlFailFrom(FakeCtrl):
+            """從第 fail_from_call 次 scan_move_step 呼叫開始，所有移動都
+            失敗（座標不變，模擬逾時／通訊失聯，不是撞限位——query_status
+            仍回報 "Stop"）。"""
+
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self._move_calls = 0
+
+            def scan_move_step(self, *args, **kwargs):
+                self._move_calls += 1
+                if self._move_calls >= fail_from_call:
+                    return False
+                return super().scan_move_step(*args, **kwargs)
+
+        ctrl = FakeCtrlFailFrom(axes=("X",))
+        scanner, _ = make_scanner(make_peaked_power_query(ctrl, center=17.0, amp=-10.0, k=0.0012),
+                                   ctrl=ctrl, selected_axes=["X"])
+        scanner.active_axes = ["X"]
+        scanner.calibrate_noise()
+
+        # 不應該拋出任何例外（ScanAbort 以外，此情境不涉及中止）。
+        scanner.run_stage_curvature_refine({"X": 20})
+        pos = ctrl.positions_machine["X"]
+        assert isinstance(pos, float) and pos == pos  # 沒有變成 NaN，狀態一致

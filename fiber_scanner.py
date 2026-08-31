@@ -109,6 +109,20 @@ BLIND_MODES = ("off", "auto", "always")
 DEFAULT_BLIND_MODE = "off"
 GUI_DEFAULT_BLIND_MODE = "auto"
 
+# ---- 收尾曲率擬合微調（run_stage_curvature_refine）的預設值 ----
+# 2026-08-31 新增，同樣是起跳值不是校準值。動機：階段三只做 ±step_min
+# 的格點微擾，抓不到「比 step_min 大、但還沒被階段一步長掃過」的中間
+# 量級偏移；這個階段用遠大於 step_min 的探測距離對峰值做一次二次曲線
+# 擬合，直接算出偏移量、一次到位。
+DEFAULT_CURVATURE_DELTA_TARGET_DB = 1.5      # h 校正的目標跌落量（dB）
+DEFAULT_CURVATURE_DELTA_RANGE_DB = (0.5, 4.0)  # Δ 落在此範圍內才不重算 h
+# 訊噪比門檻：denom（=2p0-p_plus-p_minus）標準差的倍數，denom 必須顯著
+# 大於這個門檻才接受修正量——見 run_stage_curvature_refine 內的推導
+# 註解（denom 是三個獨立平均值的線性組合，Var(denom) 隨各組樣本數縮放，
+# 不是固定常數）。6σ 是刻意保守的選擇：這裡的修正量會被直接送去移動
+# 滑台，比階段三「量測後才接受」的守衛更需要在套用前就先擋掉雜訊。
+DEFAULT_CURVATURE_DENOM_SIGMA_MULT = 6.0
+
 
 def _norm_ppf(p: float) -> float:
     """
@@ -697,6 +711,15 @@ class FiberAlignmentScanner:
         self.algorithm: str = "coordinate_descent"
         self._powell_max_iterations: int = 200
         self.enable_stage2: bool = False
+        # 收尾曲率擬合微調（2026-08-31 新增，見 run_stage_curvature_refine）
+        # 是否啟用；run() 才會依呼叫端傳入的值覆寫，這裡先給預設值，理由
+        # 與上面 enable_stage2 相同。
+        self.enable_curvature_fit: bool = False
+        # 階段三結束後的殘差診斷結果（見 _diagnose_residual_curvature），
+        # {軸: {sigma_pulse/sigma_um/residual_pulse/residual_um/
+        # loss_db_from_vertex/n_samples/tol_pulse}}。run() 都還沒跑過、
+        # 或該軸擬合失敗而被跳過時維持空字典，不是每軸都保證有值。
+        self.residual_diagnostics: Dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # 對外控制
@@ -714,6 +737,7 @@ class FiberAlignmentScanner:
         scan_dir: Optional[Path] = None,
         algorithm: str = "coordinate_descent",
         powell_max_iterations: int = 200,
+        enable_curvature_fit: bool = False,
     ) -> Dict[str, float]:
         """
         完整跑三階段（階段二可選，按需啟用——見設計文件〈折衷方案〉）。
@@ -725,6 +749,11 @@ class FiberAlignmentScanner:
             階段一＋階段二的範圍（見該模組 docstring）。此時 `enable_stage2`
             會被忽略（只記一筆 log，不當成錯誤）。實驗性功能，未經真機驗證，
             見 FIBER_ALIGNMENT_SCAN_DESIGN.md〈第三輪〉。
+
+        `enable_curvature_fit`（預設關閉，見 `run_stage_curvature_refine`）：
+        在階段二之後、階段三之前，對每軸做一次遠大於 step_min 的二次曲線
+        擬合微調，抓階段三 ±step_min 格點抓不到的中間量級偏移。與
+        `algorithm` 正交——座標下降、Powell 兩條路徑都支援。
 
         完成、中止、或任何未預期例外都會在 finally 清掉 scanning_active
         並寫出已收集的樣本（persist_samples）——中止時的資料是唯一能
@@ -757,9 +786,11 @@ class FiberAlignmentScanner:
         self.algorithm = algorithm if algorithm in ("coordinate_descent", "powell") else "coordinate_descent"
         self._powell_max_iterations = max(1, int(powell_max_iterations))
         self.enable_stage2 = enable_stage2
+        self.enable_curvature_fit = enable_curvature_fit
         self.last_abort_reason = None  # 重置：這個實例若被重複呼叫 run()，不能沿用上一輪的中止原因
         self.last_xlsx_path = None  # 同上，不能讓 GUI 指到上一輪的報表
         self.last_abort_kind = None
+        self.residual_diagnostics = {}  # 同上，不能沿用上一輪的殘差診斷結果
         self._signal_confirmed = False  # 同理：量程鎖定的一次性旗標也要重置
         # 行程邊界是「這一輪實測到的」，不跨輪沿用：兩輪之間可能做過原點
         # 復歸，POS 是相對暫存器（見 docs/hardware.md），復歸後同一個機械
@@ -850,7 +881,23 @@ class FiberAlignmentScanner:
                     ax: self.step_min * REOPEN_STEP_MULT for ax in axes
                 }
                 self.run_stage2(radius, axis_scale=axis_scale)
+            if self.enable_curvature_fit:
+                # 順序刻意排在階段二之後、階段三之前：這裡的探測距離遠大於
+                # 階段三 ±step_min 的微擾，順序反過來會讓階段三的細收尾被
+                # 這裡的粗修正覆蓋掉。ScanAbort／NoSignalAbort 不在這裡攔截，
+                # 直接往外傳給本函式最外層的 except ScanAbort 收尾。
+                self.run_stage_curvature_refine(initial_step)
             self.run_stage3()
+            # 殘差診斷刻意排在階段三**之後**：要讀的是真正的最終收斂位置，
+            # 且它會吃到曲率微調探測時留下的樣本——這是可接受的，取樣窗口
+            # 限制（見 _diagnose_residual_curvature）已經處理了這個情況。
+            # 這一步純粹是事後統計、不影響搜尋結果，任何失敗都只能記 log，
+            # 不可以中止 run() 或汙染 last_abort_reason／last_abort_kind
+            # （持久化在 finally 裡緊接在後，例外炸穿會蓋掉正常完成的回傳）。
+            try:
+                self._diagnose_residual_curvature()
+            except Exception as e:
+                self._log(f"殘差診斷失敗（不影響搜尋結果，已忽略）: {e}")
             completed = True
         except ScanAbort as e:
             self.last_abort_reason = str(e)
@@ -1795,6 +1842,375 @@ class FiberAlignmentScanner:
         return dict(self.ctrl.positions_machine)
 
     # ------------------------------------------------------------------
+    # 收尾曲率擬合微調（預設關閉，見 run() 的 enable_curvature_fit 參數）
+    # ------------------------------------------------------------------
+    def run_stage_curvature_refine(self, initial_step: Dict[str, int]) -> Dict[str, float]:
+        """
+        對每一軸用「中心 + 正負探測」的三點量測擬合局部二次曲線，直接
+        算出峰值偏移量並一次到位——取代階段三 ±step_min 的逐格微擾去
+        抓「比 step_min 大、但還沒被階段一步長掃過」的中間量級偏移。
+
+        呼叫順序（見 run() 的呼叫處）：階段二之後、階段三之前。這裡的
+        探測距離（見 `_curvature_refine_axis` 的 h）遠大於階段三
+        ±step_min 的微擾，順序反過來會讓階段三的細收尾被這裡的粗修正
+        覆蓋掉。
+
+        逐軸流程（細節見 `_curvature_refine_axis`）：
+          1. 中心點量 4 次取平均當 p0。
+          2. 用起跳距離 h 探測正方向、算跌落量 Δ，必要時最多重算兩次
+             h（目標讓 Δ 落在 [0.5, 4.0] dB）。
+          3. 用最終的 h，正負方向各量 4 次取平均。
+          4. 三點拋物線內插算出偏移量 x_hat，通過訊噪比與偏移量門檻
+             （見下方接受條件）才真的移動。
+
+        🔴 第 8 步的「移動後再量一次確認沒有變差」**只能擋住「移動後
+        明顯變差」，防不住「移動後只是普通地更好一點」**——因為改善量
+        本來就常常低於雜訊底限，這正是這個階段存在的理由（否則階段三
+        的量測後接受判準早就夠用）。真正的把關是移動前的訊噪比門檻
+        （denom 必須顯著大於 σ_denom 的倍數），不要把這兩層誤認為
+        同等強度的雙重保險。
+
+        任何 `ScanAbort`／`NoSignalAbort`（使用者中止、EMS、`_check_abort()`
+        觸發）都不在這裡攔截，直接沿呼叫鏈往外傳給 `run()` 最外層的
+        `except ScanAbort` 收尾——比照 `_move_multi_axis()` 等既有寫法。
+        """
+        self._check_abort()
+        axes = self._active_axes()
+        self._log(f"收尾曲率微調開始，可動軸：{axes}")
+        for ax in axes:
+            self._check_abort()
+            self._curvature_refine_axis(ax, initial_step)
+            self._check_abort()
+        return dict(self.ctrl.positions_machine)
+
+    def _curvature_refine_axis(self, axis: str, initial_step: Dict[str, int]) -> None:
+        """單軸曲率微調本體，見 `run_stage_curvature_refine()` 的流程說明。"""
+        m = 4
+        p0, n0 = self._measure_average(m)
+        if n0 == 0:
+            self._log(f"曲率微調：軸 {axis} 中心點 {m} 次量測全部無效，放棄此軸")
+            return
+
+        # ── 探測距離 h 的起跳與尺度依據 ──
+        if self.algorithm == "powell":
+            # Powell 不使用 initial_step 決定尺度——GUI 上這個欄位在選
+            # Powell 時會被灰階（見 run() docstring），initial_step 對它
+            # 沒有意義。延遲 import 避免與 fiber_scanner_advanced.py 對
+            # 本模組的 import 形成循環相依，比照 _run_primary_algorithm()
+            # 的既有寫法；改用 Powell 自己的容差常數乘上 REOPEN_STEP_MULT
+            # 當同一個量級的替代依據。
+            import fiber_scanner_advanced as _fsa
+            h_scale_hint = _fsa.DEFAULT_XTOL_PULSE * REOPEN_STEP_MULT
+        else:
+            h_scale_hint = initial_step.get(axis, self.step_min * 8)
+        h_scale_hint = int(round(h_scale_hint))
+        h = max(8 * self.step_min, h_scale_hint)
+        lo_bound = 8 * self.step_min
+        # initial_step[axis] 過小時 h_scale_hint*4 可能小於 lo_bound，
+        # 夾制前先跟 lo_bound 取大，避免後面把 h 夾出一個空區間。
+        hi_bound = max(h_scale_hint * 4, lo_bound)
+
+        def _probe_plus(h_val: int) -> Optional[float]:
+            """探測 +h_val、量一次、退回 -h_val。回傳功率；None 代表整軸
+            要放棄（原因已經記過 log）——涵蓋去程失敗（不做單側外推）、
+            回程失敗（滑台停在非預期位置，不假裝退回成功）、量測失敗
+            三種情況。"""
+            moved_fwd = self._move_relative(axis, h_val)
+            if not moved_fwd:
+                self._log(
+                    f"曲率微調：軸 {axis} 正方向探測 {h_val} pulse 失敗"
+                    "（撞限位/逾時），放棄此軸（不做單側外推）"
+                )
+                return None
+            s_plus = self._measure_here()
+            power = s_plus.power if s_plus.ok else None
+            moved_back = self._move_relative(axis, -h_val)
+            if not moved_back:
+                here = self.ctrl.positions_machine.get(axis)
+                here_desc = f"{here:.0f}" if here is not None else "未知"
+                self._log(
+                    f"⚠ 曲率微調：軸 {axis} 探測後退回 {-h_val:+d} pulse 失敗，"
+                    f"滑台停在 {here_desc} pulse（可能撞到另一側限位），放棄此軸"
+                )
+                return None
+            if power is None:
+                self._log(f"曲率微調：軸 {axis} 正方向探測量測失敗，放棄此軸")
+                return None
+            return power
+
+        p_plus = _probe_plus(h)
+        if p_plus is None:
+            return
+        delta_db = p0 - p_plus
+
+        lo_target, hi_target = DEFAULT_CURVATURE_DELTA_RANGE_DB
+        for _ in range(2):  # 最多重算兩次
+            if lo_target <= delta_db <= hi_target:
+                break
+            if delta_db <= 0:
+                # 正方向完全沒有跌落（可能已經站在峰值上，或雜訊讓它看起
+                # 來反而更好）：sqrt(目標/Δ) 對非正值沒有意義，直接放大到
+                # 上限再試一次，真正的把關留給後面的訊噪比門檻。
+                new_h = hi_bound
+            else:
+                new_h = h * math.sqrt(DEFAULT_CURVATURE_DELTA_TARGET_DB / delta_db)
+            new_h = int(round(max(lo_bound, min(hi_bound, new_h))))
+            if new_h == h:
+                break  # 已經夾在邊界，重算沒有意義
+            h = new_h
+            here = self.ctrl.positions_machine.get(axis)
+            if here is None:
+                self._log(f"曲率微調：軸 {axis} 讀不到目前座標，放棄此軸")
+                return
+            ok_pos, _ = self._targets_reachable({axis: here + h})
+            ok_neg, _ = self._targets_reachable({axis: here - h})
+            if not (ok_pos and ok_neg):
+                self._log(f"曲率微調：軸 {axis} 重算 h={h} 後有一側超出已知行程，放棄此軸")
+                return
+            p_plus = _probe_plus(h)
+            if p_plus is None:
+                return
+            delta_db = p0 - p_plus
+
+        # ── 用最終定案的 h，正負方向各量 m 次取平均 ──
+        moved_fwd = self._move_relative(axis, h)
+        if not moved_fwd:
+            self._log(f"曲率微調：軸 {axis} 最終正方向探測 {h} pulse 失敗，放棄此軸")
+            return
+        p_plus_avg, n_plus = self._measure_average(m)
+        moved_back = self._move_relative(axis, -h)
+        if not moved_back:
+            here = self.ctrl.positions_machine.get(axis)
+            here_desc = f"{here:.0f}" if here is not None else "未知"
+            self._log(
+                f"⚠ 曲率微調：軸 {axis} 最終正方向退回失敗，滑台停在 {here_desc} pulse，放棄此軸"
+            )
+            return
+
+        moved_neg = self._move_relative(axis, -h)
+        if not moved_neg:
+            self._log(f"曲率微調：軸 {axis} 最終負方向探測 {h} pulse 失敗，放棄此軸")
+            return
+        p_minus_avg, n_minus = self._measure_average(m)
+        moved_back2 = self._move_relative(axis, h)
+        if not moved_back2:
+            here = self.ctrl.positions_machine.get(axis)
+            here_desc = f"{here:.0f}" if here is not None else "未知"
+            self._log(
+                f"⚠ 曲率微調：軸 {axis} 最終負方向退回失敗，滑台停在 {here_desc} pulse，放棄此軸"
+            )
+            return
+
+        # ── 接受條件：全部成立才移動，任一不成立就放棄該軸 ──
+        if n0 < 3 or n_plus < 3 or n_minus < 3:
+            self._log(
+                f"曲率微調：軸 {axis} 有效讀值筆數不足"
+                f"（n0={n0}, n+={n_plus}, n-={n_minus}，均需 ≥3），放棄套用修正"
+            )
+            return
+        if self._noise_sigma is None or self._noise_sigma <= 0:
+            self._log(f"曲率微調：軸 {axis} 雜訊尚未校準或 σ=0，無法建立訊噪比門檻，放棄套用修正")
+            return
+        if p_plus_avg is None or p_minus_avg is None:
+            self._log(f"曲率微調：軸 {axis} 正負探測有一側完全無有效讀值，放棄套用修正")
+            return
+
+        denom = 2 * p0 - p_plus_avg - p_minus_avg
+        # denom 是三個獨立平均值的線性組合：
+        #   Var(denom) = 4*Var(mean(p0)) + Var(mean(p_plus)) + Var(mean(p_minus))
+        #              = σ² * (4/n0 + 1/n_plus + 1/n_minus)
+        # p0/p_plus/p_minus 各自是 n0/n_plus/n_minus 筆獨立量測的平均值，
+        # 三組量測彼此獨立（不同時間點、不同座標）才能直接加總變異數，
+        # 不需要共變異數項。門檻隨筆數縮放：筆數越少，σ_denom 越大，
+        # 需要越大的 denom 才能通過——不是固定常數。
+        sigma_denom = self._noise_sigma * math.sqrt(4.0 / n0 + 1.0 / n_plus + 1.0 / n_minus)
+        if denom <= DEFAULT_CURVATURE_DENOM_SIGMA_MULT * sigma_denom:
+            self._log(
+                f"曲率微調：軸 {axis} denom={denom:.5f} 未超過訊噪比門檻 "
+                f"{DEFAULT_CURVATURE_DENOM_SIGMA_MULT}×σ_denom={sigma_denom:.5f}，"
+                "判定曲率訊號淹沒在雜訊裡，放棄套用修正"
+            )
+            return
+
+        x_hat = (h / 2.0) * (p_plus_avg - p_minus_avg) / denom
+        if abs(x_hat) > h / 2.0:
+            self._log(
+                f"曲率微調：軸 {axis} 推算偏移 {x_hat:.1f} pulse 超出 ±h/2（h={h}），放棄套用修正"
+            )
+            return
+        move_amount = round(x_hat)
+        if abs(move_amount) < self.step_min:
+            self._log(
+                f"曲率微調：軸 {axis} 推算偏移 {move_amount} pulse 小於 step_min"
+                f"（{self.step_min}），判定修正量沒有意義，放棄套用修正"
+            )
+            return
+
+        # ── 移動＋驗收（只能擋「明顯變差」，見本方法 docstring）──
+        moved = self._move_relative(axis, move_amount)
+        if not moved:
+            self._log(f"曲率微調：軸 {axis} 套用修正 {move_amount:+d} pulse 失敗，放棄")
+            return
+        s_new = self._measure_here()
+        p_new = s_new.power if s_new.ok else None
+        if p_new is not None and p_new >= p0 - self._noise_floor():
+            self._log(
+                f"曲率微調：軸 {axis} 套用修正 {move_amount:+d} pulse，"
+                f"功率 {p0:.4f} → {p_new:.4f} dBm"
+            )
+            return
+        # 沒過「沒有明顯變差」這一關（或量測失敗），退回移動前的座標。
+        moved_back3 = self._move_relative(axis, -move_amount)
+        if not moved_back3:
+            here = self.ctrl.positions_machine.get(axis)
+            here_desc = f"{here:.0f}" if here is not None else "未知"
+            self._log(
+                f"⚠ 曲率微調：軸 {axis} 修正效果不佳、退回移動也失敗，滑台停在 {here_desc} pulse"
+            )
+        else:
+            self._log(
+                f"曲率微調：軸 {axis} 套用修正後功率未達 p0-noise_floor 門檻"
+                f"（p_new={p_new}），已退回原位置"
+            )
+
+    # ------------------------------------------------------------------
+    # 殘差診斷（階段三收尾後的事後統計，不移動、不量測）
+    # ------------------------------------------------------------------
+    def _diagnose_residual_curvature(self) -> None:
+        """
+        用已收集的 `self.samples` 對每一軸做一次 dB 域二次曲線最小平方擬合，
+        估計該軸的局部曲率（等效高斯 σ）、目前收斂點離擬合頂點的殘留距離，
+        以及對應的預估耦光損失。純粹的事後統計，全程不呼叫
+        `_move_relative()`、不改變任何 `pos`，不需要 `_check_abort()`。
+
+        呼叫端（`run()`）把整段包在 try/except Exception 裡：這裡的失敗
+        只代表「這一軸沒有足夠乾淨的樣本可以擬合」，不代表搜尋出了問題，
+        不可以中止 run() 或汙染 last_abort_reason／last_abort_kind。
+
+        🔴 取樣窗口是這個方法唯一的正確性關鍵。階段零盲搜留下的樣本
+        x 座標可以達到 `blind_max_radius`（使用者現行設定常見值 10000
+        pulse），混進來會讓二次擬合被遠處的雜訊點主導，估出無意義的
+        σ／殘留距離／預估損失。因此每一軸擬合時：
+          - 其他軸的座標要落在「最終收斂位置 ± tol」的窗口內
+            （`tol = step_min × REOPEN_STEP_MULT`）；
+          - 被擬合的那一軸**自己**的座標也要落在同一個 tol 窗口內——
+            只選 1 軸搜尋時 `other_axes` 是空清單，上面那條窗口檢查形同
+            虛設，這一層自身窗口限制正是補救。
+        窗口內還要求兩側都有樣本（`min(x) < 0 < max(x)`）才擬合，樣本數
+        不足（<4）也跳過，兩者都只記 log、不拋例外。
+
+        擬合前把 x 除以窗口尺度 tol 做無因次化再解方程式，避免 x 到 1e4
+        量級時設計矩陣條件數暴增（`_solve_linear_system` 是一般高斯消去，
+        沒有為病態矩陣做特別處理）；解完再把係數換算回原始 pulse 單位。
+        重用階段二已有的 `_weighted_least_squares`（權重全部給 1，等同
+        一般最小平方），不重新造一套線性代數工具。
+
+        從擬合出的二次項係數 a（pulse 單位）反推等效 σ：
+        `a = -4.343/(2σ²)`（dB/pulse²，a<0 才是開口向下、物理上合理），
+        `σ = sqrt(4.343/(2|a|))`；a>=0 視為擬合失敗，記 log 跳過。
+
+        殘留距離 = 目前收斂點到擬合頂點 `-b/(2a)` 的距離；超出窗口一半
+        就判定外插不可信，略過該軸（比照曲率微調自己的 `abs(x_hat)>h/2`
+        守衛邏輯）。對應的預估耦光損失 `loss_db = a·residual²` 是精確
+        等式（不是近似）：對 `y=ax²+bx+c`，`P(0)-P(x_vertex)=b²/(4a)=
+        a·x_vertex²`。a<0 時這個值本身是負的，代表「目前收斂點比擬合
+        頂點低多少 dB」——寫進 JSON／xlsx 時用絕對值＋精確欄名
+        （「距擬合頂點的 dB 差」），避免被誤讀成增益。
+        """
+        if not self.active_axes:
+            return
+        final_pos = dict(self.ctrl.positions_machine)
+        tol = self.step_min * REOPEN_STEP_MULT
+        diagnostics: Dict[str, dict] = {}
+
+        for ax in self.active_axes:
+            if ax not in final_pos:
+                continue
+            other_axes = [a for a in self.active_axes if a != ax]
+            xs: List[float] = []
+            ys: List[float] = []
+            for s in self.samples:
+                if not (s.ok and s.power is not None):
+                    continue
+                if ax not in s.coords:
+                    continue
+                x_self = s.coords[ax] - final_pos[ax]
+                if abs(x_self) > tol:
+                    continue
+                in_window = True
+                for a in other_axes:
+                    base = final_pos.get(a)
+                    if base is None:
+                        continue
+                    if abs(s.coords.get(a, base) - base) > tol:
+                        in_window = False
+                        break
+                if not in_window:
+                    continue
+                xs.append(x_self)
+                ys.append(s.power)
+
+            if len(xs) < 4:
+                self._log(f"殘差診斷：軸 {ax} 窗口內可用樣本只有 {len(xs)} 筆（需要 ≥4），略過")
+                continue
+            if not (min(xs) < 0 < max(xs)):
+                self._log(
+                    f"殘差診斷：軸 {ax} 窗口內樣本只在單側"
+                    f"（x 範圍 [{min(xs):.1f}, {max(xs):.1f}] pulse），無法可靠擬合頂點，略過"
+                )
+                continue
+
+            xn = [x / tol for x in xs]  # 無因次化，避免設計矩陣病態
+            rows = [[1.0, x, x * x] for x in xn]
+            try:
+                beta = _weighted_least_squares(rows, ys, [1.0] * len(ys))
+            except ValueError as e:
+                self._log(f"殘差診斷：軸 {ax} 二次擬合矩陣奇異（{e}），略過")
+                continue
+
+            c_norm, b_norm, a_norm = beta
+            # 換算回原始 pulse 單位：y = a_norm*(x/tol)^2 + b_norm*(x/tol) + c_norm
+            #                       = (a_norm/tol^2)*x^2 + (b_norm/tol)*x + c_norm
+            a_pulse = a_norm / (tol * tol)
+            b_pulse = b_norm / tol
+            if a_pulse >= 0:
+                self._log(f"殘差診斷：軸 {ax} 擬合開口非向下（a={a_pulse:.3e}），判定不可信，略過")
+                continue
+
+            residual_pulse = -b_pulse / (2 * a_pulse)
+            if abs(residual_pulse) > tol / 2:
+                self._log(
+                    f"殘差診斷：軸 {ax} 頂點推算偏移 {residual_pulse:.1f} pulse 超出窗口"
+                    f"一半（{tol / 2:.1f} pulse），研判外插不可信，略過"
+                )
+                continue
+
+            sigma_pulse = math.sqrt(4.343 / (2 * abs(a_pulse)))
+            loss_db = a_pulse * residual_pulse * residual_pulse  # 精確等式，見本方法 docstring
+
+            sigma_um = self.ctrl.estimate_um(ax, sigma_pulse)
+            residual_um = self.ctrl.estimate_um(ax, residual_pulse)
+
+            diagnostics[ax] = {
+                "n_samples": len(xs),
+                "tol_pulse": tol,
+                "sigma_pulse": sigma_pulse,
+                "sigma_um": sigma_um,
+                "residual_pulse": residual_pulse,
+                "residual_um": residual_um,
+                "loss_db_from_vertex": loss_db,
+            }
+            self._log(
+                f"殘差診斷：軸 {ax} 估計 σ≈{sigma_pulse:.1f} pulse"
+                + (f"（{sigma_um:.3f} µm 估算）" if sigma_um is not None else "")
+                + f"，收斂點距擬合頂點 {residual_pulse:+.1f} pulse"
+                + (f"（{residual_um:+.3f} µm 估算）" if residual_um is not None else "")
+                + f"，距頂點 dB 差 {abs(loss_db):.4f}（{len(xs)} 筆樣本）"
+            )
+
+        self.residual_diagnostics = diagnostics
+
+    # ------------------------------------------------------------------
     # 動態調速
     # ------------------------------------------------------------------
     def _dynamic_speed(self, delta_pulse: int) -> Tuple[str, str, str, str]:
@@ -1897,6 +2313,26 @@ class FiberAlignmentScanner:
         s = self._measure_here()
         return s.power if s.ok else None
 
+    def _measure_average(self, m: int) -> Tuple[Optional[float], int]:
+        """
+        在目前位置量 m 次，回傳 (平均值或 None, 有效筆數)。
+
+        刻意回傳有效筆數而不是只回傳平均值——`run_stage_curvature_refine()`
+        的訊噪比守衛需要知道「這個平均值背後真的有幾筆讀值」：實機記錄過
+        同一時段有時讀到有效值、有時回傳 sentinel 的情況（見
+        docs/fiber-scan.md），只有 1、2 筆有效讀值卻假裝有 m 筆去算標準差
+        門檻，會讓守衛整個失效。
+        """
+        powers: List[float] = []
+        for _ in range(max(1, int(m))):
+            self._check_abort()
+            s = self._measure_here()
+            if s.ok and s.power is not None:
+                powers.append(s.power)
+        if not powers:
+            return None, 0
+        return sum(powers) / len(powers), len(powers)
+
     def _safe_power_query(self) -> Tuple[bool, float]:
         """
         功率查詢的例外邊界。背景執行緒不可讓例外逃逸（main_ai.py 既有
@@ -1912,13 +2348,19 @@ class FiberAlignmentScanner:
     # ------------------------------------------------------------------
     # 雜訊校準與收斂判準
     # ------------------------------------------------------------------
-    def calibrate_noise(self, n_samples: int = 5) -> float:
+    def calibrate_noise(self, n_samples: int = 12) -> float:
         """
         在目前位置重複量測 n_samples 次，估計功率讀值的標準差並快取。
 
         這是「功率雜訊底限」的具體實作，但實際標準差要接上真實
         HP 8153A 才有意義——對合成測試資料跑，量出來的就是合成雜訊
         的標準差，一樣能驗證判準邏輯本身是否正確。
+
+        ⚠ 2026-08-31 預設值從 5 調到 12：σ 估計的變異係數是
+        `1/√(2(n-1))`，n=5 時是 35%，n=12 時降到 21%——這個估計值直接
+        影響 `_noise_floor()`，牽動全部階段（含新增的曲率微調訊噪比
+        門檻，見 `run_stage_curvature_refine`）的判準穩定度。`run()`
+        內部的呼叫點都是空參數呼叫，會自動吃到這個新預設。
         """
         self._check_abort()
         powers = []
@@ -2116,6 +2558,11 @@ class FiberAlignmentScanner:
             "abort_reason": self.last_abort_reason,
             "abort_kind": self.last_abort_kind,
             "algorithm": self.algorithm,
+            # 階段三收尾後的殘差診斷（見 _diagnose_residual_curvature），
+            # 讓報表數字事後能從 JSON 復現，不是只寫進 xlsx。擬合失敗被
+            # 跳過的軸不會出現在這個字典裡，空字典代表整輪都沒有可信的
+            # 擬合結果（不代表沒跑過這一步）。
+            "residual_diagnostics": self.residual_diagnostics,
             "samples": [s.to_dict() for s in self.samples],
         }
         # 供之後真機校準時回推「這輪用了什麼參數」——見 _powell_param_snapshot
@@ -2171,6 +2618,22 @@ class FiberAlignmentScanner:
                 extra_meta["Powell max_iterations"] = p["max_iterations"]
             except Exception as e:
                 self._log(f"Powell 參數快照讀取失敗（不影響 Excel 報表其餘內容）: {e}")
+        if self.residual_diagnostics:
+            # 比照上面 Powell 參數快照的既有寫法：這是同一類「跨函式 dict
+            # 鍵約定，改名就 KeyError」的陷阱，任何失敗只記 log、略過這
+            # 幾欄，不可讓例外炸穿 finally（見 _diagnose_residual_curvature
+            # docstring）。
+            try:
+                for ax, diag in self.residual_diagnostics.items():
+                    extra_meta[f"{ax} 軸估計 σ (pulse)"] = round(diag["sigma_pulse"], 3)
+                    if diag.get("sigma_um") is not None:
+                        extra_meta[f"{ax} 軸估計 σ (µm 估算)"] = round(diag["sigma_um"], 4)
+                    extra_meta[f"{ax} 軸收斂點距擬合頂點 (pulse)"] = round(diag["residual_pulse"], 3)
+                    if diag.get("residual_um") is not None:
+                        extra_meta[f"{ax} 軸收斂點距擬合頂點 (µm 估算)"] = round(diag["residual_um"], 4)
+                    extra_meta[f"{ax} 軸距擬合頂點的 dB 差"] = round(abs(diag["loss_db_from_vertex"]), 4)
+            except Exception as e:
+                self._log(f"殘差診斷寫入 Excel 摘要失敗（不影響報表其餘內容）: {e}")
         try:
             export_samples_xlsx(
                 self.samples,
