@@ -10,6 +10,8 @@ Windows 桌面應用，用 Python + tkinter 控制 **駿河精機 SURUGA SEIKI D
 
 沒有 CI、沒有套件化結構——全部是可直接執行的頂層腳本。有十支回歸測試腳本（清單見下方〈常用指令〉，實際項數以 `pytest --collect-only -q` 為準），用假物件跑 GUI 邏輯。2026-08-18 起改寫成 **pytest 測試檔**（檔名不變，透過 `pytest.ini` 的 `python_files` 設定讓 pytest 認得 `verify_*.py` 這個既有命名），VS Code 的 Testing 面板可以個別發現、個別重跑每一項；`conftest.py` 放共用的 fixture（建 GUI、跑 Tk mainloop、monkeypatch `RECORDING_DIR`）。
 
+🔴 **[HANDOVER.md](HANDOVER.md) 記載目前分支狀態與已知未解事項，本檔不重複。** 內容包含：目前工作分支是否已合併回 `main`（截至最後一次更新尚未合併，且沒有「建議合併」的正式複審結論）、真機層級卡住的未解問題（例如 DATA1 分度值疑似未生效）、測試涵蓋缺口、以及 `FIBER_ALIGNMENT_SCAN_DESIGN.md` 與 Notion 報告相對於程式碼進度的落後程度。**該檔本身不會逐次同步更新**（不像本檔跟著每次改動同步），使用前先核對其編製日期是否明顯落後於 `git log`。
+
 ## 常用指令
 
 一律使用專案內的 venv 直譯器（全域 Python 沒有 pyserial / PyVISA）：
@@ -42,6 +44,7 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 | [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，功能與修正都加在這裡 |
 | [ds102_ctrl.py](ds102_ctrl.py) | 🔴 **不要跟下面的 `ds102_controller.py` 搞混**——這是 2026-08-17 從 main_ai.py 拆出來的 `DS102Controller` 本體（現役程式碼），main_ai.py 用 `from ds102_ctrl import DS102Controller, ...` 引入。細節見下方〈main_ai.py 架構〉 |
 | [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照（跟上面的 `ds102_ctrl.py` 是完全不同的兩個檔案）。已進版控，可作為對照，但**不要在此新增功能** |
+| [ui_theme.py](ui_theme.py) | **2026-08-31 新增**（模組化前置工作 3，見 [docs/modularization.md](docs/modularization.md)〈八〉）：十個 `CLR_*` 色票的單一來源，從 main_ai.py 抽出。依賴方向 `ds102_ctrl.py → ui_theme.py → main_ai.py`，🔴 **本檔只允許 import `ds102_ctrl._app_settings`，絕不可 import main_ai.py 或任何 GUI 模組**（那會讓這條鏈成環，抽出它的意義整個消失）。新增 UI 模組要用色票時一律 `from ui_theme import ...`，不要 `from main_ai import CLR_*`。⚠ `_app_settings` / `_app_setting_num` **沒有**跟著搬過來，它們留在 `ds102_ctrl.py`（`HISTORY_MAX` 需要），理由見該檔 docstring |
 | [main.py](main.py) | 廠商 SURUGA SEIKI 官方範例（模組層級全域變數風格），是**指令格式的權威來源**。main_ai.py 的每個指令組法都對應此檔某段程式。修改指令時先回頭比對 |
 | [test.py](test.py) | 無 GUI 的連線 / 狀態查詢腳本（含 `find_ds_port()` 自動搜埠）。名稱誤導——不是單元測試 |
 | [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
@@ -89,7 +92,7 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 - **`_search_axis_once()` 的方向探測必須帶雜訊門檻（`> p0 + noise_floor`）。** 用赤裸的 `>` 會讓純雜訊環境下兩側輪流「看起來比較好」，每次呼叫都移動、步長永遠不縮、階段一永遠不結束（實測 180 萬次移動仍在擺盪）。`STAGE1_MAX_PASSES_PER_STEP` 是保險絲不是調校參數。（fiber-scan）
 - **`POS 0` 只能在 `_confirm_stopped()` 通過後才寫。** 寫在飛行中等於把座標系原點偷偷改掉，且零警告。（homing）
 - **「非 Driving」不等於「已停好」**：`GO` 有約 96ms 的 Driving assert 延遲，等待函式一律要有位移證據。（homing）
-- **任何新增的「作業進行中」狀態，必須同步加進 `_update_stat_ui` 的按鈕鎖定判斷**，否則 100ms 後按鈕自己復活。（safety-fixes）
+- **任何新增的「長時間背景作業」，一律只在 `_register_long_ops()` 註冊一筆，不要自己去 `_update_stat_ui` / `_start_poller` / `_do_stop` / `_on_escape` / `_toggle_connect` / `_on_close` 手動接線。** 那六個位置 2026-08-31 起全部改走 `self._long_ops` 註冊表（`LongOperation` dataclass）。舊寫法要作者記得六個地方，實際上漏過三次（尋光按 Esc／■ Stop／中斷連線都攔不住）。漏掉註冊的後果仍是老症狀：100ms 後按鈕自己復活、停止鍵按了沒用。🔴 註冊表只服務「UI 忙碌顯示」與「停止請求分派」，**絕不可拿來當移動守衛**，也不可把 `motion_active` / `scanning_active` 併進去。（modularization〈七〉、safety-fixes）
 - **停止／中止類按鈕不可放進 `_drive_buttons`**，那串會在重播中與復歸中被整批 disable——正是最需要停止的時候。（safety-fixes）
 - **新增放在 `RECORDING_DIR` 的設定檔，務必同步加進 `NON_RECORDING_JSON`**，且一律走 `_write_json_with_backup()`。（settings-files）
 - **`ORG_MODES` 從 `ORG 1` 開始，不可用 `.index()` 換算樣式編號**（差一位）。（safety-fixes）
@@ -106,10 +109,10 @@ VS Code 已設定對應的 tasks（預設 build task = 執行 GUI）與 launch �
 
 ## main_ai.py 架構
 
-main_ai.py 約 6810 行（2026-08-28 實測，Powell 演算法選單接進「尋光」分頁後又新增約 260 行；⚠ 這已進一步越過[docs/modularization.md](docs/modularization.md)的門檻 4「5800～6000 行」，下次動到分頁結構前應先重新評估方向1b），邏輯上仍是三塊，但**`DS102Controller` 現在實際定義在 [ds102_ctrl.py](ds102_ctrl.py)**：
+main_ai.py 約 7114 行（2026-08-31 實測）。⚠ **行數已越過[docs/modularization.md](docs/modularization.md)的門檻 4，該檔 2026-08-31 已完成正式複審：結論是「仍不拆分頁 mixin，但先做三件前置工作」，並在複審中抓到三項停止／中斷路徑的漏接缺陷。前置 0～3 已於同日全部完成**——前置 0（漏接修正，〈六〉）、前置 1（長時間背景作業註冊表 `LongOperation`，〈七〉）、前置 3（`CLR_*` 抽成 [ui_theme.py](ui_theme.py)，〈八〉）、前置 2（光功率讀值抽成 `PowerReading`，〈九〉）。**動到分頁結構、或新增任何「長時間背景作業」（比照重播／全軸原點復歸／原點復歸重現性量測／尋光）之前，先讀該檔 2026-08-31 那一節（含〈六〉～〈九〉），不要重做評估。⚠ 行數判準已證實沒有預測力，不要再拿總行數當觸發條件（觀察指標見該檔〈四〉，其中指標 2 已因前置 2 完成而改寫，見〈九〉9.9）。** 邏輯上仍是三塊，但**`DS102Controller` 現在實際定義在 [ds102_ctrl.py](ds102_ctrl.py)**：
 
 1. **`DS102Controller`**（[ds102_ctrl.py](ds102_ctrl.py)）— 所有序列通訊集中於此，完全不碰 tkinter。對外只暴露 `connect()` / `move_step()` / `query_status()` / `goto_point()` 等高階方法。main_ai.py 開頭用 `from ds102_ctrl import DS102Controller, AXES, AXIS_NO, NO_AXIS, MODE_CONTINUE, MODE_STEP, MODE_ORIGIN, COMM_FAIL_THRESHOLD, _BASE_DIR, LOG_DIR, RECORDING_DIR, DATA_DIR, NON_RECORDING_JSON, logger, _write_json_with_backup, _load_json_settings, _app_settings, _app_setting_num, _safety_setting_rejections` 整批重新引入——這份清單就是 `DS102Controller` 的完整依賴閉包，改動任一邊的模組層級常數前先確認它有沒有在這份清單裡（`_load_json_settings`／`_safety_setting_rejections` 是後來加的，見 [docs/settings-files.md](docs/settings-files.md) 與 [docs/modularization.md](docs/modularization.md)，這份清單本身就是活的，隨改動同步更新）。
-2. **`StatusBar`**（仍在 main_ai.py）— 各分頁共用的座標 / 連線狀態列（同時存在多個實例，統一收在 `self._status_bars`）。**刻意沒有跟著搬去 `ds102_ctrl.py`**：它用到的 `CLR_*` 色票（含 `app_settings.json` 覆寫邏輯）留在 main_ai.py，若把 `StatusBar` 也搬走，`ds102_ctrl.py` 會反過來需要 import main_ai.py 的色票，形成循環相依；`StatusBar` 本身只有約 120 行、且與 `DS102GUI` 的 `self._status_bars` 集中管理耦合更緊，留給下次拆 `DS102GUI` 時一併考慮較合適。
+2. **`StatusBar`**（仍在 main_ai.py）— 各分頁共用的座標 / 連線狀態列（同時存在多個實例，統一收在 `self._status_bars`）。⚠ **2026-08-31 起，它留在這裡的理由已經換了一個**：原本的理由是「它需要的 `CLR_*` 色票在 main_ai.py，搬走會循環相依」，但前置工作 3 已把色票抽到 [ui_theme.py](ui_theme.py)，那個阻礙**不再成立**——`StatusBar` 現在隨時可以搬。沒搬的新理由是「可以做但沒必要」：它有 tkinter 元件、要 `DS102Controller` 型別、且與 `DS102GUI._status_bars` 的集中管理耦合更緊，單獨搬只是把 120 行從 A 檔移到 B 檔而不解決任何實際問題。等真的拆 `DS102GUI`、需要決定「共用 UI 元件放哪」時一併處理才會落在正確位置（見 [docs/modularization.md](docs/modularization.md)〈八〉8.3）。
 3. **`DS102GUI`**（main_ai.py）— 七個分頁（分頁標題字串為「儀表板 / 移動控制 / Teaching / 行程錄製 / 光功率 / 尋光 / LOG」，grep 時用這些字），只呼叫 controller 的公開方法。「光功率」封裝 `HP8153APowerMeter`（[meter_GPIB.py](meter_GPIB.py)）、「尋光」封裝 `FiberAlignmentScanner`（[fiber_scanner.py](fiber_scanner.py)），細節見 [docs/fiber-scan.md](docs/fiber-scan.md)。
 
 ⚠ `fiber_scanner.py` 的 `TYPE_CHECKING` 型別提示已同步改成 `from ds102_ctrl import DS102Controller`（原本指向 main_ai.py，`DS102Controller` 搬家後這裡也要跟著改，否則型別提示會指向錯誤的定義位置——雖然不影響執行期，但下次有人依賴它做型別檢查會查錯地方）。`fiber_scanner.py` 本身仍然不 import 任何一個 main_ai 系列模組，「避免循環相依」的方向沒變。
