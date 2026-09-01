@@ -18,9 +18,9 @@
 
 **測試基礎建設對未來 mixin 化是有利的**：`conftest.py`／兩份 pytest 測試檔全部透過 `gui.ctrl`/`gui.meter`/`monkeypatch.setattr(gui, ...)` 存取單一 `gui` 物件屬性，沒有假設方法定義在哪個檔案——只要最終類別仍叫 `DS102GUI`、由 `main_ai.DS102GUI(root)` 建構，mixin 化後現有 123 項測試不用改一行。唯一地雷：`conftest.py` 是用 `patch.object(main_ai, "RECORDING_DIR", ...)` 動態改模組層級名字，如果將來某個 mixin 檔案在模組層級快取了 `RECORDING_DIR` 的值而非透過 `self`／動態 import 存取，這個 monkeypatch 會失效、測試會意外寫進真實 `recordings/`——現在還沒發生，真拆檔案時要提醒實作者。
 
-⚠ **`__init__`（main_ai.py:475-916 附近）存在只靠註解提醒、沒有機制強制的初始化順序相依**：例如 `ctrl.load_axis_calib()` 必須在 `_build_notebook()` 之前執行，卡片建構時才讀得到值；`_scanner_cfg_pending` 要等 `_build_tab_scan` 才會被消費。將來若真的把 `__init__` 拆成各 mixin 自己的 `_init_xxx_state()`，這些順序相依必須顯式化（例如一份有序的 init 步驟清單），否則會在特定操作路徑上悄悄讀到空值、且不會立刻炸出來。
+**`__init__`（main_ai.py:475-916 附近）存在只靠註解提醒、沒有機制強制的初始化順序相依**：例如 `ctrl.load_axis_calib()` 必須在 `_build_notebook()` 之前執行，卡片建構時才讀得到值；`_scanner_cfg_pending` 要等 `_build_tab_scan` 才會被消費。將來若真的把 `__init__` 拆成各 mixin 自己的 `_init_xxx_state()`，這些順序相依必須顯式化（例如一份有序的 init 步驟清單），否則會在特定操作路徑上悄悄讀到空值、且不會立刻炸出來。
 
-✅ **技術債已解決（2026-08-18）：四份設定檔讀取骨架抽成共用函式。** `_load_app_settings`／`_load_safety_settings`（ds102_ctrl.py）與 `_load_meter_config`／`_load_scanner_config`（main_ai.py）原本逐字同一套骨架，現在統一呼叫 `ds102_ctrl._load_json_settings(path, label, log=None, error_level="INFO", not_found_msg=None, fail_msg=..., invalid_type_msg=..., success_msg=None)`，用參數精確重現原本兩種行為模式：app/safety 是「詳細」模式（不傳 `log`、走模組 `logger`、INFO 等級、「不存在」與「成功」都記錄）；meter/scanner 是「安靜」模式（可選 `log` callback、ERROR 等級、「不存在」與「成功」都不記錄）。四個原函式對外的名稱／參數／回傳型別完全沒變，純內部實作重構。連帶讓 main_ai.py 的 `import json` 變成真正未使用，已移除。**新增任何第五份設定檔讀取函式，一律呼叫這個共用函式，不要再複製骨架。**
+**技術債已解決（2026-08-18）：四份設定檔讀取骨架抽成共用函式。** `_load_app_settings`／`_load_safety_settings`（ds102_ctrl.py）與 `_load_meter_config`／`_load_scanner_config`（main_ai.py）原本逐字同一套骨架，現在統一呼叫 `ds102_ctrl._load_json_settings(path, label, log=None, error_level="INFO", not_found_msg=None, fail_msg=..., invalid_type_msg=..., success_msg=None)`，用參數精確重現原本兩種行為模式：app/safety 是「詳細」模式（不傳 `log`、走模組 `logger`、INFO 等級、「不存在」與「成功」都記錄）；meter/scanner 是「安靜」模式（可選 `log` callback、ERROR 等級、「不存在」與「成功」都不記錄）。四個原函式對外的名稱／參數／回傳型別完全沒變，純內部實作重構。連帶讓 main_ai.py 的 `import json` 變成真正未使用，已移除。**新增任何第五份設定檔讀取函式，一律呼叫這個共用函式，不要再複製骨架。**
 
 至於「`_app_settings`/`_app_setting_num`/`CLR_*` 獨立成第三個檔案」這項更早的技術債——**維持先前結論仍不急**，觸發時機該跟方向1b綁在一起（真的做 mixin 化時勢必要重新梳理 import 邊界，那時候順手做是同一批工），現在單獨做只是提前付 import 調整成本卻拿不到額外好處。
 
@@ -50,7 +50,7 @@
 
 整條迴圈現在每 100ms 直接觸碰 **儀表板／移動控制／尋光／光功率 四個分頁的 widget＋全部 StatusBar**。字面判準（單一方法 +2）沒到，但門檻 1 想抓的現象（「Core 本身已是事實上的上帝方法」）**已經成立**。
 
-⚠ 門檻 1 的原文已經預先寫好了處方：「**這時候先拆 Core 自己的職責（例如抽出獨立的 `_busy_reasons()`），不是急著拆分頁**」。這次複審的結論跟那句話一致。
+門檻 1 的原文已經預先寫好了處方：「**這時候先拆 Core 自己的職責（例如抽出獨立的 `_busy_reasons()`），不是急著拆分頁**」。這次複審的結論跟那句話一致。
 
 #### 門檻 2：沒有第二對，但 Scan↔Power 這一對從 2 個橋接點長成 6 個
 
@@ -123,15 +123,15 @@
 #### 前置工作（建議依序執行，都不搬動分頁）
 
 **前置 0（必須，且與模組化無關）：補上〈三〉列出的漏接。** 這是正確性缺陷，不該等模組化排程。
-✅ **2026-08-31 已完成**（見〈六〉）。
+**2026-08-31 已完成**（見〈六〉）。
 
 **前置 1：把「長時間背景作業」變成第一類概念。**
-✅ **2026-08-31 已完成，實際落地的設計見〈七〉。** 原始構想如下（保留以對照）：建立一份註冊表，每個長時間作業註冊 `(名稱, 進行中旗標, 請求停止的 callable, 經過時間 StringVar)`，然後：
+**2026-08-31 已完成，實際落地的設計見〈七〉。** 原始構想如下（保留以對照）：建立一份註冊表，每個長時間作業註冊 `(名稱, 進行中旗標, 請求停止的 callable, 經過時間 StringVar)`，然後：
 
 - `_update_stat_ui` 的 `busy` 改成 `any(op.running for op in self._long_ops)`；門檻 1 原文提到的 `_busy_reasons()` 就在這裡實現（順帶讓橫幅可以說出「正在忙什麼」）。
 - `_start_poller` 的兩段經過時間計算合併成一個迴圈。
 - `_do_stop` / `_on_escape` / `_toggle_connect` / `_on_close` 一律改成 `for op in self._long_ops: op.request_stop()`——**漏接從此在結構上不可能發生**，這才是門檻 3 真正要的東西。
-- 🔴 這一步**不可以**順手把 `motion_active` 或 `scanning_active` 併進來當移動守衛，那是 [fiber-scan.md](fiber-scan.md) 明列的紅線。註冊表只服務「UI 忙碌顯示」與「停止請求分派」兩件事。
+- 這一步**不可以**順手把 `motion_active` 或 `scanning_active` 併進來當移動守衛，那是 [fiber-scan.md](fiber-scan.md) 明列的紅線。註冊表只服務「UI 忙碌顯示」與「停止請求分派」兩件事。
 
 **前置 2：把光功率的「最近一次讀值」抽成具名的共用狀態。** 現況是 `_pm_last_ok_time` / `_pm_last_value` / `_pm_status_var` 三個欄位由「光功率」與「尋光」兩邊各自直接寫（4608-4616 vs 5944-5945）。抽成一個小物件（例如 `PowerReading`，帶 `value` / `ok_time` / `source`），寫入只走它的方法，讀取只走 `_pm_refresh_status_line()`。做完之後 Scan→Power 的六個橋接點會剩下真正需要協調的兩三個，且都是有名字的介面。
 
@@ -142,21 +142,21 @@
 1. 它是本次盤點裡**唯一零風險、無條件正向**的一步（純模組層級常數搬家，沒有狀態、沒有執行緒、沒有初始化順序問題）。
 2. 現況第 2 節已經寫明：`StatusBar` 留在 main_ai.py 的**唯一理由**就是它需要 `CLR_*` 色票，搬去 `ds102_ctrl.py` 會造成循環相依。抽出 `ui_theme.py` 之後這個阻礙立刻消失，`StatusBar`（約 120 行）就有了獨立搬遷的選項。
 3. 如果將來真的做 mixin 化，每個 mixin 檔案都會需要色票；不先抽，就會變成每個 mixin 都 `from main_ai import CLR_*` ——那正是循環相依本身。這件事**必須**在 mixin 化之前完成，不是「跟它一起做」。
-4. ⚠ 搬遷時注意：`app_settings.json` 的覆寫邏輯要一起搬，且 `CLR_*` 必須在 import 時就完成覆寫（現有行為），不可改成延遲求值——`_build_*` 在 `__init__` 期間就讀它們了。
+4. 搬遷時注意：`app_settings.json` 的覆寫邏輯要一起搬，且 `CLR_*` 必須在 import 時就完成覆寫（現有行為），不可改成延遲求值——`_build_*` 在 `__init__` 期間就讀它們了。
 
 ### 三、複審過程中發現的正確性缺陷（與模組化無關，應優先修）
 
 這三項是「散彈式接線」論點的實證，但它們本身就是缺陷，不該等模組化。
 
-**🔴 必須修正 1：尋光執行中按 Esc 或「■ Stop」，滑台會停一下然後自己繼續走。**
+**必須修正 1：尋光執行中按 Esc 或「■ Stop」，滑台會停一下然後自己繼續走。**
 `_on_escape`（main_ai.py:2501-2510）與 `_do_stop`（2493-2499）都只送 `ctrl.stop()`，並設 `_stop_playback`／`_org_repeat_stop_event`，但**都沒有呼叫 `self._active_scanner.request_stop()`**。`fiber_scanner._check_abort()`（fiber_scanner.py:2518-2523）只檢查 `_stop_event` 與 `ctrl.ems_active`，兩者皆未被設。
 失效情境：尋光進行中按 Esc（`bind_all`，在任何分頁都有效）→ `STOP 0` 讓軸停下 → `_wait_axis_stop()` 看到軸已停、回報 True → 演算法把這個被強制停住的位置當成該步的落點，量測後送出下一組 `PULS`/`GO` → **滑台在使用者按下停止後約 1 秒內重新開始移動**。目前唯一能真正停住尋光的入口是尋光分頁自己的停止鍵（`_do_stop_scan`，5149-5155，它有呼叫 `request_stop()`）。注意 `_sync_stop_button()`（6248）明文「其餘一律可按」，所以停止鍵在尋光期間確實是 enabled 的。
 
-**🔴 必須修正 2：尋光／重播執行中按頂列「中斷」，背景執行緒會繼續對已關閉的序列埠送指令。**
+**必須修正 2：尋光／重播執行中按頂列「中斷」，背景執行緒會繼續對已關閉的序列埠送指令。**
 `_toggle_connect`（5491-5510）的中斷分支設了 `_org_repeat_stop_event`，但沒有 `_active_scanner.request_stop()`，也沒有 `_stop_playback.set()`，接著就 `ctrl.stop()` + `ctrl.disconnect()`。
 這與 `_on_close`（6764-6778）已經修過的問題**是同一個**——那裡的註解寫得很清楚「沒有這行，`_run()` 仍會繼續跑 `scanner.run()`，下一步對已經 `disconnect()` 的序列埠操作大機率拋例外」。修在 `_on_close`，沒有修在 `_toggle_connect`。這正是散彈式接線的典型症狀：同一個 bug 要在 N 個地方各修一次，修了 N−1 個。
 
-**⚠ 建議改善 3：`_do_stop` 與 `_on_escape` 對重播的行為不一致。**
+**建議改善 3：`_do_stop` 與 `_on_escape` 對重播的行為不一致。**
 `_on_escape` 會 `self._stop_playback.set()`，`_do_stop` 不會。`ds102_ctrl.play_recording()`（3592-3606）只在 `stop_event` 或 `ems_active` 時收工，所以重播中按「■ Stop」是「停這一步，然後繼續下一步」。若這是刻意設計（重播有自己的停止鍵），至少要在 `_do_stop` 補註解說明；但 `_on_escape` 的存在說明原意是「全域停止應中止重播」。前置 1 的註冊表會一次消滅這類不一致。
 
 ### 四、下次評估的觀察指標（取代原本的四條門檻）
@@ -164,7 +164,7 @@
 行數判準這次已經證明**沒有預測力**（6820 行的檔案，邊界其實還算清楚；而拆掉 898 行也回不到門檻以下）。改用下列三項：
 
 1. ~~**長時間背景作業的接線點數量**：目前 6 個接線點 × 3 個作業。前置 1 完成後應降為「1 個註冊呼叫」。若前置 1 沒做而作業數增加到 4 個（例如未來的自動化量測流程），視為紅線。~~
-   ✅ **2026-08-31 前置 1 完成後改為**：接線點已降為「`_register_long_ops()` 裡的 1 筆註冊」，這項指標本身不再是觸發條件。**改成盯這個**：`grep -n "_stop_playback\.set\|_org_repeat_stop_event\.set\|_active_scanner\.request_stop" main_ai.py` 的結果，除了 `_register_long_ops()` 與各分頁自己的專屬停止鍵（`_do_stop_playback` / `_do_stop_org_repeat` / `_do_stop_scan`）之外，**不應該再有第四類呼叫點**。出現了就代表有人繞過註冊表又接了一份手動接線，那是「兩份會走鐘的真相來源」，該回頭改成註冊。
+   **2026-08-31 前置 1 完成後改為**：接線點已降為「`_register_long_ops()` 裡的 1 筆註冊」，這項指標本身不再是觸發條件。**改成盯這個**：`grep -n "_stop_playback\.set\|_org_repeat_stop_event\.set\|_active_scanner\.request_stop" main_ai.py` 的結果，除了 `_register_long_ops()` 與各分頁自己的專屬停止鍵（`_do_stop_playback` / `_do_stop_org_repeat` / `_do_stop_scan`）之外，**不應該再有第四類呼叫點**。出現了就代表有人繞過註冊表又接了一份手動接線，那是「兩份會走鐘的真相來源」，該回頭改成註冊。
 2. **跨分頁的「共用可變狀態」數量**：目前 1 組（光功率讀值快取）。**出現第二組即觸發**——這比「互相呼叫私有方法」更嚴重，因為它連呼叫點都 grep 不到。
 3. **單一分頁區塊超過 2000 行**：尋光目前 1714 行，是最接近的。若尋光突破 2000 行，就該把「尋光＋光功率」當成**一個** `AlignmentMixin`（約 2500 行）整塊搬出，而不是拆成兩個——前置 2 是這一步的必要前提。
 
@@ -180,7 +180,7 @@
 4. `RecordingTabMixin`（500 行，洩漏 2／34，是所有分頁裡封裝最好的一塊）
 5. `AlignmentMixin`（尋光＋光功率合併約 2537 行）— **必須先完成前置 2**，且兩者一起搬，不可分開
 
-⚠ 08-18 記錄的兩個地雷依然有效，實作前務必重讀本檔第 19、21 行：mixin 檔案**不可在模組層級快取 `RECORDING_DIR`**（`conftest.py` 的 `patch.object` 會失效，測試會寫進真實 `recordings/`）；`__init__` 的初始化順序相依必須顯式化。
+08-18 記錄的兩個地雷依然有效，實作前務必重讀本檔第 19、21 行：mixin 檔案**不可在模組層級快取 `RECORDING_DIR`**（`conftest.py` 的 `patch.object` 會失效，測試會寫進真實 `recordings/`）；`__init__` 的初始化順序相依必須顯式化。
 
 📌 本次複審**未搬動任何程式碼**，也未執行測試（本機為 Linux，專案的 `venv/Scripts/python.exe` 是 Windows 直譯器）。上述行號依 `2365bd3` 版本的 main_ai.py（6820 行）。
 
@@ -198,7 +198,7 @@
 
 回歸測試 404 項全數通過（Linux 端以 `xvfb-run -a venv/bin/python -m pytest ...` 執行）。
 
-⚠ 這批修正**本身就是散彈式接線的最後一次示範**：同一個概念改了 4 個地方、加了 3 個測試，而下一個長時間作業還是會要求作者記得同樣的 4 個地方。前置 1 就是為了讓這件事不再發生。
+這批修正**本身就是散彈式接線的最後一次示範**：同一個概念改了 4 個地方、加了 3 個測試，而下一個長時間作業還是會要求作者記得同樣的 4 個地方。前置 1 就是為了讓這件事不再發生。
 
 ---
 
@@ -217,7 +217,7 @@
 | `started_at` | `Optional[Callable[[], float]]` | 本輪起算的 `time.time()` 基準 |
 | `show_elapsed` | `Optional[Callable[[str], None]]` | 把 `"MM:SS"` 寫進對應的 StringVar |
 
-🔴 **除了 `key` / `label`，每個欄位都是 callable，而且註冊時一律包成 lambda，不可寫成 `self._stop_playback.set` 這種綁定方法。** 兩個理由，都是本檔第 21 行那個地雷的直接對策：
+**除了 `key` / `label`，每個欄位都是 callable，而且註冊時一律包成 lambda，不可寫成 `self._stop_playback.set` 這種綁定方法。** 兩個理由，都是本檔第 21 行那個地雷的直接對策：
 
 1. **消滅初始化順序相依。** `_org_repeat_elapsed_var` 要等 `_build_card_origin_repeatability()` 才建立，而 `_register_long_ops()` 跑在 `_build_notebook()` 之前。全部走 callable 表示每個欄位都在「被呼叫的當下」才解析 `self` 的屬性，註冊表因此可以放在 `__init__` 的任何位置（實際擺在四個旗標定義之後，純為可讀性）。
 2. **避免靜默盯著舊物件。** 綁定方法會在註冊當下把 Event／StringVar 實例抓進閉包；日後若有人重新指派 `self._scanning = threading.Event()`，註冊表會**不報錯地**繼續盯著已被丟棄的舊物件。
@@ -248,7 +248,7 @@
 | `_request_stop_long_ops()` | 停止請求分派 |
 | `_update_long_op_elapsed()` | `_start_poller` 每輪呼叫，更新所有經過時間顯示 |
 
-### 7.4 🔴 `_request_stop_long_ops()` 的兩個設計決定
+### 7.4 `_request_stop_long_ops()` 的兩個設計決定
 
 **（a）刻意不先判斷 `is_running()`，無條件分派。** 理由：
 
@@ -268,9 +268,9 @@
 | `_toggle_connect` 中斷分支 | 2 個 `if`（且缺 `_stop_playback`） | 同上（順帶補齊重播那一項） |
 | `_on_close` | 2 個無條件 set ＋ 1 個 `if` | 同上 |
 
-另外 `_do_start_org_repeat` 被擋下來時的橫幅改用 `_busy_reasons()` 說出實際在忙什麼。⚠ **它的擋人條件刻意沒有改成 `_any_long_op_running()`**：那段條件額外含有 `ctrl.measuring_active` / `ctrl.scanning_active` 兩個控制器層級旗標，是註冊表（只服務 UI 忙碌顯示與停止分派）不該涵蓋的；`_busy_reasons()` 為空時退回原本的通稱字串。
+另外 `_do_start_org_repeat` 被擋下來時的橫幅改用 `_busy_reasons()` 說出實際在忙什麼。**它的擋人條件刻意沒有改成 `_any_long_op_running()`**：那段條件額外含有 `ctrl.measuring_active` / `ctrl.scanning_active` 兩個控制器層級旗標，是註冊表（只服務 UI 忙碌顯示與停止分派）不該涵蓋的；`_busy_reasons()` 為空時退回原本的通稱字串。
 
-🔴 **本次沒有把 `motion_active` 或 `scanning_active` 併進註冊表，也沒有讓註冊表參與任何移動守衛判斷。** 那是 [fiber-scan.md](fiber-scan.md) 明列的紅線。
+**本次沒有把 `motion_active` 或 `scanning_active` 併進註冊表，也沒有讓註冊表參與任何移動守衛判斷。** 那是 [fiber-scan.md](fiber-scan.md) 明列的紅線。
 
 ### 7.6 驗證
 
@@ -306,7 +306,7 @@ main_ai.py 從 6820 → **7000 行**（+180）。程式碼本身其實變少（�
 import 一個名字（`ds102_ctrl._app_settings`），**不 import main_ai.py 或任何
 GUI 模組**。
 
-### 8.2 🔴 與原計畫的重大差異：`_app_settings` 沒有搬
+### 8.2 與原計畫的重大差異：`_app_settings` 沒有搬
 
 〈前置 3〉原文寫的是「`_app_settings` / `_app_setting_num` / `CLR_*` 抽成第三個
 檔案」。**這一半做不到，而且不該做。** 動手前重新 grep 才發現：這三個名字早在
@@ -321,7 +321,7 @@ ds102_ctrl.HISTORY_MAX      需要  ui_theme._app_setting_num
 ui_theme._load_app_settings 需要  ds102_ctrl._load_json_settings + RECORDING_DIR
 ```
 
-⚠ **這件事本身值得記下來**：複審筆記寫於 2026-08-31，但〈前置 3〉那一段的內容是
+**這件事本身值得記下來**：複審筆記寫於 2026-08-31，但〈前置 3〉那一段的內容是
 從 2026-08-18 之前的舊結論繼承下來的，沒有重新驗證檔案配置。**複審筆記裡「繼承自
 更早結論」的段落，行號與檔案歸屬都要當成過期資訊重新查證。**
 
@@ -359,7 +359,7 @@ ui_theme._load_app_settings 需要  ds102_ctrl._load_json_settings + RECORDING_D
    需要 `from main_ai import CLR_*`（那正是循環相依本身）。**這一步必須在
    mixin 化之前完成，不是跟它一起做。**
 
-⚠ 覆寫時機不變：`CLR_*` 在 `ui_theme.py` **模組載入當下**就把
+覆寫時機不變：`CLR_*` 在 `ui_theme.py` **模組載入當下**就把
 `app_settings.json` 的覆寫值算完並固定，**不可改成延遲求值**——`_build_*` 在
 `DS102GUI.__init__` 期間就把這些值餵給 tkinter 元件的 `bg=`／`fg=` 了。
 
@@ -384,7 +384,7 @@ main_ai.py 7000 → **7017**（+17）。移除 13 行色票定義，換來 16 �
 | `_scan_plot_extend()`（尋光轉貼） | 主執行緒（掛在 `_redraw_scan_plot` 的 `root.after` 鏈） |
 | `_on_meter_connect_result()` / `_disconnect_meter()` | 主執行緒 |
 | `_pm_update_age_label()` | 主執行緒 |
-| **`_get_last_pm_value()`** | 🔴 **移動執行緒**（`ds102_ctrl._record_data_point()` 在 `_wait_axis_stop()` 的等待迴圈裡呼叫） |
+| **`_get_last_pm_value()`** | **移動執行緒**（`ds102_ctrl._record_data_point()` 在 `_wait_axis_stop()` 的等待迴圈裡呼叫） |
 
 也就是「單一寫入執行緒 ＋ 單一跨執行緒讀取者」。這個形狀**不需要鎖**，而且改成
 frozen dataclass 之後跨執行緒讀取的一致性**變好了**（見 9.3）。所以沒有走「只做
@@ -403,13 +403,13 @@ main_ai.py 模組層級新增 `@dataclass(frozen=True) class PowerReading`（緊
 
 取代原本的 `_pm_last_value` / `_pm_last_ok_time` 兩個裸欄位（已從程式碼完全消失）。
 
-### 9.3 🔴 frozen 是唯一真正的技術理由，而不是「看起來比較整齊」
+### 9.3 frozen 是唯一真正的技術理由，而不是「看起來比較整齊」
 
 原本 value 與 ok_time 是**兩行各自指派**，移動執行緒有機會讀到「新的 value 配舊的
 ok_time」這種撕裂組合。換成 frozen dataclass 後，更新是**單一次屬性重新指派**
 （GIL 下不可分割），跨執行緒讀取端拿到的必定是同一次讀值的完整快照。
 
-⚠ **但這只是讓原本就存在的跨執行緒讀取變得一致，沒有、也不宣稱新增任何鎖保護。**
+**但這只是讓原本就存在的跨執行緒讀取變得一致，沒有、也不宣稱新增任何鎖保護。**
 `PowerReading` 的 docstring 明文寫了這句——不要因為它現在有名字就假設它是執行緒
 安全的容器（派工時特別點名要避免的「看起來安全其實還是沒鎖」的假象）。真正的保證
 只有「單一寫入執行緒 ＋ 不可變快照」這一條。
@@ -466,7 +466,7 @@ if valid_samples := [s for s in samples if s.ok and s.power is not None]:
 
 ### 9.7 沒有動的東西
 
-🔴 **自動量程退回邏輯完全沒碰。** `_on_scan_signal_found()`（鎖定量程）與
+**自動量程退回邏輯完全沒碰。** `_on_scan_signal_found()`（鎖定量程）與
 `_restore_meter_auto_range()`（尋光結束還原）一行未改——它們操作的是儀器狀態，
 不是「讀值怎麼存」。見 CLAUDE.md〈光功率計預設用自動量程〉那條紅線。
 

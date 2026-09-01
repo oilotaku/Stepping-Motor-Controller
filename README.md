@@ -2,7 +2,7 @@
 
 Windows 桌面應用，用 Python + tkinter 控制 **駿河精機 SURUGA SEIKI DS102 / DS112 步進馬達控制箱**（RS-232C / USB 虛擬 COM 埠），用於光纖對準與光學自動化量測。
 
-滑台已與 **HP 8153A 光波萬用表**（GPIB，封裝於 [meter_GPIB.py](meter_GPIB.py)）整合，GUI 內建「光功率」與「尋光」兩個分頁，可執行自動掃描尋光（[fiber_scanner.py](fiber_scanner.py) 的 `FiberAlignmentScanner`）。⚠ 光功率計尚未接上真實儀器驗證過，本機沒有 GPIB 卡可測。
+滑台已與 **HP 8153A 光波萬用表**（GPIB，封裝於 [meter_GPIB.py](meter_GPIB.py)）整合，GUI 內建「光功率」與「尋光」兩個分頁，可執行自動掃描尋光（[fiber_scanner.py](fiber_scanner.py) 的 `FiberAlignmentScanner`）。光功率計尚未接上真實儀器驗證過，本機沒有 GPIB 卡可測。
 
 ---
 
@@ -73,7 +73,7 @@ VS Code 的 Testing 面板也能個別發現、個別重跑每一項（`.vscode/
 | 檔案 | 定位 |
 |---|---|
 | [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，約 5408 行。GUI 與各分頁邏輯都加在這裡 |
-| [ds102_ctrl.py](ds102_ctrl.py) | `DS102Controller` 本體（2026-08-17 從 main_ai.py 拆出的獨立模組，約 2326 行，完全不碰 tkinter）。🔴 不要跟下面的 `ds102_controller.py` 搞混 |
+| [ds102_ctrl.py](ds102_ctrl.py) | `DS102Controller` 本體（2026-08-17 從 main_ai.py 拆出的獨立模組，約 2326 行，完全不碰 tkinter）。不要跟下面的 `ds102_controller.py` 搞混 |
 | [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照（跟上面的 `ds102_ctrl.py` 是完全不同的兩個檔案）。可作對照，**不要在此新增功能** |
 | [main.py](main.py) | 廠商官方範例，是**指令格式的權威來源**。修改指令前先回頭比對 |
 | [test.py](test.py) | 無 GUI 的連線／狀態查詢腳本。名稱誤導——不是單元測試 |
@@ -82,7 +82,7 @@ VS Code 的 Testing 面板也能個別發現、個別重跑每一項（`.vscode/
 | [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`，光纖對準尋光演算法，已接上「尋光」分頁 |
 | [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) / [verify_fiber_scanner_signal.py](verify_fiber_scanner_signal.py) | 「尋光」／「光功率」分頁／軸機械校正參數／`fiber_scanner.py` 訊號有效性判準的假物件回歸測試（57／66／50／14 項，共 187 項，pytest 測試檔，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py -v` 執行，或用 VS Code Testing 面板，不需硬體） |
 | [Gtest.py](Gtest.py) | 外部第三方範例，`import control` 的模組不存在於本 repo，**無法執行** |
-| [step-motor.txt](step-motor.txt) | 三層架構藍圖。⚠ 其中 DS112 通訊細節（`\r\n`、9600、`!:` 輪詢）**全部是錯的** |
+| [step-motor.txt](step-motor.txt) | 三層架構藍圖。其中 DS112 通訊細節（`\r\n`、9600、`!:` 輪詢）**全部是錯的** |
 
 ---
 
@@ -150,7 +150,7 @@ venv 內已裝 `pyinstaller` 與 `auto-py-to-exe`。
 venv/Scripts/pyinstaller.exe --onedir --windowed --name DS102 main_ai.py
 ```
 
-🔴 **2026-08-17 已實際打包驗證過一次**：build 乾淨完成（matplotlib TkAgg backend 自動偵測），產出約 152MB，`DS102.exe` 能正常啟動、存活，在自己目錄下建出 `logs/`/`recordings/`/`data/`。**沒有實測連硬體**（GPIB／序列埠），那部分仍待驗證。
+**2026-08-17 已實際打包驗證過一次**：build 乾淨完成（matplotlib TkAgg backend 自動偵測），產出約 152MB，`DS102.exe` 能正常啟動、存活，在自己目錄下建出 `logs/`/`recordings/`/`data/`。**沒有實測連硬體**（GPIB／序列埠），那部分仍待驗證。
 
 - **用 `--onedir` 而非 `--onefile`** — 未簽章的 onefile exe 會自解壓縮到 temp，行為特徵與 packer 相同，是防毒誤判的典型目標；這台機器的 SentinelOne 有前科（見 [DRIVER_ISSUE_REPORT.md](DRIVER_ISSUE_REPORT.md)）。onedir 也省掉每次啟動的解壓時間。
 - **程式必須放在有寫入權限的位置**（桌面、`D:\` 等），不要放 `Program Files`——它需要在自己的目錄下建 `logs/` `recordings/` `data/`。權限不足時會跳錯誤視窗說明，不會無聲關閉。
