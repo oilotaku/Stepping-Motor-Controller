@@ -17,7 +17,7 @@
   **舊版 HANDOVER 寫的「尚未合併回 `main`，領先 43 個 commit」這個框架已經不成立**——沒有一個叫 `main` 的分支可以拿來比較領先幾個 commit。這不是「已經合併了」，而是**這個 repo 本身根本沒有 `main`**：可能是專案一開始就只用這一條分支在做、也可能 `main` 存在於使用者本機的另一個 clone 或尚未推上來的地方。**這件事我無法從 repo 內部判斷，需要使用者說明目前的分支/發布策略**——`feat/fiber-search-gui` 這個名字本身聽起來像是一條 feature 分支，但它就是目前唯一可用的分支。
 - **當前分支 `feat/fiber-search-gui`**：把光功率計（HP 8153A）與尋光演算法（`FiberAlignmentScanner` / Powell 共軛方向法）整合進 GUI，外加 2026-08-17 起陸續做的架構調整（`DS102Controller` 拆檔、UI 色票外部化、`LongOperation`/`PowerReading` 具名狀態）、軸機械校正參數、原點復歸重現性量測、尋光的盲搜與撞限位修正等大量安全性與功能工作。細節見下方〈這次做了什麼〉。
 - `main_ai.py` **7114 行**（2026-08-31 實測，見下方模組化複審記錄）。CLAUDE.md 已明確記載「行數對『該不該拆』沒有預測力」，不要單看這個數字下判斷。
-- 回歸測試（假物件，不需硬體）**421 項全數通過，10 支 `verify_*.py`**（2026-08-31 實測，見〈測試涵蓋缺口〉之後的〈交接注意事項〉指令）。
+- 回歸測試（假物件，不需硬體）**436 項全數通過，11 支 `verify_*.py`**（2026-09-02 實測，新增 `verify_sw_limit_sync.py`，見〈測試涵蓋缺口〉之後的〈交接注意事項〉指令）。
 
 ## 已知未解決事項
 
@@ -27,7 +27,7 @@
 
 ### 程式層級（2026-09-01 用 `grep` 逐項重新核對，三項皆確認仍然存在，寫法比舊版更精確）
 
-1. **長按點動的 Python 端限位保護預設不生效**——`sw_limits` 初始值全部是 `(None, None)`（`ds102_ctrl.py:628`），本次查證確認**全程式只有 `main_ai.py:6830` 一處會寫入它**，且那是〈軟體行程限制〉卡片使用者手動輸入後套用的路徑，**沒有任何程式碼在連線時自動把 `CWSLP?`/`CCWSLP?` 讀回來填入**。`capture_controller_config()`（`ds102_ctrl.py:1071` 附近）雖然確實有查詢 `CWSLP?`/`CCWSLP?`，但只是把值存進 `controller_config.json` 這份持久化字典供將來還原韌體設定用，跟 `self.sw_limits`（`_check_sw_limit()` 真正比對的那份）完全是两回事。除非使用者手動輸入並套用，長按點動全程只靠韌體端限位保護。
+1. ~~長按點動的 Python 端限位保護預設不生效~~——**2026-09-02 已部分修正**。`ds102_ctrl.DS102Controller.sync_sw_limits_from_controller()`（architect 評估、`coder` 落地、architect 收尾審查）在 `connect()` 的 `restore_controller_config()` 之後，逐軸逐側查 `CWSLE?`/`CCWSLE?`/`CWSLP?`/`CCWSLP?`，把韌體端限位鏡射進 `self.sw_limits`——合併規則「只收緊、永不放寬、永不清空」：使用者手動輸入並套用過的值不會被覆寫，兩邊都有值時取較嚴格的一側；`main_ai.py` 連線成功時據此跳「已同步」／「⚠ 沒有任何行程保護」兩則橫幅。**這治不好病根本身**——韌體軟體限位出廠／斷電後就是停用的，此時查回來的 `CWSLP?`/`CCWSLP?` 是哨兵值（±99999999），同步邏輯視為無有效邊界，`sw_limits` 依然是 `None`；出廠狀態下長按點動依然全程只靠韌體端限位保護（此時韌體端本身也已停用），跟修正前的實際保護效果相同。這次修法做到的是「兩層彼此同步、無保護時明講」，不是「預設就有保護」——後者需要使用者主動設定並持久化韌體限位。新增 `verify_sw_limit_sync.py`（15 項），**假物件驗證，未真機驗證**：出廠狀態連線後無保護橫幅是否正確跳出、手動設定韌體限位後「目前生效」欄數值是否相符、尋光在 `sw_limits` 有值時 `_targets_reachable()` 是否會誤擋起步，皆待確認。
 2. **`play_recording` 仍繞過 `_check_sw_limit` 與 `PULS` 整數正規化**——`grep -n "_check_sw_limit\b" ds102_ctrl.py` 只在 `move_step`／`goto_point` 相關路徑出現，`play_recording()`（3561～3720 行左右）本體完全不呼叫它；錄製時每步 delay 仍是寫死 800ms（非實際按住時間）。重播無法還原點動的實際行程長度，不能當安全功能用。
 3. **`_toggle_connect` 的中斷分支仍在 Tk 主執行緒做同步序列 I/O**——本次查證發現這點需要比舊版描述更精確：**連線流程本身已經在背景執行緒跑**（`_toggle_connect` 的 `_do()` 用 `threading.Thread(target=_do, daemon=True).start()`，這部分看起來已經不是問題，但沒有找到對應修正 commit，也可能原本就是這樣，需要使用者確認這是不是這次查證才注意到的既有事實）；**仍然阻塞的是中斷分支**——`self.ctrl.stop()` 與 `self.ctrl.disconnect()` 兩行在按下「中斷」當下於主執行緒同步執行。`disconnect()` 本身實作很短（`_jog_stop.set()` + `ser.close()`），阻塞風險比舊版描述的「連線流程」小很多，但它沒有像 `stop()` 那樣的 `STOP_LOCK_TIMEOUT`(0.15s) 逾時保護，理論上 `ser.close()` 仍可能卡住 UI。本次沒有找到相關修正 commit，判斷這項仍然成立，但描述已更新為「中斷分支」而非「連線流程與中斷都有問題」。
 
@@ -119,22 +119,26 @@
 
 三項前置工作全數完成、413 → 421 項回歸測試零修改零破壞（`ui_theme.py` 那步）。main_ai.py 行數從 6820 漲到 7114（+294，幾乎全是機制與說明註解，非邏輯膨脹），**再次印證複審自己下的結論：行數對「該不該拆」沒有預測力**，不要單看行數變化下判斷。完整記錄見 [docs/modularization.md](docs/modularization.md)〈2026-08-31 重新評估〉起（含〈六〉～〈九〉四節）。
 
+### 長按點動限位保護：連線時同步韌體限位（2026-09-02，僅假物件驗證）
+
+修〈已知未解決事項〉程式層級第 1 項。`architect` 先評估（結論：韌體軟體限位出廠／斷電即停用，此時查回來的 `CWSLP?`/`CCWSLP?` 是哨兵值，這個修法治不好「出廠狀態下沒有保護」本身，只能做到「兩層彼此同步＋無保護時明講」）→ `coder` 落地新增 `DS102Controller.sync_sw_limits_from_controller()`（`connect()` 於 `restore_controller_config()` 之後呼叫）→ `architect` 收尾審查抓到三個非阻塞問題並全部修正：「已同步」橫幅在韌體值較寬鬆被拒絕採用時仍誤報、「沒有任何行程保護」警示排在四則橫幅最後要等 30 秒以上才出現、未接滑台的軸（如實機 U 軸）被誤報成無保護。合併規則「只收緊、永不放寬、永不清空」是本次最重要的安全不變量，靠 `verify_sw_limit_sync.py`（15 項）鎖住。刻意排除 `sw_limits` 本身的持久化（跨連線記住使用者手動輸入）——`POS` 是相對暫存器，跨斷電/跨原點復歸保存一組舊座標邊界有獨立風險，值得另開一次評估。**仍待實機驗證**：出廠狀態連線後無保護橫幅是否正確跳出、手動設定韌體限位後「目前生效」欄數值是否相符、尋光在 `sw_limits` 有值時 `_targets_reachable()` 是否會誤擋起步。
+
 ### 測試套件成長軌跡
 
-187 項（2026-08-19）→ 379 項（Powell GUI 整合後，2026-08-28）→ 413 項（前置 0/1 完成後，2026-08-31）→ **421 項（前置 2 完成後，2026-08-31，目前最新）**，10 支 `verify_*.py`。
+187 項（2026-08-19）→ 379 項（Powell GUI 整合後，2026-08-28）→ 413 項（前置 0/1 完成後，2026-08-31）→ 421 項（前置 2 完成後，2026-08-31）→ **436 項（新增 `verify_sw_limit_sync.py`，2026-09-02，目前最新）**，11 支 `verify_*.py`。
 
 ## 交接注意事項
 
 - 這個專案高度仰賴子代理分工（`architect`／`coder`／`tester`／`ui-designer`／`mathematician`／`reporter`／`questioner`／`data-scientist`），規則寫在 CLAUDE.md〈子代理分工〉一節，**動到執行緒／序列通訊／持久化的改動要先過 architect，新增 GUI 元件要先過 ui-designer，動到尋光演算法要先過 mathematician**，不是隨意的建議，是這個專案吃過虧之後定下的流程。
-- 沒有 CI。目前僅有的永久回歸測試是 10 支 `verify_*.py`（假物件，不需硬體），**421 項全數通過（2026-08-31 實測）**：
+- 沒有 CI。目前僅有的永久回歸測試是 11 支 `verify_*.py`（假物件，不需硬體），**436 項全數通過（2026-09-02 實測，`xvfb-run` 下跑的）**：
 
   ```bash
   venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py \
     verify_fiber_scanner_signal.py verify_wait_axis_stop.py verify_ctrl_pos_sync.py verify_blind_scan.py \
-    verify_scan_export.py verify_scan_powell.py verify_scan_powell_integration.py -v
+    verify_scan_export.py verify_scan_powell.py verify_scan_powell_integration.py verify_sw_limit_sync.py -v
   ```
 
-  Linux 端要跑 GUI 相關測試需要虛擬顯示：`xvfb-run -a venv/bin/python -m pytest ... -q`（本機是 Linux，`venv/Scripts/python.exe` 是 Windows 直譯器，兩邊直譯器路徑不能混用）。**實際測試項數請以 `pytest --collect-only -q` 為準，不要相信任何文件裡寫死的數字**——`docs/testing.md` 目前自己都還寫著舊的 379 這個數字，是本次查證時發現的既有文件落差，不代表 421 這個數字不可信（421 是對照 CLAUDE.md 與 `docs/modularization.md`〈九〉9.8 兩份最新記錄交叉確認過的）。
+  Linux 端要跑 GUI 相關測試需要虛擬顯示：`xvfb-run -a venv/bin/python -m pytest ... -q`（本機是 Linux，`venv/Scripts/python.exe` 是 Windows 直譯器，兩邊直譯器路徑不能混用）。**實際測試項數請以 `pytest --collect-only -q` 為準，不要相信任何文件裡寫死的數字**——436 這個數字是本次（新增 `verify_sw_limit_sync.py`，15 項）實測跑出來的，取代舊版寫的 421／379。
 - `conftest.py` 的 `make_gui()` 要記得它同時 patch `main_ai.RECORDING_DIR`／`ds102_ctrl.RECORDING_DIR`／`main_ai.DATA_DIR`／`ds102_ctrl.DATA_DIR` 四個模組層級綁定，缺一邊等於沒防護，新增測試檔不需要（也不應該）再自己額外 patch。細節見 [docs/testing.md](docs/testing.md)。
 - git commit 習慣寫得比較長，說明「為什麼」不只「做了什麼」，且都會附驗證結果（回歸測試通過與否、實機量測數字等）——看 `git log` 找同類型改動的前例，照同樣的詳細程度寫，別只寫一行摘要。
 - **沒有模擬模式，這是刻意的、不要加回來**——這支程式驅動真實滑台，任何會影響移動/限位/安全邏輯的改動，最終都要有人在真機上驗證過才算數，光靠假物件測試通過不夠。本次彙整再次確認：尋光的 Powell 路徑、階段零盲搜的自動量程退回、多軸撞限位路徑，都還停在「假物件驗證/部分實機驗證」，不要在文件或對話中把它們講成「已驗證」。
