@@ -475,6 +475,11 @@ COMM_FAIL_THRESHOLD = _safety_setting_num(
     _safety_settings, "comm_fail_threshold", 3, int, 1, 10
 )
 
+# 韌體軟體限位出廠／停用時，CWSLP?/CCWSLP? 查回來的哨兵值——不是真邊界。
+# docs/hardware.md 實測記錄；sync_sw_limits_from_controller() 用它排除
+# 「查得到數字但那個數字沒有意義」的情況，避免把 ±99999999 當成真的行程極限。
+SW_LIMIT_SENTINEL = 99_999_999.0
+
 
 # =============================================================================
 # 原點復歸重現性量測——結果存檔（模組層級函式）
@@ -659,6 +664,11 @@ class DS102Controller:
         # 連線時偵測到「復歸樣式未設定」的軸（MEMSW0=0）。
         # MEMSW 是 RAM-only，控制器斷電後會全部歸零。
         self.homing_unconfigured: List[str] = []
+        # 本次連線實際從韌體同步了哪些軸的程式端行程限制說明（供 GUI 顯示）。
+        # 見 sync_sw_limits_from_controller()。
+        self.sw_limits_synced: List[str] = []
+        # 兩層限位（韌體軟限位／程式端 sw_limits）合併後仍完全無保護的軸名。
+        self.sw_limits_unprotected: List[str] = []
         # 控制器設定（MEMSW0 / 韌體軟體限位）的存檔內容
         self.controller_config: dict = {}
         # 同 _points_loaded：沒載入就存檔會把既有設定整份蓋掉
@@ -999,6 +1009,11 @@ class DS102Controller:
         self.load_controller_config()
         self.config_restored = self.restore_controller_config()
         self.check_homing_config()
+        # 韌體軟體限位是否停用（出廠／斷電即如此）決定了 Python 端
+        # sw_limits 是否有東西可用——上面 restore_controller_config()
+        # 只在「設定檔記錄為啟用」時才補寫回控制器，這裡要在那之後、
+        # 讀取還原後的最終狀態同步進 sw_limits，順序不可調換。
+        self.sw_limits_synced = self.sync_sw_limits_from_controller()
 
         msg = f"已連線至 {port}（{self.axis_count} 軸，韌體 {self.firmware}）"
         self._log("INFO", msg)
@@ -1251,6 +1266,141 @@ class DS102Controller:
     # =========================================================================
     # 軟體行程限制
     # =========================================================================
+    def sync_sw_limits_from_controller(self) -> List[str]:
+        """
+        連線時把韌體軟體限位（CWSLP?/CCWSLP?）同步進程式端 `self.sw_limits`。
+
+        背景：`_check_sw_limit()` 比對的 `self.sw_limits` 預設六軸皆為
+        `(None, None)`（無保護），只有使用者在〈軟體行程限制〉卡片手動輸入
+        並套用才會有值——這治不好「預設沒保護」的病根，因為韌體軟體限位
+        本身出廠／斷電後就是停用的，此時查回來的 CWSLP?/CCWSLP? 是哨兵值
+        `SW_LIMIT_SENTINEL`（±99999999），不是真邊界。這支方法做的是把
+        「兩層限位彼此同步」＋「兩層都沒保護時主動告知」，讓不可見的
+        無保護狀態變成可見的（architect 評估結論，見呼叫端 CLAUDE.md 條目）。
+
+        合併規則只收緊、永不放寬、永不清空——這是安全不變量，不是效能考量：
+        使用者手動設定的值代表明確意圖，不能被「韌體這次查不到／查到停用」
+        這種訊號覆寫掉；韌體有更嚴格的值時才收緊，兩者都有值但不同時取
+        較保守的一側（CCW 取較大值、CW 取較小值，兩者都是讓行程範圍變窄
+        的方向）。
+
+        回傳：本次實際同步（採用了韌體值、或韌體值與既有值不同而取嚴格側）
+        的軸／側說明清單，同時寫入 `self.sw_limits_synced`；完全沒有保護的
+        軸名寫入 `self.sw_limits_unprotected`。未連線時直接回傳空清單。
+        """
+        if not self.connected:
+            return []
+
+        synced: List[str] = []
+        unprotected: List[str] = []
+
+        for i in range(self.axis_count):
+            n = str(i + 1)
+            ax = NO_AXIS.get(n)
+            if not ax:
+                continue
+
+            ccw_lim, cw_lim = self.sw_limits.get(ax, (None, None))
+            current_by_side = {"CCW": ccw_lim, "CW": cw_lim}
+            final_by_side: Dict[str, Optional[float]] = {}
+
+            for side, le_suffix, lp_suffix in (
+                ("CCW", "CCWSLE?", "CCWSLP?"),
+                ("CW", "CWSLE?", "CWSLP?"),
+            ):
+                current = current_by_side[side]
+                fw_val: Optional[float] = None
+
+                le_resp = self._serial_write_read(f"AXI{n}:{le_suffix}").strip()
+                if le_resp not in ("0", "1"):
+                    self._log(
+                        "ERROR",
+                        f"軸 {ax} {le_suffix} 回應非預期（{le_resp!r}），"
+                        f"視為該側無有效邊界",
+                    )
+                elif le_resp == "1":
+                    lp_resp = self._serial_write_read(f"AXI{n}:{lp_suffix}").strip()
+                    try:
+                        v = float(lp_resp)
+                    except ValueError:
+                        self._log(
+                            "ERROR",
+                            f"軸 {ax} {lp_suffix} 回應非數字（{lp_resp!r}），"
+                            f"視為該側無有效邊界",
+                        )
+                    else:
+                        if abs(v) >= SW_LIMIT_SENTINEL:
+                            self._log(
+                                "INFO",
+                                f"軸 {ax} {side} 韌體限位為哨兵值 {v:.0f}"
+                                f"（停用狀態），視為無有效邊界",
+                            )
+                        else:
+                            fw_val = v
+                # le_resp == "0"：該側韌體限位本來就停用，fw_val 維持 None，
+                # 這是正常情況、不需要記 log。
+
+                if current is None and fw_val is not None:
+                    # 程式端原本沒有保護，韌體有 → 採用韌體值
+                    final = fw_val
+                    synced.append(f"{ax} {side}={final:.0f}")
+                elif current is None and fw_val is None:
+                    # 兩邊都沒有 → 維持無保護
+                    final = None
+                elif current is not None and fw_val is None:
+                    # 使用者已手動設定，韌體這次查不到有效邊界
+                    # → 維持使用者的值不動，絕不清空
+                    final = current
+                else:
+                    # 兩邊都有值 → 取較嚴格的一側（CCW 取較大值、CW 取
+                    # 較小值，兩者皆為讓行程範圍變窄的方向）
+                    final = max(current, fw_val) if side == "CCW" else min(current, fw_val)
+                    if fw_val != current:
+                        self._log(
+                            "INFO",
+                            f"軸 {ax} {side} 韌體限位（{fw_val:.0f}）與程式端既有值"
+                            f"（{current:.0f}）不同，取較嚴格者 {final:.0f}",
+                        )
+                        # 只有真的採用了韌體值（韌體較嚴格）才算「同步」；
+                        # 韌體較寬鬆時 final 維持 current 不變，若仍列進
+                        # synced 會讓橫幅謊報「已同步」成一個實際上被
+                        # 拒絕採用的數字（architect 審查抓到）。
+                        if final != current:
+                            synced.append(f"{ax} {side}={final:.0f}")
+
+                final_by_side[side] = final
+
+            # 整個 tuple 一次指派——這是跨執行緒共用的屬性，寫入要保持
+            # 原子觀感一致，不要逐欄位改讓其他執行緒讀到「寫一半」的狀態。
+            self.sw_limits[ax] = (final_by_side["CCW"], final_by_side["CW"])
+
+            if final_by_side["CCW"] is None and final_by_side["CW"] is None:
+                # 未接滑台的軸本來就不會被驅動，不需要行程保護，列進
+                # 「沒有保護」警示只會是假警報、稀釋真正的警示可信度
+                # （比照 restore_controller_config()／check_homing_config()
+                # 既有的「未接滑台一律跳過」慣例，architect 審查抓到）。
+                # 只在真的會加進清單時才查，其餘軸不多花這筆往返。
+                st, _ = self.query_status(n)
+                if st != "Stage not connected":
+                    unprotected.append(ax)
+
+        self.sw_limits_synced = synced
+        self.sw_limits_unprotected = unprotected
+
+        if unprotected:
+            self._log(
+                "WARN",
+                f"軸 {'、'.join(unprotected)} 沒有任何行程保護"
+                f"（韌體限位停用、程式端未設定），長按點動只靠機械限位擋",
+            )
+        if synced:
+            self._log(
+                "INFO",
+                f"已從韌體限位同步程式端行程限制：{'、'.join(synced)}",
+            )
+
+        return self.sw_limits_synced
+
     def _check_sw_limit(self, axis_no: str, target_pulse: float) -> Tuple[bool, str]:
         """
         檢查目標位置是否超出軟體行程限制。

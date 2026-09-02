@@ -5823,6 +5823,24 @@ class DS102GUI:
             self._sync_org_mode()
             restored = self.ctrl.config_restored
             unset = self.ctrl.homing_unconfigured
+            # 韌體軟體限位（CWSLP?/CCWSLP?）連線時已同步進 ctrl.sw_limits
+            # （見 ds102_ctrl.sync_sw_limits_from_controller）。先刷新
+            # 〈軟體行程限制〉卡片的「目前生效」欄，再把結果告訴使用者：
+            # 這治不好「預設沒保護」的病根（韌體限位出廠即停用），只是
+            # 讓兩層限位彼此同步、把無保護狀態從不可見變成可見。
+            self._refresh_sw_limit_display()
+            sw_synced = self.ctrl.sw_limits_synced
+            sw_unprotected = self.ctrl.sw_limits_unprotected
+            # 「沒有任何行程保護」是這幾則橫幅裡唯一跟立即安全有關的一則
+            # ——_flash_banner 是序列播放、不重疊，排最後要等其他幾則播完
+            # 才會出現，這段期間使用者已經可以點動了。因此刻意排在最前面，
+            # 讓最重要的警示最先被看到（architect 審查抓到的排序問題）。
+            if sw_unprotected:
+                self._flash_banner(
+                    f"⚠ 軸 {'、'.join(sw_unprotected)} 沒有任何行程保護"
+                    f"（韌體限位停用、程式端未設定），長按點動只靠機械限位擋",
+                    14000,
+                )
             if restored:
                 self._flash_banner(
                     "✔ 已從設定檔還原控制器設定（斷電後會被清空）："
@@ -5835,6 +5853,11 @@ class DS102GUI:
                     f"原點復歸會略過這些軸。設好之後按「儲存控制器設定」，"
                     f"下次連線就會自動補回。",
                     14000,
+                )
+            if sw_synced:
+                self._flash_banner(
+                    "✔ 已從韌體限位同步程式端行程限制：" + "、".join(sw_synced),
+                    10000,
                 )
         else:
             self._conn_btn.config(text="連線", bg=CLR_ACCENT)
