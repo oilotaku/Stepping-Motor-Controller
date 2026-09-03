@@ -94,7 +94,7 @@ from ds102_ctrl import (
 # 所以依賴鏈是 ds102_ctrl → ui_theme → main_ai，沒有環。
 # 這裡刻意逐一列名而非 `import *`：main_ai.py 底下有 445 處引用，
 # 用 `import *` 會讓靜態分析完全查不到這些名字從哪來。
-from ui_theme import (
+from core.ui_theme import (
     CLR_BG,
     CLR_CARD,
     CLR_BORDER,
