@@ -1278,7 +1278,14 @@ class TestGlobalStopEntriesNotifyScanner:
             g.ctrl.connected = saved_connected
 
     def test_toggle_connect_disconnect_requests_scanner_stop(self, gui):
-        """案例 27c：_toggle_connect() 的中斷連線分支呼叫了 _active_scanner.request_stop()。"""
+        """
+        案例 27c：_toggle_connect() 的中斷連線分支呼叫了 _active_scanner.request_stop()。
+
+        2026-09-03 architect 審查後，stop()/disconnect() 搬進背景執行緒，
+        UI 更新透過 root.after() 回主執行緒——必須用 pump_until() 讓
+        mainloop 真的轉起來，callback 才會被執行（見 conftest.pump_until
+        docstring）。request_stop() 分派仍在主執行緒同步呼叫，不受影響。
+        """
         root, g = gui
         fake_scanner = self.FakeScanner()
         g._active_scanner = fake_scanner
@@ -1287,10 +1294,16 @@ class TestGlobalStopEntriesNotifyScanner:
         try:
             g._toggle_connect()
             assert fake_scanner.stop_requested is True
+            # 中斷期間按鈕應立即鎖住，避免連點疊出第二條中斷執行緒。
+            assert str(g._conn_btn["state"]) == "disabled"
+            # 等按鈕狀態本身回到 normal，而不是等 ctrl.connected 翻 False——
+            # 後者在 disconnect() 內部就已翻好，早於 _on_disconnect_result
+            # 這個 after callback 真正執行，用它當條件會有競態，偶爾在
+            # callback 執行前就通過。
+            pump_until(root, lambda: str(g._conn_btn["state"]) == "normal")
+            assert g.ctrl.connected is False
         finally:
             g._active_scanner = None
-            # _toggle_connect() 的中斷連線分支自己會把 ctrl.connected 設回
-            # False（disconnect() 內部邏輯），這裡明確還原，不依賴該行為。
             g.ctrl.connected = saved_connected
 
 

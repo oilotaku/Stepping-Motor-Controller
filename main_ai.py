@@ -5709,16 +5709,31 @@ class DS102GUI:
             # bug 的第二個入口（_on_close 修過、這裡以前漏了，2026-08-31 審查）。
             # 分派放在 ctrl.stop() 之前，讓背景執行緒盡早知道要收工。
             self._request_stop_long_ops()
-            # 先停再斷。少了這行，移動中按「中斷」會關掉 port 卻讓馬達繼續跑，
-            # 程式從此失去對它的控制（_on_close 有做，這裡以前漏了）。
-            self.ctrl.stop()
-            self.ctrl.disconnect()
-            self._conn_dot.itemconfig(self._conn_dot_id, fill=CLR_DANGER)
-            self._conn_lbl.config(text="未連線")
-            self._conn_btn.config(text="連線", bg=CLR_ACCENT)
-            self._fw_var.set("（未連線）")
-            self._set_drive_buttons_state("disabled")
-            self._set_axis_btns_state("disabled")
+            # 中斷期間鎖住按鈕：stop()/disconnect() 搬進背景執行緒後，
+            # _toggle_connect() 會立刻返回，此時 self.ctrl.connected 仍是
+            # True，若不 disable 按鈕，使用者連點會疊出第二條中斷執行緒
+            # （architect 2026-09-03 審查）。
+            self._conn_btn.config(text="中斷中...", state="disabled", bg=CLR_WARN)
+
+            def _do_disconnect():
+                # 先停再斷。少了這行，移動中按「中斷」會關掉 port 卻讓
+                # 馬達繼續跑，程式從此失去對它的控制
+                # （_on_close 有做，這裡以前漏了）。
+                try:
+                    self.ctrl.stop()
+                    self.ctrl.disconnect()
+                except Exception:
+                    logger.exception("中斷連線流程失敗")
+                finally:
+                    # 關窗流程已經 set 這個旗標並準備 destroy root，此時
+                    # 排 after 只會對已銷毀的 widget 操作，直接放棄。
+                    if not self._shutting_down.is_set():
+                        try:
+                            self.root.after(0, self._on_disconnect_result)
+                        except Exception:
+                            pass
+
+            threading.Thread(target=_do_disconnect, daemon=True).start()
         else:
             port = self._port_var.get()
             baud = int(self._baud_var.get())
@@ -5730,9 +5745,24 @@ class DS102GUI:
 
             def _do():
                 ok, msg = self.ctrl.connect(port, baud)
-                self.root.after(0, lambda: self._on_connect_result(ok, msg))
+                # 關窗流程可能與連線流程同時在跑，root 這時可能已 destroy
+                # （中斷分支的同一個既有缺陷，一併補上，見 _do_disconnect）。
+                if not self._shutting_down.is_set():
+                    try:
+                        self.root.after(0, lambda: self._on_connect_result(ok, msg))
+                    except Exception:
+                        pass
 
             threading.Thread(target=_do, daemon=True).start()
+
+    def _on_disconnect_result(self) -> None:
+        """`_do_disconnect()` 背景執行緒收工後，回主執行緒做的 UI 更新。"""
+        self._conn_btn.config(state="normal", text="連線", bg=CLR_ACCENT)
+        self._conn_dot.itemconfig(self._conn_dot_id, fill=CLR_DANGER)
+        self._conn_lbl.config(text="未連線")
+        self._fw_var.set("（未連線）")
+        self._set_drive_buttons_state("disabled")
+        self._set_axis_btns_state("disabled")
 
     def _on_connect_result(self, ok: bool, msg: str):
         self._conn_btn.config(state="normal")

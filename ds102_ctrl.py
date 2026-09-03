@@ -1234,9 +1234,12 @@ class DS102Controller:
         # 中斷連線也要確保點動監看執行緒收工，否則 _jog_stop 會卡在
         # clear() 狀態，motion_active 永遠回報 True（見 emergency_stop 同一類前置缺陷）。
         self._jog_stop.set()
+        # connected 必須先設 False 再關 port：兩者順序顛倒會製造一段「其他
+        # 執行緒看得到 connected=True，但 ser 已關」的窗口（architect
+        # 2026-09-03 審查抓到）。「已宣告不再使用」應先於「實際釋放資源」。
+        self.connected = False
         if self.ser and self.ser.is_open:
             self.ser.close()
-        self.connected = False
         self._log("INFO", "已中斷連線")
 
     # =========================================================================

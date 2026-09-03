@@ -25,11 +25,11 @@
 
 - **DATA1 驅動器分度值已確認生效（2026-08-21 解決，見 [docs/protocol.md](docs/protocol.md) 第 23 行）**。舊版 HANDOVER 把這個列為頭號「真的卡住」問題，**現在已經不是**：使用者用 DATA1 兩極端值（Full-step vs 1/10）重新對比測試，固定 pulse 數移動同一軸，實際移動距離確實等比例縮短，與公式預期一致，取代了 2026-08-18 當時「感覺沒有變少」的疑慮。`axis_calib.division` 的 μm 換算公式因此可信。第二顆「division changing-over switch（R1/R2）」的實際位置仍未確認（手冊那頁是圖片，文字擷取工具讀不到），但不影響這個結論。
 
-### 程式層級（2026-09-01 用 `grep` 逐項重新核對，三項皆確認仍然存在，寫法比舊版更精確）
+### 程式層級（2026-09-01 用 `grep` 逐項重新核對；第 3 項已於 2026-09-03 修正，剩下兩項仍然存在）
 
 1. ~~長按點動的 Python 端限位保護預設不生效~~——**2026-09-02 已部分修正**。`ds102_ctrl.DS102Controller.sync_sw_limits_from_controller()`（architect 評估、`coder` 落地、architect 收尾審查）在 `connect()` 的 `restore_controller_config()` 之後，逐軸逐側查 `CWSLE?`/`CCWSLE?`/`CWSLP?`/`CCWSLP?`，把韌體端限位鏡射進 `self.sw_limits`——合併規則「只收緊、永不放寬、永不清空」：使用者手動輸入並套用過的值不會被覆寫，兩邊都有值時取較嚴格的一側；`main_ai.py` 連線成功時據此跳「已同步」／「⚠ 沒有任何行程保護」兩則橫幅。**這治不好病根本身**——韌體軟體限位出廠／斷電後就是停用的，此時查回來的 `CWSLP?`/`CCWSLP?` 是哨兵值（±99999999），同步邏輯視為無有效邊界，`sw_limits` 依然是 `None`；出廠狀態下長按點動依然全程只靠韌體端限位保護（此時韌體端本身也已停用），跟修正前的實際保護效果相同。這次修法做到的是「兩層彼此同步、無保護時明講」，不是「預設就有保護」——後者需要使用者主動設定並持久化韌體限位。新增 `verify_sw_limit_sync.py`（15 項），**假物件驗證，未真機驗證**：出廠狀態連線後無保護橫幅是否正確跳出、手動設定韌體限位後「目前生效」欄數值是否相符、尋光在 `sw_limits` 有值時 `_targets_reachable()` 是否會誤擋起步，皆待確認。
 2. **`play_recording` 仍繞過 `_check_sw_limit` 與 `PULS` 整數正規化**——`grep -n "_check_sw_limit\b" ds102_ctrl.py` 只在 `move_step`／`goto_point` 相關路徑出現，`play_recording()`（3561～3720 行左右）本體完全不呼叫它；錄製時每步 delay 仍是寫死 800ms（非實際按住時間）。重播無法還原點動的實際行程長度，不能當安全功能用。
-3. **`_toggle_connect` 的中斷分支仍在 Tk 主執行緒做同步序列 I/O**——本次查證發現這點需要比舊版描述更精確：**連線流程本身已經在背景執行緒跑**（`_toggle_connect` 的 `_do()` 用 `threading.Thread(target=_do, daemon=True).start()`，這部分看起來已經不是問題，但沒有找到對應修正 commit，也可能原本就是這樣，需要使用者確認這是不是這次查證才注意到的既有事實）；**仍然阻塞的是中斷分支**——`self.ctrl.stop()` 與 `self.ctrl.disconnect()` 兩行在按下「中斷」當下於主執行緒同步執行。`disconnect()` 本身實作很短（`_jog_stop.set()` + `ser.close()`），阻塞風險比舊版描述的「連線流程」小很多，但它沒有像 `stop()` 那樣的 `STOP_LOCK_TIMEOUT`(0.15s) 逾時保護，理論上 `ser.close()` 仍可能卡住 UI。本次沒有找到相關修正 commit，判斷這項仍然成立，但描述已更新為「中斷分支」而非「連線流程與中斷都有問題」。
+3. ~~`_toggle_connect` 的中斷分支仍在 Tk 主執行緒做同步序列 I/O~~——**2026-09-03 已修正（architect 評估、僅假物件驗證）**。`ctrl.stop()` + `ctrl.disconnect()` 搬進背景執行緒（比照連線分支既有的 `_do()` 寫法），UI 更新抽成 `_on_disconnect_result()` 透過 `root.after()` 回主執行緒；中斷期間立即 disable `_conn_btn` 避免連點疊出第二條中斷執行緒；`root.after` 呼叫前檢查 `_shutting_down`（連線分支既有的同一個缺陷這次一併補上）。`ds102_ctrl.DS102Controller.disconnect()` 同時把 `self.connected = False` 移到 `ser.close()` 之前，消除「其他執行緒看得到 connected=True 但 port 已關」的窗口。**architect 明確定調這個修法不會根治 `ser.close()` 真的卡死的情況**（Win32 `CloseHandle` 理論上仍可能不返回），只是把症狀從「UI 凍結」降級成「按鈕卡在『中斷中...』」——`ser.close()` 沒有可中止機制。**拔線/斷線情境下是否真的會卡住仍待實機驗證**，本次未做。詳見 [docs/safety-fixes.md](docs/safety-fixes.md)〈仍然存在〉第 3 項。
 
 ### 測試涵蓋缺口
 
