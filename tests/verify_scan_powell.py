@@ -33,7 +33,7 @@ import math
 import pytest
 
 import ds102_ctrl  # 只為了 FakeCtrl.limit_direction 委派給真正的實作
-import fiber_scanner as fs
+import core.fiber_scanner as fs
 import fiber_scanner_advanced as fsa
 
 

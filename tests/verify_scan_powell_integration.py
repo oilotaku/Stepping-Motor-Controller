@@ -54,7 +54,7 @@ from unittest.mock import patch
 import pytest
 
 import ds102_ctrl
-import fiber_scanner as fs
+import core.fiber_scanner as fs
 import fiber_scanner_advanced as fsa
 import main_ai
 
@@ -543,7 +543,7 @@ def gui(tmp_path_factory):
     scan_dir = tmp_path_factory.mktemp("scan_powell_gui_scan")
     root, g, patchers = make_gui(
         recording_dir,
-        extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+        extra_patches=[patch("core.fiber_scanner._default_scan_dir", return_value=scan_dir)],
     )
     yield root, g
     close_gui(root, g, patchers)
@@ -639,7 +639,7 @@ class TestScipyUnavailableDegradation:
         root, g, patchers = make_gui(
             recording_dir,
             extra_patches=[
-                patch("fiber_scanner._default_scan_dir", return_value=scan_dir),
+                patch("core.fiber_scanner._default_scan_dir", return_value=scan_dir),
                 patch.object(fsa, "_SCIPY_AVAILABLE", False),
             ],
         )

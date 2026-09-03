@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-import fiber_scanner
-from fiber_scanner import Sample, export_samples_xlsx
+import core.fiber_scanner as fiber_scanner
+from core.fiber_scanner import Sample, export_samples_xlsx
 
 pytestmark = pytest.mark.skipif(
     not fiber_scanner._XLSXWRITER_AVAILABLE,
@@ -326,7 +326,7 @@ class TestPersistSamplesIntegration:
         # 連續兩次 persist_samples() 會算出同一個檔名，tmp.replace() 不
         # 報錯、第一輪的原始樣本會被靜默覆蓋消失。改成微秒精度
         # （%_f）後，同一秒仍要能產生兩組互不覆蓋的 json／xlsx。
-        import fiber_scanner as fs
+        import core.fiber_scanner as fs
         from datetime import datetime as _real_datetime
 
         class _FakeDateTime:

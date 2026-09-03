@@ -57,7 +57,7 @@ import pytest
 
 import ds102_ctrl
 import main_ai
-from fiber_scanner import FiberAlignmentScanner
+from core.fiber_scanner import FiberAlignmentScanner
 
 from conftest import close_gui, make_gui
 

@@ -41,10 +41,10 @@ except ImportError as _scipy_err:  # pragma: no cover - 取決於執行環境
     _SCIPY_AVAILABLE = False
     _SCIPY_IMPORT_ERROR = str(_scipy_err)
 
-from fiber_scanner import REOPEN_STEP_MULT, ScanAbort, NoSignalAbort
+from core.fiber_scanner import REOPEN_STEP_MULT, ScanAbort, NoSignalAbort
 
 if TYPE_CHECKING:
-    from fiber_scanner import FiberAlignmentScanner
+    from core.fiber_scanner import FiberAlignmentScanner
 
 # 軟牆懲罰的預設斜率（dB/pulse）。⚠ 起跳值，非校準值。撞限位或量測失敗時
 # Powell 仍需要一個「比目前最佳點差、且差距與越界距離成比例」的數字，才能

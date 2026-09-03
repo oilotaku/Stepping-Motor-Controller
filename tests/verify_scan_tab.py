@@ -60,7 +60,7 @@ from unittest.mock import patch
 import pytest
 
 import main_ai
-from fiber_scanner import Sample
+from core.fiber_scanner import Sample
 
 from conftest import close_gui, make_gui, pump_until
 
@@ -209,7 +209,7 @@ def gui(tmp_path_factory):
     scan_dir = tmp_path_factory.mktemp("scan_shared_scan")
     root, g, patchers = make_gui(
         recording_dir,
-        extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+        extra_patches=[patch("core.fiber_scanner._default_scan_dir", return_value=scan_dir)],
     )
     yield root, g
     close_gui(root, g, patchers)
@@ -984,7 +984,7 @@ class TestScannerConfigPersistence:
         scan_dir = tmp_path_factory.mktemp("scan_cfg21_scan")
         root, g, patchers = make_gui(
             recording_dir,
-            extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+            extra_patches=[patch("core.fiber_scanner._default_scan_dir", return_value=scan_dir)],
         )
         setup_fake_ctrl(g)
         g.meter = FakeMeter(value=-10.0, ok=True)
@@ -1036,7 +1036,7 @@ class TestScannerConfigPersistence:
         )
         root, g, patchers = make_gui(
             recording_dir,
-            extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+            extra_patches=[patch("core.fiber_scanner._default_scan_dir", return_value=scan_dir)],
         )
         yield root, g
         close_gui(root, g, patchers)
@@ -1091,7 +1091,7 @@ class TestScannerConfigPersistence:
         scan_dir.mkdir()
         root, g, patchers = make_gui(
             tmp_path,
-            extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+            extra_patches=[patch("core.fiber_scanner._default_scan_dir", return_value=scan_dir)],
         )
         close_gui(root, g, patchers)
 
@@ -1196,7 +1196,7 @@ class TestOnCloseNotifiesScanner:
         scan_dir = tmp_path_factory.mktemp("scan_onclose_scan")
         root, g, patchers = make_gui(
             recording_dir,
-            extra_patches=[patch("fiber_scanner._default_scan_dir", return_value=scan_dir)],
+            extra_patches=[patch("core.fiber_scanner._default_scan_dir", return_value=scan_dir)],
         )
 
         class FakeScanner:

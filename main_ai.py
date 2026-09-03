@@ -39,7 +39,7 @@ from typing import Optional, List, Dict, Tuple, Callable
 from dataclasses import dataclass
 
 from core.meter_GPIB import HP8153APowerMeter
-from fiber_scanner import (
+from core.fiber_scanner import (
     FiberAlignmentScanner,
     ScanAbort,
     DEFAULT_STEP_MIN,

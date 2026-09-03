@@ -38,7 +38,7 @@ from pathlib import Path
 
 import pytest
 
-import fiber_scanner as fs
+import core.fiber_scanner as fs
 
 
 # =============================================================================
