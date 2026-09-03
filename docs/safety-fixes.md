@@ -85,3 +85,11 @@
    出廠狀態（`sw_limits` 全 `None`）連線後無保護橫幅是否正確跳出、尋光在 `sw_limits` 有值時 `_targets_reachable()` 是否會誤擋起步，這兩件事仍待驗證。
 2. **`play_recording` 仍繞過 `_check_sw_limit` 與 `PULS` 取整數正規化**（它直接重送原始 `tx`）。而且錄製時每步 delay 是**寫死 800ms**、不是實際按住的時間，所以重播**無法還原點動的行程長度**（實測：錄製走 277 pulse，重播走 1046 pulse）。別把錄製重播當成安全功能。
 3. ~~`_toggle_connect` 仍在 Tk 主執行緒做阻塞式序列 I/O~~——**2026-09-03 已修正（architect 評估、僅假物件驗證）**。中斷分支的 `ctrl.stop()` + `ctrl.disconnect()` 搬進背景執行緒（比照連線分支既有的 `_do()` 寫法），UI 更新抽成 `_on_disconnect_result()` 透過 `root.after()` 回主執行緒；中斷期間立即 disable `_conn_btn`，避免 `_toggle_connect()` 提早返回後使用者連點疊出第二條中斷執行緒；`root.after` 呼叫前檢查 `_shutting_down`，避免對已 `destroy()` 的 root 操作（連線分支既有的同一個缺陷這次一併補上）。`ds102_ctrl.DS102Controller.disconnect()` 同時把 `self.connected = False` 移到 `ser.close()` 之前，消除「其他執行緒看得到 connected=True 但 port 已關」的窗口。**這個修法不會根治 `ser.close()` 真的卡死的情況**（Win32 `CloseHandle` 理論上仍可能不返回）——architect 明確定調這是「把 UI 凍結症狀降級成按鈕卡在『中斷中...』」，不是消除風險；`ser.close()` 沒有可中止機制，加逾時只能讓 UI 復位，不能回收卡住的執行緒。`verify_scan_tab.py` 對應測試改用 `pump_until()`（Python 3.14 tkinter 要求背景執行緒排 `after()` 前主執行緒必須正在跑 mainloop，光 `update()` 不算），並新增「中斷期間按鈕鎖住」的斷言。**拔線/斷線情境下是否真的會卡住仍待實機驗證**，本次未做。
+
+#### 全軸原點復歸中 CW/CCW 仍可點動（2026-09-03，使用者回報，**實機驗證通過**）
+
+使用者回報「按下全軸原點復歸時，CW/CCW 按鈕還能按」。根因不是缺守衛，是**`state="disabled"` 對這兩顆按鈕根本沒生效過**：CW/CCW 用 `.bind("<ButtonPress-1>", ...)` 掛事件（不是 `command=`），tkinter 的 `state="disabled"` 只擋 `command=` callback，不擋 `.bind()` 掛的低階事件——`_set_drive_buttons_state("disabled")` 只讓按鈕視覺變灰，實際點擊仍會觸發 `_on_cw_press`/`_on_ccw_press`。而這兩個 handler 的守衛只查了 `connected`／`ems_active`／`playback_running`，沒查 `_homing`。
+
+危險之處：`origin_all()` 對正在復歸的那一軸會暫時關閉軟體限位（原點通常落在行程末端 POS≈0，會被軟限位擋住），此時若還能發出點動指令，等於在唯一的安全網關閉時移動該軸。
+
+修法：`_on_cw_press`/`_on_ccw_press` 的守衛加上 `self._any_long_op_running()`（既有的長時間作業註冊表，見〈main_ai.py 架構〉），一次涵蓋全軸復歸／尋光／原點復歸重現性量測／重播四項，不再手刻個別旗標。`_drive_buttons` 裡目前只有 CW/CCW 這兩顆用 `.bind()` 模式，其餘（含「全軸原點復歸」按鈕自己）都是 `command=`，不受影響。既有十一支回歸測試（436 項）全數通過（沒有測試直接覆蓋這個缺陷——原本就是要人工按按鈕才會發現）。**2026-09-03 實機驗證通過**：全軸原點復歸執行中按住 CW/CCW 完全無反應。

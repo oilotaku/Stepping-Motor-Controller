@@ -2676,6 +2676,7 @@ class DS102GUI:
             not self.ctrl.connected
             or self.ctrl.ems_active
             or self.ctrl.playback_running
+            or self._any_long_op_running()
         ):
             return
         mode = self._drive_mode_var.get()
@@ -2703,6 +2704,7 @@ class DS102GUI:
             not self.ctrl.connected
             or self.ctrl.ems_active
             or self.ctrl.playback_running
+            or self._any_long_op_running()
         ):
             return
         mode = self._drive_mode_var.get()
