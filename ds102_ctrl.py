@@ -34,16 +34,31 @@ import serial
 # =============================================================================
 def _app_dir() -> Path:
     """
-    程式所在目錄——**不是**目前工作目錄。
+    專案根目錄（放 logs/recordings/data 的位置）——**不是**目前工作目錄，
+    也**不是**本檔案所在目錄。
 
     以前三個資料目錄用 `Path("logs")` 這種相對路徑，綁在 CWD 上：直接跑
     .py 時看不出問題，但打包成 exe 後從開始功能表啟動，CWD 可能變成
     C:\\Windows\\System32，教點與行程會被存到那裡且每次啟動位置不同看到的
     清單都不一樣。改成以執行檔位置為基準，走到哪都指向同一份資料。
+
+    2026-09-03：分資料夾遷移第一步。本檔未來會搬進 core/ 子資料夾，
+    若沿用「本檔所在目錄」（`Path(__file__).resolve().parent`）就會多繞一層，
+    算出 core/ 而不是專案根，recordings/logs/data 會悄悄跑去錯的位置且完全
+    不報錯。改成往上尋找「含 main_ai.py（主程式入口，架構上固定留在根目
+    錄不搬）的目錄」，這樣不管本檔被搬到第幾層子資料夾，算出來的都還是
+    同一個專案根——搬檔案這件事本身不會影響任何人的 recordings/logs/data
+    位置。
     """
     if getattr(sys, "frozen", False):  # PyInstaller 打包後為 True
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    here = Path(__file__).resolve().parent
+    for candidate in (here, *here.parents):
+        if (candidate / "main_ai.py").exists():
+            return candidate
+    # 找不到 main_ai.py（理論上不會發生，除非本檔被複製到專案外執行）：
+    # 退回本檔所在目錄，至少行為可預期，不會靜默指向奇怪的位置。
+    return here
 
 
 _BASE_DIR = _app_dir()

@@ -298,14 +298,24 @@ def _weighted_least_squares(
 
 def _default_scan_dir() -> Path:
     """
-    掃描樣本的預設輸出目錄，比照 main_ai.py 的 _app_dir() 邏輯：
-    以程式所在位置為準，不是目前工作目錄（見 CLAUDE.md〈執行期目錄
-    與啟動流程〉——這裡刻意不 import main_ai，所以邏輯獨立複製一份）。
+    掃描樣本的預設輸出目錄，比照 ds102_ctrl.py 的 _app_dir() 邏輯：
+    以「專案根目錄」（含 main_ai.py 的目錄）為準，不是目前工作目錄、
+    也不是本檔所在目錄（見 CLAUDE.md〈執行期目錄與啟動流程〉——這裡
+    刻意不 import ds102_ctrl / main_ai，所以邏輯獨立複製一份）。
+
+    2026-09-03：分資料夾遷移第一步，理由與 ds102_ctrl.py 的 _app_dir()
+    相同——本檔未來會搬進 core/ 子資料夾，用「本檔所在目錄」會多繞一層
+    算錯位置。改成往上尋找含 main_ai.py 的目錄，搬檔案不影響輸出位置。
     """
     if getattr(sys, "frozen", False):
         base = Path(sys.executable).resolve().parent
     else:
-        base = Path(__file__).resolve().parent
+        here = Path(__file__).resolve().parent
+        base = here
+        for candidate in (here, *here.parents):
+            if (candidate / "main_ai.py").exists():
+                base = candidate
+                break
     return base / "recordings" / "scans"
 
 
