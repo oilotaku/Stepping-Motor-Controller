@@ -93,7 +93,7 @@ def make_meter(fake_instrument=None, gpib_address=21, channel=1, wavelength_nm=1
     fake_rm = MagicMock()
     fake_rm.open_resource.return_value = fake_instrument
     with patch("pyvisa.ResourceManager", return_value=fake_rm):
-        import meter_GPIB
+        from core import meter_GPIB
         meter = meter_GPIB.HP8153APowerMeter(
             gpib_address=gpib_address, channel=channel, wavelength_nm=wavelength_nm
         )

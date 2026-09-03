@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Callable
 from dataclasses import dataclass
 
-from meter_GPIB import HP8153APowerMeter
+from core.meter_GPIB import HP8153APowerMeter
 from fiber_scanner import (
     FiberAlignmentScanner,
     ScanAbort,
