@@ -55,7 +55,7 @@ import pytest
 
 import ds102_ctrl
 import core.fiber_scanner as fs
-import fiber_scanner_advanced as fsa
+import core.fiber_scanner_advanced as fsa
 import main_ai
 
 from conftest import close_gui, make_gui, pump_until

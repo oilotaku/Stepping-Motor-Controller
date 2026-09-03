@@ -61,7 +61,7 @@ from core.fiber_scanner import (
 # 不會循環相依。這裡只讀 `_SCIPY_AVAILABLE` / `_SCIPY_IMPORT_ERROR` 兩個
 # 模組屬性決定 GUI 要不要讓使用者選到這個選項，不直接呼叫模組內的函式
 # （那是 fiber_scanner.FiberAlignmentScanner.run() 內部的事）。
-import fiber_scanner_advanced
+from core import fiber_scanner_advanced
 # DS102Controller 與其專屬的模組層級常數／函式已抽到 ds102_ctrl.py
 # （2026-08-17，架構拆分第一階段 1a，機械式搬移，行為不變）。
 # 這裡把 GUI 端仍需要的名字重新引入自己的命名空間，其餘只有

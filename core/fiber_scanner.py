@@ -945,7 +945,7 @@ class FiberAlignmentScanner:
             # 的 import 形成循環相依，所以刻意延遲到這裡才 import；用模組
             # 別名（而非 from ... import run_stage_powell）方便測試對這個
             # 模組屬性做 monkeypatch。
-            import fiber_scanner_advanced as _fsa
+            import core.fiber_scanner_advanced as _fsa
             idx = len(self.samples)
 
             def _early_check() -> None:
@@ -1004,7 +1004,7 @@ class FiberAlignmentScanner:
         try/except 當第二道防線，見 persist_samples() 與
         _persist_samples_xlsx()。
         """
-        import fiber_scanner_advanced as _fsa
+        import core.fiber_scanner_advanced as _fsa
 
         return {
             "xtol_pulse": _fsa.DEFAULT_XTOL_PULSE,
@@ -1875,7 +1875,7 @@ class FiberAlignmentScanner:
             # 本模組的 import 形成循環相依，比照 _run_primary_algorithm()
             # 的既有寫法；改用 Powell 自己的容差常數乘上 REOPEN_STEP_MULT
             # 當同一個量級的替代依據。
-            import fiber_scanner_advanced as _fsa
+            import core.fiber_scanner_advanced as _fsa
             h_scale_hint = _fsa.DEFAULT_XTOL_PULSE * REOPEN_STEP_MULT
         else:
             h_scale_hint = initial_step.get(axis, self.step_min * 8)
