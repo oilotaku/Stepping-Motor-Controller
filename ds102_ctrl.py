@@ -1,17 +1,15 @@
 # =============================================================================
 # DS102/DS112 控制器核心模組
 #
-# 2026-08-17 從 main_ai.py 抽出（架構拆分第一階段 1a）。DS102Controller
-# 本來就設計成完全不碰 tkinter（靠 set_log_callback/set_alarm_callback/
-# set_power_reader 三個 callback 對外通知），這裡是機械式搬移，不涉及
-# 重新設計狀態共享方式——全案仍然只有 DS102GUI.__init__ 那一處
-# `self.ctrl = DS102Controller()` 實例化點，物件身分不受影響。
+# 2026-08-17 從 main_ai.py 抽出。DS102Controller 本來就設計成完全不碰
+# tkinter（靠 set_log_callback/set_alarm_callback/set_power_reader 三個
+# callback 對外通知），這裡是機械式搬移——全案仍然只有 DS102GUI.__init__
+# 那一處 `self.ctrl = DS102Controller()` 實例化點，物件身分不受影響。
 #
 # main_ai.py 用 `from ds102_ctrl import DS102Controller` 取得這個類別；
-# 本檔內其餘只被 main_ai.py（GUI 端）用到的模組層級常數/函式，也一併從
-# main_ai.py 用 `from ds102_ctrl import ...` 重新引入，避免同一個名字
-# 留兩份定義。哪些常數留在這裡、哪些留在 main_ai.py，判斷依據單純是
-# 「DS102Controller 本身有沒有用到」——不是語意分類。
+# 只被 main_ai.py（GUI 端）用到的模組層級常數/函式也一併重新引入，避免
+# 同一個名字留兩份定義。哪些常數留在這裡、哪些留在 main_ai.py，判斷依據
+# 單純是「DS102Controller 本身有沒有用到」，不是語意分類。
 # =============================================================================
 
 import sys
@@ -38,12 +36,10 @@ def _app_dir() -> Path:
     """
     程式所在目錄——**不是**目前工作目錄。
 
-    以前三個資料目錄都是 `Path("logs")` 這種相對路徑，等於綁在 CWD 上。
-    直接跑 .py 時 CWD 通常就是專案資料夾所以看不出問題，但打包成 exe 之後：
-      - 從開始功能表／捷徑啟動，CWD 可能是 C:\\Windows\\System32
-        → 教點與行程會被存到那裡，使用者以為資料不見了
-      - 每次從不同位置啟動，看到的行程清單都不一樣
-    改成以執行檔位置為基準，走到哪都指向同一份資料。
+    以前三個資料目錄用 `Path("logs")` 這種相對路徑，綁在 CWD 上：直接跑
+    .py 時看不出問題，但打包成 exe 後從開始功能表啟動，CWD 可能變成
+    C:\\Windows\\System32，教點與行程會被存到那裡且每次啟動位置不同看到的
+    清單都不一樣。改成以執行檔位置為基準，走到哪都指向同一份資料。
     """
     if getattr(sys, "frozen", False):  # PyInstaller 打包後為 True
         return Path(sys.executable).resolve().parent
@@ -68,9 +64,9 @@ def _write_json_with_backup(path: Path, data: dict, log=None) -> None:
     覆寫 JSON 設定檔前先留一份 .bak，並以「先寫暫存再置換」避免寫到一半壞檔。
 
     這些檔（teaching_points / speed_profiles）是把整個記憶體字典整份寫回，
-    所以任何沒先 load 就儲存的程式碼路徑都會把既有內容清空——實際發生過兩次，
-    都是測試腳本建了新的 DS102Controller 就呼叫 save/delete。
-    .bak 讓這種意外可以直接復原。
+    所以任何沒先 load 就儲存的程式碼路徑都會把既有內容清空——實際發生過
+    兩次，都是測試腳本建了新的 DS102Controller 就呼叫 save/delete。.bak
+    讓這種意外可以直接復原。
     """
     if path.exists():
         try:
@@ -87,9 +83,9 @@ def _write_json_with_backup(path: Path, data: dict, log=None) -> None:
     # 目錄可能不存在（測試直接指定路徑、或 init_runtime() 沒跑過）
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 例外要在這裡收掉並轉成 LOG + 例外往上拋給呼叫端判斷，不能讓
-    # OSError 直接穿過 Tk callback 變成 traceback。磁碟滿、防毒鎖檔、
-    # 或 exe 被放在唯讀位置時都會走到這裡——打包之後尤其容易遇上。
+    # 例外要在這裡收掉並轉成 LOG + 往上拋給呼叫端判斷，不能讓 OSError
+    # 直接穿過 Tk callback 變成 traceback。磁碟滿、防毒鎖檔、或 exe 被放
+    # 在唯讀位置時都會走到這裡——打包之後尤其容易遇上。
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         tmp.write_text(
@@ -113,13 +109,11 @@ def _write_json_with_backup(path: Path, data: dict, log=None) -> None:
 # app_settings / safety_settings（本檔）與 meter_config / scanner_config
 # （main_ai.py）四份讀取函式原本逐字重複同一套骨架：exists 檢查 →
 # read_text → json.loads → except (OSError, JSONDecodeError) →
-# isinstance(dict) 檢查 → 回傳 data。2026-08-18 依 architect 評估抽成
-# 這支共用函式（純函式抽取、四個呼叫點都只在啟動時各跑一次，風險低）。
+# isinstance(dict) 檢查 → 回傳 data。2026-08-18 抽成這支共用函式。
 #
-# 四者的差異——訊息文字、log 等級（ERROR vs INFO）、「不存在」與「成功」
-# 兩種情況要不要記錄、用 log 回呼還是模組 logger——全部靠參數重現，
-# 刻意不「平均化」：這是純粹的行為保留重構，不能改變任何一個呼叫點的
-# 可觀察行為（log 文字、log 等級、回傳值都要與重構前逐字相同）。
+# 四者的差異——訊息文字、log 等級、「不存在」與「成功」要不要記錄、用
+# log 回呼還是模組 logger——全部靠參數重現，刻意不「平均化」：純粹的
+# 行為保留重構，不能改變任何呼叫點的可觀察行為。
 # =============================================================================
 def _log_level_adapter(level: str, msg: str) -> None:
     """
@@ -203,11 +197,11 @@ def _load_json_settings(
 # =============================================================================
 # UI 節奏／顯示上限與色票設定（app_settings.json）
 #
-# 邏輯上是「給維護人員手動編輯的 UI 靜態設定」（main_ai.py 的 CLR_* 色票、
-# POSITION_POLL_INTERVAL 等大部分欄位都在那邊使用），但下方 HISTORY_MAX
-# 需要透過 _app_setting_num() 覆寫，而 HISTORY_MAX 是 DS102Controller
-# 用的常數。為了不讓 main_ai.py 反過來 import 這個檔案造成循環相依，
-# 整組（_load_app_settings / _app_setting_num / _app_settings）留在這裡，
+# 邏輯上是給維護人員手動編輯的 UI 靜態設定（main_ai.py 的 CLR_* 色票、
+# POSITION_POLL_INTERVAL 等大部分欄位在那邊使用），但下方 HISTORY_MAX
+# 是 DS102Controller 用的常數、需要 _app_setting_num() 覆寫。為了不讓
+# main_ai.py 反過來 import 這個檔案造成循環相依，整組
+# （_load_app_settings / _app_setting_num / _app_settings）留在這裡，
 # main_ai.py 用到的部分改成 from ds102_ctrl import 回去。
 # =============================================================================
 def _load_app_settings() -> dict:
@@ -215,19 +209,15 @@ def _load_app_settings() -> dict:
     讀取 UI 節奏／顯示上限與色票設定（app_settings.json）。
 
     跟 meter_config.json／scanner_config.json 不同：這份是給維護人員
-    手動編輯的靜態設定，程式只讀不寫，所以沒有對應的 `_save_app_settings()`
-    ——沒有任何執行路徑會把這些值寫回檔案。
+    手動編輯的靜態設定，程式只讀不寫，沒有對應的 `_save_app_settings()`。
 
-    這支函式在 **模組載入時**（任何 class 定義之前）就會被呼叫，此時
-    `logger` 還沒有 `init_runtime()` 掛上的 FileHandler（那要等 main()
-    呼叫 init_runtime() 才會建立），所以這裡的 log 不一定會落地到
-    logs/*.log，但呼叫方式與既有的 `_load_meter_config` 一致，之後
-    log 系統就緒時的行為不受影響。
+    這支函式在模組載入時（任何 class 定義之前）就會被呼叫，此時 `logger`
+    還沒有 `init_runtime()` 掛上的 FileHandler，所以這裡的 log 不一定會
+    落地到 logs/*.log，但呼叫方式與既有的 `_load_meter_config` 一致。
 
     找不到檔案、壞檔、或個別欄位缺漏都不中止載入：找不到檔案就整份回傳
-    空字典，個別欄位由呼叫端逐一 `.get(key, 預設值)` 退回目前寫死的
-    預設值——不是整份退回、也不是報錯中止。這些值沒有安全含意，
-    只記 INFO 不需要 WARN。
+    空字典，個別欄位由呼叫端逐一 `.get(key, 預設值)` 退回內建預設值。
+    這些值沒有安全含意，只記 INFO 不需要 WARN。
     """
     return _load_json_settings(
         RECORDING_DIR / "app_settings.json",
@@ -263,18 +253,17 @@ _app_settings = _load_app_settings()
 # B 類：安全相關常數設定（safety_settings.json）
 #
 # 與上面的 app_settings.json 刻意分成獨立檔案、獨立機制：A 類是 UI 節奏／
-# 色票，改壞了最多介面卡頓；這裡的六顆常數牽涉通訊重送次數、到位逾時、
-# 限位監看頻率、STOP 插隊搶鎖時限、通訊失聯判定門檻——改壞了會直接影響
-# 「撞限位要多久才停下來」這類安全行為。recordings/ 整個目錄不進版控、
-# 沒有 PR review 這道關卡，把安全常數跟色票放同一份檔案會讓人誤以為
-# 兩者風險等級相同，所以刻意不沿用 _load_app_settings／_app_setting_num。
+# 色票，改壞了最多介面卡頓；這裡六顆常數牽涉通訊重送次數、到位逾時、
+# 限位監看頻率、STOP 插隊搶鎖時限、通訊失聯判定門檻，改壞了會直接影響
+# 「撞限位要多久才停下來」這類安全行為。recordings/ 不進版控、沒有 PR
+# review，跟色票放同一份檔案會讓人誤以為風險等級相同，故不沿用
+# _load_app_settings／_app_setting_num。
 #
-# 驗證也因此比 A 類嚴格：A 類只檢查型別，這裡型別對了還要落在合理範圍內
-# ——例如 stop_lock_timeout 打成 500 秒不會讓程式崩潰，但等同拿掉
-# 「STOP 插隊直接寫入」這層保護。範圍之外一律拒絕、退回內建預設值
-# （不 clamp 到邊界：貼著邊界的值本身也未必是維護人員的本意），並記
-# WARNING（比 A 類的 INFO 高一級）＋寫進 _safety_setting_rejections。
-# 這份清單目前只在模組層級準備好，GUI 端的橫幅顯示是後續任務。
+# 驗證也更嚴格：A 類只檢查型別，這裡型別對了還要落在合理範圍內——例如
+# stop_lock_timeout 打成 500 秒不會讓程式崩潰，但等同拿掉「STOP 插隊
+# 直接寫入」這層保護。範圍之外一律拒絕、退回內建預設值（不 clamp 到邊
+# 界），並記 WARNING（比 A 類高一級）＋寫進 _safety_setting_rejections
+# （目前只在模組層級準備好，GUI 端橫幅顯示是後續任務）。
 # =============================================================================
 def _load_safety_settings() -> dict:
     """
@@ -401,49 +390,40 @@ STOP_LOCK_TIMEOUT = _safety_setting_num(
     _safety_settings, "stop_lock_timeout", 0.15, float, 0.0, 0.5
 )
 
-# 原點復歸「有沒有真的執行」的判定參數（2026-08-21 COM2 實機驗證抓到：
-# Z 軸送出 GO ORG 後第一次 SB1? 往返約 56ms，但 Driving 位元要 +0.08s
-# 才 assert，_wait_origin_done() 舊語意「非 Driving 即完成」會在復歸
-# 根本還沒開始時就回報成功，下游 set_position(axis_no, "0") 因此在
-# 滑台飛行途中把座標系原點寫在錯的地方）。
+# 原點復歸「有沒有真的執行」的判定參數（2026-08-21 COM2 實機驗證：Z 軸
+# 送出 GO ORG 後第一次 SB1? 往返約 56ms，但 Driving 位元要 +0.08s 才
+# assert，舊語意「非 Driving 即完成」會在復歸還沒開始時就回報成功，
+# 下游 set_position(axis_no, "0") 因此在滑台飛行途中寫錯座標原點）。
 #
-# 🔴 刻意不外部化成 safety_settings.json 的第七顆常數——CLAUDE.md
-# 定義的 B 類安全常數清單是固定六顆（MAX_RETRY/WAIT_TIMEOUT/
-# WAIT_INTERVAL/JOG_WATCH_INTERVAL/STOP_LOCK_TIMEOUT/COMM_FAIL_
-# THRESHOLD），新增這兩顆並讓它們可被 safety_settings.json 覆寫，
-# 等於讓維護人員可以把「復歸有沒有真的執行」這道驗證整組關掉或調鬆
-# 到失去意義——而這正是這次要新增的保護，不是可以選擇性停用的旋鈕。
+# 🔴 刻意不外部化成 safety_settings.json——CLAUDE.md 定義的 B 類安全
+# 常數清單是固定六顆，新增這兩顆並可被覆寫，等於讓維護人員能把「復歸
+# 有沒有真的執行」這道驗證整組關掉或調鬆到失去意義。
 #
 # 2026-08-21 COM2 實測的 Driving assert 延遲（決定 GRACE 要多長）：
-#   GO ORG（壓在限位上出發）  96 ms
-#   GO CW （一般步進）        96 ms
-#   GO ORG（離開限位後出發）  80 ms
-# 三種起始條件幾乎一致，所以延遲是韌體處理 GO 指令的固定成本，跟
-# 「是不是從限位上出發」無關。GRACE 取 2.0s 對 96ms 有約 20 倍餘裕。
+#   GO ORG（壓在限位上出發）96ms／GO CW（一般步進）96ms／
+#   GO ORG（離開限位後出發）80ms——三者幾乎一致，延遲是韌體處理 GO
+#   指令的固定成本，跟出發位置無關。GRACE 取 2.0s，對 96ms 約 20 倍餘裕。
 ORIGIN_START_GRACE = 2.0   # 送出 GO ORG 後容許 Driving 尚未 assert 的寬限期（秒）
 ORIGIN_MOTION_EPS = 2.0    # 判定「POS 確實變化過」的門檻（pulse）
 ORIGIN_START_POLL = 0.1    # 寬限期內的快輪詢間隔（秒）
-# 寬限期內刻意不用 WAIT_INTERVAL(0.5s)：2 秒只取樣 4 次，對 96ms 的
-# assert 延遲解析度太差。用 0.1s 可得約 20 次機會，且只有「還沒看到
-# Driving」這條路徑會用到——Driving 一 assert 就切回 WAIT_INTERVAL 的
-# 節奏，正常復歸最多只多送 1～3 筆 SB1?。
+# 寬限期內不用 WAIT_INTERVAL(0.5s)：2 秒只取樣 4 次，對 96ms 的 assert
+# 延遲解析度太差；0.1s 約 20 次機會，且只有「還沒看到 Driving」這條路
+# 徑用到——一 assert 就切回 WAIT_INTERVAL 節奏，正常復歸最多多送 1~3 筆。
 
 # 一般步進移動「有沒有真的起步」的判定參數（2026-08-26；CLAUDE.md 自
-# 2026-08-21 起記載的「孿生競態」技術債）。上面那組常數修的是
-# `_wait_origin_done()`，這組修的是它在 `_wait_axis_stop()` 的孿生體：
-# 舊語意 `status == "Stop"` 直接 return True，而實測 `GO CW` 的 Driving
-# assert 延遲同樣是 96ms、`_wait_axis_stop()` 第一次 `query_status()`
-# 要 SB3?+SB1? 兩次往返約 112ms——**餘裕只有約 16ms**。落在那個窗口裡
-# 就會把「還沒起步」讀成「已經停好」，`move_step(wait_done=True)` 在軸
-# 飛行中回報成功，下游 `goto_point()` 會提前送出下一軸、
-# `fiber_scanner._measure_here()` 會在移動中量光功率。
+# 2026-08-21 記載的「孿生競態」技術債，修的是上面那組的孿生體
+# `_wait_axis_stop()`）。舊語意 `status == "Stop"` 直接 return True，
+# 而 `GO CW` 的 Driving assert 延遲同樣是 96ms、`_wait_axis_stop()` 第
+# 一次查詢要 SB3?+SB1? 兩次往返約 112ms——餘裕只有約 16ms，落在窗口裡
+# 就把「還沒起步」讀成「已經停好」：`move_step(wait_done=True)` 在軸
+# 飛行中回報成功，下游 `goto_point()` 提前送下一軸、
+# `fiber_scanner._measure_here()` 在移動中量光功率。
 #
-# 🔴 同 ORIGIN_* 那組，刻意不外部化成 safety_settings.json——那會讓維護
-# 人員可以把這道驗證整組調鬆到失去意義。
+# 🔴 同 ORIGIN_* 那組，刻意不外部化成 safety_settings.json。
 #
-# GRACE 取 1.0s（對 96ms 約 10 倍餘裕）而非復歸那邊的 2.0s：步進移動
-# 本身可能只有幾毫秒，寬限期唯一的代價是「出發前就壓在該方向限位上」
-# 這種必定失敗的情境要多等這麼久才報錯，取短一點比較合理。
+# GRACE 取 1.0s（對 96ms 約 10 倍餘裕）而非復歸那邊的 2.0s：步進移動本身
+# 可能只有幾毫秒，寬限期的代價是「出發前就壓在限位上」這種必敗情境要
+# 多等才報錯，取短一點較合理。
 MOVE_START_GRACE = 1.0     # 送出 GO CW/CCW 後容許 Driving 尚未 assert 的寬限期（秒）
 MOVE_START_POLL = 0.05     # 寬限期內的快輪詢間隔（秒）
 MOVE_POS_EPS = 1.0         # 「已走完預期行程」的容差（pulse），與量測路徑的 offset-1 同一慣例
@@ -637,22 +617,18 @@ class DS102Controller:
         self.firmware = ""
         self.axis_count = 0
         # 各軸驅動器分割設定（AXI{n}:DRDIV? 原始回應字串，0=full step…15=1/250）。
-        # 🔴 對這台滑台裝的 AMS（微步進）型驅動器沒有意義——手冊(ds102 (2).pdf
-        # p.73-75)明講 MS 型驅動器的細分是打開外殼調實體旋轉開關，:DRDIV 指令
-        # 對它不生效，控制器也沒有電路能讀回實體開關位置。2026-08-18 實測：
-        # 使用者把實體開關轉到 6，這裡查回來依然是 0——查到的只是控制器內部
-        # 一個沒人寫過的軟體暫存器，跟實體開關無關，不是查詢邏輯錯誤。
-        # 連線時查一次、之後不會變，純資訊性顯示，不做任何 pulse→um 換算
-        # ——RESOLUT? 在這台機器上實測回傳 1，代表控制器裡沒有配置真實尺度，
-        # 貿然拿 DRDIV 去乘除會是未經驗證的假設（同一個理由，2026-08-05 拿掉
-        # 了 um/mm 單位切換，見 CLAUDE.md）。
+        # 🔴 對這台滑台裝的 AMS（微步進）型驅動器沒有意義——手冊明講 MS 型
+        # 驅動器的細分是打開外殼調實體旋轉開關，:DRDIV 指令對它不生效，控制
+        # 器也沒有電路能讀回實體開關位置（2026-08-18 實測：開關轉到 6，這裡
+        # 查回來依然是 0，查到的只是沒人寫過的軟體暫存器）。連線時查一次、
+        # 純資訊性顯示，不做任何 pulse→um 換算——RESOLUT? 實測回傳 1，代表
+        # 控制器沒有配置真實尺度，貿然乘除是未經驗證的假設（同一理由，
+        # 2026-08-05 拿掉了 um/mm 單位切換，見 CLAUDE.md）。
         self.axis_drdiv: Dict[str, str] = {}
         # 軸機械校正參數（螺桿導程 / 馬達步進角 / 使用者手動設定的分割倍數）。
         # 純粹用來把 pulse「額外」估算成 μm 顯示——不影響任何移動、限位、
-        # 教點比對邏輯，那些永遠只認 pulse（同一個理由，2026-08-05 拿掉了
-        # um/mm 單位切換，見上方 axis_drdiv 的說明與 CLAUDE.md）。
-        # 只有參數完整的軸才會是這個字典的 key，缺參數的軸沒有這個 key
-        # （不像 sw_limits 六軸都預先擺好 (None, None)）。
+        # 教點比對邏輯，那些永遠只認 pulse。只有參數完整的軸才會是這個
+        # 字典的 key（不像 sw_limits 六軸都預先擺好 (None, None)）。
         self.axis_calib: Dict[str, dict] = {}
         # 同 _points_loaded：沒載入就存檔會把既有校正參數整份蓋掉
         self._axis_calib_loaded = False
@@ -2176,13 +2152,11 @@ class DS102Controller:
                         else:
                             failed.append(f"{ax}(歸零失敗 POS={pos3})")
             finally:
-                # 無論成功與否都要把軟體限位還原回去。
-                #
-                # 還原不到就一律開啟（"1"），絕不 fallback 到停用：
-                # _serial_write_read 三次失敗會回傳空字串，舊寫法的 `cw or '0'`
-                # 會把它變成 '0'＝停用，於是「序列埠壅塞一下」就等於把韌體端
-                # 唯一可靠的那層保護永久關掉，而且不留任何痕跡。
-                # 保護該有的失效方向是「寧可多擋」，不是「寧可放行」。
+                # 無論成功與否都要把軟體限位還原回去，還原不到就一律開啟
+                # （"1"），絕不 fallback 到停用：`cw or '0'` 這種寫法在
+                # _serial_write_read 三次失敗回傳空字串時會變成停用，等於
+                # 序列埠壅塞一下就把韌體端唯一可靠的保護永久關掉，且不留
+                # 痕跡。保護該有的失效方向是「寧可多擋」，不是「寧可放行」。
                 for axis_no, (cw, ccw) in saved.items():
                     ax = NO_AXIS.get(axis_no, axis_no)
                     for cmd, val in (("CWSLE", cw), ("CCWSLE", ccw)):
@@ -2310,34 +2284,28 @@ class DS102Controller:
 
                 ax_name = NO_AXIS.get(axis_no, axis)
                 # 只記錄、不改寫：MEMSW7=0 才會讓控制器在復歸完成後自動把
-                # POS 歸零（見 origin_all 的同一段說明），殘差數字的物理
-                # 意義跟這個值是否為 0 有關，附進每組合的 metadata 供事後
-                # 判讀，不影響任何量測邏輯。
+                # POS 歸零（見 origin_all 同段說明），附進每組合 metadata
+                # 供事後判讀，不影響量測邏輯。
                 axis_memsw7 = self._serial_write_read(f"AXI{axis_no}:MEMSW7?").strip()
 
                 # 暫停該軸的韌體軟體限位——offset 可能把軸推到韌體限位以外
-                # （比照 origin_all 的既有規則：讀不到一律還原成 1／啟用，
+                # （比照 origin_all 既有規則：讀不到一律還原成 1／啟用，
                 # 不可 fail-unsafe，見下方 finally）。
                 saved_limits = self._soft_limits_enabled(axis_no)
                 self._set_soft_limits_enabled(axis_no, False)
                 try:
-                    # 基準復歸：不能假設「進場時 POS≈0」。使用者可能剛手動
-                    # 點動過，或方向是手動指定（代表當下沒有壓在任何限位，
-                    # 也就是判不出來自動方向的那種情況——本來就不在原點）。
-                    # 沒有這一步，第一組 offset 的殘差會混進「進場時離原點
-                    # 多遠」的誤差：offset=100 但起點離原點 3000 pulse，
-                    # 復歸後殘差 ≈3000 遠超漂移門檻（0.25×100=25），會被
-                    # 誤判成「偵測到累積漂移」，樣本只有 1 筆、統計整欄
-                    # 變 None，顯示的失敗原因本身就是錯的（architect
+                    # 基準復歸：不能假設進場時 POS≈0（使用者可能剛手動點動
+                    # 過，或方向是手動指定）。沒有這一步，第一組 offset 的
+                    # 殘差會混進「進場時離原點多遠」的誤差：offset=100 但
+                    # 起點離原點 3000 pulse，復歸後殘差 ≈3000 遠超漂移門檻
+                    # （0.25×100=25），會被誤判成累積漂移（architect
                     # 2026-08-21 審查抓到）。
                     #
-                    # 🔴 這次歸零定義了整組量測的座標框架，是全流程最重要
-                    # 的一次寫入，所以走四步驗證（architect 2026-08-21 第二
-                    # 輪追加）：驗證復歸真的執行過 → 確認軸已停穩 → 寫 0 →
-                    # 回讀確認。實機驗證證實，少了這幾步時基準復歸會踩到
+                    # 🔴 這次歸零定義了整組量測的座標框架，是全流程最重要的
+                    # 一次寫入，故走四步驗證：驗證復歸真的執行過 → 確認軸
+                    # 已停穩 → 寫 0 → 回讀確認。少了這幾步時基準復歸會踩到
                     # 「Driving 尚未 assert」競態、把 POS 0 寫在飛行途中，
-                    # 整軸資料靜默作廢且沒有任何 origin_lost 標記（實測 Y 軸
-                    # 因此多出 83 pulse 的假性系統偏移）。
+                    # 整軸資料靜默作廢（實測 Y 軸因此多出 83 pulse 假性偏移）。
                     base_ok, base_reason = self._do_origin_ex(
                         axis_no, org_type, l_speed, f_speed, rate, s_rate,
                         abort_event=stop_event,
@@ -2373,13 +2341,11 @@ class DS102Controller:
                         continue
 
                     # 方向自動判定搬到基準復歸之後（architect 2026-08-21
-                    # 建議改善 N1）：判定依賴「當下正壓在某側限位」，剛做完
-                    # 基準復歸的軸必然回到原點、也就必然壓在某側限位上，
-                    # 判定幾乎必定成功。放在復歸之前的舊寫法，使用者若剛
-                    # 手動點動停在行程中間、又沒手動指定方向，會被誤判成
-                    # 「無法自動判定」而整軸跳過——其實只要先復歸一次就
-                    # 能判出來。`_do_origin()` 不需要 `direction` 參數，
-                    # 兩者沒有相依，搬動不影響基準復歸本身。
+                    # 建議 N1）：判定依賴「當下正壓在某側限位」，剛復歸完的
+                    # 軸必然壓在某側限位上，判定幾乎必定成功。放在復歸之前
+                    # 的舊寫法，使用者若剛手動點動停在行程中間又沒指定方向，
+                    # 會被誤判成無法自動判定而整軸跳過。`_do_origin()` 不需要
+                    # `direction` 參數，搬動不影響基準復歸本身。
                     direction = directions.get(axis)
                     if direction not in ("CW", "CCW"):
                         st2, _ = self.query_status(axis_no)
@@ -2409,14 +2375,11 @@ class DS102Controller:
                             combo_done_cb(axis, offset, combo_result)
                         if combo_result.get("origin_lost"):
                             # 座標系已失準：這一軸剩下的 offset 既不可信
-                            # （殘差是在未歸零的參考框裡量的，會誤報成
-                            # 「累積漂移」——M4 修掉的問題用另一種路徑
-                            # 復發），也不安全（下一個組合的 at_origin
-                            # 初始值恆為 True，若它在第一輪之前就被中止，
-                            # finally 會把 POS 0 寫在滑台當下的任意位置）。
-                            # 整軸收手，讓使用者先手動復歸——只中止這一軸，
-                            # 不中止整批，其他軸各自有自己的基準復歸不受
-                            # 影響（architect 2026-08-21 第二輪審查抓到）。
+                            # （殘差在未歸零的參考框裡量，會誤報成累積漂移），
+                            # 也不安全（下一組合若在第一輪之前就被中止，
+                            # finally 會把 POS 0 寫在滑台當下任意位置）。整軸
+                            # 收手讓使用者先手動復歸，只中止這一軸，其他軸
+                            # 各自有自己的基準復歸不受影響。
                             result["skipped_axes"].append(
                                 {
                                     "axis": axis,
@@ -3051,16 +3014,14 @@ class DS102Controller:
                 return False
 
             if not saw_driving and not moved and within_grace:
-                # 🔴 限位／異常狀態同樣可能只是「GO 還沒生效時讀到出發前就
-                # 壓著的那一顆限位」——例如從 CCW 限位上往 CW 走。舊寫法會
-                # 在這裡直接判失敗並發警報。續輪等 Driving assert 即可分辨：
-                # 真的走得掉就會轉成 Driving，走不掉則寬限期一過照樣報錯，
-                # 代價只是這種必定失敗的情境晚 1 秒才報。
+                # 🔴 限位／異常狀態同樣可能只是 GO 還沒生效時讀到出發前就
+                # 壓著的那顆限位（例如從 CCW 限位上往 CW 走）。續輪等
+                # Driving assert 即可分辨：真的走得掉就轉成 Driving，走
+                # 不掉則寬限期一過照樣報錯，代價只是晚 1 秒才報。
                 #
-                # 🔴 這個 deferral 刻意排除 moved 成立的情況：那代表軸確實
-                # 走完了並停在限位上，是貨真價實的撞限位，必須照 2026-08-05
-                # 「撞限位不再靜默」的結論大聲報出來，不可因為有位移證據就
-                # 當成功回傳。
+                # 🔴 刻意排除 moved 成立的情況：那代表軸確實走完並停在
+                # 限位上，是貨真價實的撞限位，必須照 2026-08-05「撞限位
+                # 不再靜默」的結論報出來，不可因為有位移證據就當成功回傳。
                 time.sleep(MOVE_START_POLL)
                 continue
 
@@ -3763,13 +3724,12 @@ class DS102Controller:
                     tx = step.get("tx", "")
                     if tx:
                         self._serial_write(tx)
-                        # 只有「有終點」的指令才等到位。
-                        #
-                        # GO CWJ / CCWJ 是連續點動，沒有終點——它會一直跑到
-                        # 下一個 step 的 STOP 0 才停。舊寫法用 `"GO" in tx`
-                        # 把點動也納入等待，於是重播時 _wait_axis_stop 會阻塞
-                        # 到 30 秒逾時（或撞上硬體限位），STOP 0 遲遲送不出去。
-                        # ORG 同樣排除：它可能橫跨整個行程且途中壓限位屬正常。
+                        # 只有「有終點」的指令才等到位。GO CWJ / CCWJ 是連續
+                        # 點動，沒有終點，會一直跑到下一個 step 的 STOP 0
+                        # 才停——用 `"GO" in tx` 把它也納入等待會讓重播的
+                        # _wait_axis_stop 阻塞到 30 秒逾時（或撞上硬體限位），
+                        # STOP 0 遲遲送不出去。ORG 同樣排除：可能橫跨整個
+                        # 行程且途中壓限位屬正常。
                         if _is_finite_move(tx):
                             ax_m = re.search(r"AXI(\d)", tx)
                             if ax_m:

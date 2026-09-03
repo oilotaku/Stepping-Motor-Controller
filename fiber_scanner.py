@@ -1,20 +1,17 @@
 # =============================================================================
 # 光纖對準尋光演算法 — FiberAlignmentScanner
 #
-# 設計依據（完整討論見 FIBER_ALIGNMENT_SCAN_DESIGN.md）：
-#   - mathematician 代理兩輪設計：座標下降式模式搜尋（階段一）
-#     + K 近鄰局部加權迴歸精修（階段二，按需啟用）+ 收尾微擾（階段三）
-#   - architect 代理落地評估：獨立類別、scanning_active 安全整合、
-#     多軸批次收尾邏輯（DS102 沒有單軸停止指令）、樣本一次性持久化
+# 設計依據（完整討論見 FIBER_ALIGNMENT_SCAN_DESIGN.md）：座標下降式模式
+# 搜尋（階段一）＋ K 近鄰局部加權迴歸精修（階段二，按需啟用）＋收尾微擾
+# （階段三），落地時整合 scanning_active 安全機制、多軸批次收尾邏輯
+# （DS102 沒有單軸停止指令）、樣本一次性持久化。
 #
-# 尚未接上真實 HP 8153A。power_query 透過依賴注入解耦，測試時可傳入
-# 合成功率函式（例如高斯峰值曲線），不需要真實硬體即可驗證收斂性、
-# 安全邏輯與樣本持久化——見 scratchpad 的 verify_fiber_scanner.py。
+# power_query 透過依賴注入解耦，測試時可傳入合成功率函式（例如高斯峰值
+# 曲線），不需要真實硬體即可驗證收斂性、安全邏輯與樣本持久化。
 #
-# 本檔刻意不在執行期 import main_ai.py：main_ai.py 未來若要接上 GUI，
-# 會 import 這個檔案，若這裡也 import main_ai 會構成循環 import。
-# 軸名/軸號對應因此在本檔自成一份（AXES/AXIS_NO/NO_AXIS），
-# 必須與 main_ai.py 的定義保持一致——若那邊改了六軸命名，這裡要同步改。
+# 本檔刻意不在執行期 import main_ai.py（main_ai.py 反過來會 import 本檔，
+# 避免循環 import）。軸名/軸號對應因此自成一份（AXES/AXIS_NO/NO_AXIS），
+# 若 main_ai.py 改了六軸命名，這裡要同步改。
 # =============================================================================
 
 import json
@@ -28,8 +25,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    # DS102Controller 定義於 ds102_ctrl.py（2026-08-17 從 main_ai.py 抽出）。
-    # 純型別提示、不影響執行期，方向仍是「不 import main_ai.py」——
+    # DS102Controller 定義於 ds102_ctrl.py。純型別提示不影響執行期，
     # ds102_ctrl.py 本身也不 import main_ai.py，不構成循環相依。
     from ds102_ctrl import DS102Controller
 
@@ -39,60 +35,52 @@ AXIS_NO = {"X": "1", "Y": "2", "Z": "3", "U": "4", "V": "5", "W": "6"}
 NO_AXIS = {v: k for k, v in AXIS_NO.items()}
 
 # power_query()：呼叫一次即量測一次，回傳 (成功?, 功率dBm)。
-# 契約與 meter_GPIB.HP8153APowerMeter.get_power() 一致（見該檔的修正說明）。
+# 契約與 meter_GPIB.HP8153APowerMeter.get_power() 一致。
 PowerQuery = Callable[[], Tuple[bool, float]]
 ProgressCallback = Callable[[str], None]
-# 每次「移動＋量測」完成（不論成功與否）都會呼叫一次，用於外部即時視覺化
-# （例如即時軌跡圖）。跟 ProgressCallback 不同：那個只在階段/輪次等巨觀
-# 里程碑觸發，這個是每一筆樣本都觸發，頻率高很多。
+# 每次「移動＋量測」完成（不論成功與否）都呼叫一次，供外部即時視覺化。
+# 跟 ProgressCallback 不同：那個只在階段/輪次等里程碑觸發，這個每筆樣本
+# 都觸發，頻率高很多。
 SampleCallback = Callable[["Sample"], None]
 
 # ---- 以下數值皆為「起跳用」的保守預設，不是校準值 ----
 # 全部待接上 HP 8153A、量出真實響應曲線與雜訊水準後才能校準，
-# 詳細清單見設計文件〈待實測參數〉一節，不要當成已驗證的常數看待。
+# 詳細清單見設計文件〈待實測參數〉一節。
 DEFAULT_STEP_MIN = 2           # 最小步長（pulse）。需 ≥ 機械重現性下限 ±1~2 pulse
 DEFAULT_SETTLE_SEC = 0.03      # 到位後等機構震動衰減的時間
 DEFAULT_MAX_CYCLES = 5         # 階段一外層座標下降的最多輪數
 DEFAULT_NOISE_SIGMA_MULT = 3.0  # 功率雜訊底限＝重複量測標準差的幾倍
 DEFAULT_NO_SIGNAL_RANGE_MULT = 2.0
 # 全域無訊號偵測的安全倍數。⚠ 2026-08-12 語意變更：舊版直接乘在固定的
-# 3σ 雜訊底限上（等於假設 n 落在某個固定範圍，已被合成資料實測推翻，
-# 見 fiber_scanner 設計文件）。新版乘在「n 相關的期望純雜訊全距
-# d2(n)×σ」上，數值本身沿用 2.0（對實測 n≈150~350 區間仍有數個標準差
-# 的餘裕，見驗算），但若曾假設這是「6σ」等固定倍數，該假設已不成立。
+# 3σ 雜訊底限上，已被合成資料實測推翻。新版乘在「n 相關的期望純雜訊
+# 全距 d2(n)×σ」上，數值沿用 2.0（對實測 n≈150~350 區間仍有數個標準差
+# 餘裕），不再是「6σ」等固定倍數的語意。
 REOPEN_STEP_MULT = 8           # 階段一第 2 輪起，每輪從 step_min×這個倍數重新收斂
-# 階段一單軸單一步長的「沒收斂就再來一輪」次數上限（見 run_stage1 的用法）。
-# 🔴 這是防無窮迴圈的保險絲，不是調校參數。`while s >= step_min` 只在
-# `_search_axis_once()` 回報收斂時才縮步，而該函式只要「有移動」就回報
-# 未收斂——純雜訊環境下方向探測可以無止境地左右擺盪，兩邊輪流看起來
-# 都比對方好，於是步長永遠不縮、迴圈永遠不結束。2026-08-26 用假物件重現：
-# 起點壓在限位上、讀值只有雜訊時，舊版跑到 180 萬次移動仍未收斂（其中
-# 60 萬次是真的撞在限位開關上）。實機的症狀就是「尋光跑不完、限位警報
-# 一直跳」。200 對真的在跟訊號的搜尋非常寬鬆——爬坡是在單次呼叫內部
-# 連續走完的，這裡數的是「換方向的次數」。
+# 階段一單軸單一步長的「沒收斂就再來一輪」次數上限。🔴 這是防無窮迴圈的
+# 保險絲，不是調校參數：純雜訊環境下方向探測會無止境左右擺盪，兩邊輪流
+# 看起來都比對方好，步長永遠不縮。2026-08-26 假物件重現：起點壓在限位、
+# 讀值只有雜訊時，舊版跑到 180 萬次移動仍未收斂（60 萬次真的撞限位）。
+# 200 對真的在跟訊號的搜尋非常寬鬆——這裡數的是「換方向的次數」，爬坡
+# 本身在單次呼叫內部連續走完。
 STAGE1_MAX_PASSES_PER_STEP = 200
 
 # ---- 階段零（盲搜粗掃）的預設值，同樣是起跳值不是校準值 ----
 # 2026-08-26 新增。動機：座標下降／爬坡需要梯度才能決定方向，而尋光的
-# 起點**本來就常常是完全無光的**——那正是要尋光的原因。無光時所有方向
-# 的讀值都貼在同一個底噪水準，演算法在原地無從選擇方向，只能中止。
-# 盲搜的職責就是在這種情況下用固定樣式掃過一塊區域，把滑台帶到「量得到
-# 高於底噪的訊號」的位置，再交棒給既有的三階段。
+# 起點本來就常常完全無光——那正是要尋光的原因。無光時所有方向的讀值都
+# 貼在同一底噪水準，演算法無從選擇方向，只能中止。盲搜的職責就是用固定
+# 樣式掃過一塊區域，把滑台帶到量得到訊號的位置，再交棒給既有三階段。
 DEFAULT_BLIND_STEP = 200            # 盲搜格點間距（pulse）
 DEFAULT_BLIND_MAX_RADIUS = 1000     # 盲搜最大半徑（pulse，Chebyshev 距離）
-# ⚠ 上面兩個值是「起跳用的保守預設」，**不是依光學條件校準過的值**，而且
-# 這一組的物理正確性比本檔其他預設更依賴使用者的實際架設：
+# ⚠ 上面兩個值是起跳用的保守預設，不是依光學條件校準過的值：
 #   - 格點數是 (2×半徑÷格距+1)²，平方成長。半徑 1000／格距 200 是 121 點
-#     （粗估半分鐘），刻意讓「預設按下去」是一次規模溫和、掃得完的動作；
-#     早期版本預設半徑 4000 等於 1681 點、七分鐘以上的無人看管運動，那不
-#     適合當預設值。
-#   - 🔴 **格距必須小於耦合光斑的尺度，否則螺旋會直接跨過訊號區而漏掉。**
-#     單模光纖纖芯約 9μm，以 2μm/pulse 換算約 5 pulse；多模 50/62.5μm 也
-#     不過 25~30 pulse。200 pulse（約 400μm）對這兩種都太粗——它只適合
-#     「已知光斑很大／只是要先確認大方向」的情境。真正要靠盲搜找到單模
-#     耦合，格距得往個位數 pulse 設，而那會讓同樣半徑的點數暴增，必須
-#     同時把半徑縮小。這個取捨沒有通用解，只能由使用者依自己的光學架設
-#     決定，GUI 的即時格點數估算就是為了讓這個取捨看得見。
+#     （粗估半分鐘）——刻意讓預設是規模溫和、掃得完的動作；早期版本半徑
+#     4000（1681 點、七分鐘以上無人看管運動）不適合當預設值。
+#   - 🔴 格距必須小於耦合光斑的尺度，否則螺旋會直接跨過訊號區而漏掉。
+#     單模光纖纖芯約 9μm（≈5 pulse）、多模 50/62.5μm 也不過 25~30 pulse，
+#     200 pulse（約 400μm）對兩者都太粗，只適合「已知光斑很大／只是要
+#     先確認大方向」的情境。真正要靠盲搜找到單模耦合，格距得縮到個位數
+#     pulse，同樣半徑的點數會暴增，須同時縮小半徑——這個取捨只能由使用者
+#     依自己的光學架設決定，GUI 的即時格點數估算就是為了讓取捨看得見。
 DEFAULT_BLIND_SIGNAL_SIGMA_MULT = 5.0   # 判定「找到訊號」的 σ 倍數
 DEFAULT_BLIND_SIGNAL_MIN_DELTA_DB = 0.5  # 判定「找到訊號」的絕對下限（dB）
 # 盲搜模式：
@@ -100,12 +88,10 @@ DEFAULT_BLIND_SIGNAL_MIN_DELTA_DB = 0.5  # 判定「找到訊號」的絕對下�
 #   "auto"   先跑階段一；判定無訊號才回頭盲搜，找到訊號後重跑階段一
 #   "always" 一律先盲搜再進階段一
 BLIND_MODES = ("off", "auto", "always")
-# 🔴 函式庫層的預設刻意是 "off"，不是 "auto"。盲搜會驅動滑台在一個平面上
-# 走過上千個格點，是本專案目前**單次自動運動量最大**的操作；沒有明確
-# 要求就自動跑起來，違反 CLAUDE.md 一貫的「寧可少搜不多動」fail-safe
-# 原則，也會讓任何忘記設定的呼叫端得到一次非預期的長時間機械運動。
-# GUI 端（main_ai.py）預設是 "auto"，但那是使用者看得到、可以取消、
-# 而且會在確認對話框裡明列掃描規模的情境，兩者不衝突。
+# 🔴 函式庫層的預設刻意是 "off"，不是 "auto"。盲搜會驅動滑台走過上千個
+# 格點，是本專案單次自動運動量最大的操作；沒有明確要求就自動跑起來，違反
+# 「寧可少搜不多動」的 fail-safe 原則。GUI 端（main_ai.py）預設 "auto"，
+# 但那是使用者看得到、可取消、且會在確認對話框列明規模的情境，不衝突。
 DEFAULT_BLIND_MODE = "off"
 GUI_DEFAULT_BLIND_MODE = "auto"
 
@@ -680,16 +666,14 @@ class FiberAlignmentScanner:
         # None＝校準時一個有效讀值都沒拿到（見 calibrate_noise）。
         self._noise_baseline: Optional[float] = None
         # run() 內部把所有中止事件（使用者停止／EMS／無訊號判定）都用
-        # ScanAbort 自己接住、正常 return——呼叫端如果只看 run() 的回傳值
-        # 或例外，完全無法分辨「真的收斂完成」跟「中途被中止」。這個屬性
-        # 在 run() 正常返回後仍然可以讀到中止原因（None＝真的完成），供
-        # main_ai.py 這類需要分級呈現結果的呼叫端使用，不需要重新設計
-        # run() 既有的例外吞併行為（那是刻意的：中止是正常結束路徑，不該
-        # 讓呼叫端還要自己包 try/except 分辨語意）。
+        # ScanAbort 接住、正常 return，只看回傳值或例外無法分辨「真的收斂
+        # 完成」跟「中途被中止」。這個屬性在 run() 正常返回後仍可讀到中止
+        # 原因（None＝真的完成），供 main_ai.py 這類需要分級呈現結果的
+        # 呼叫端使用，不用重新設計 run() 既有的例外吞併行為（中止是刻意
+        # 設計的正常結束路徑）。
         self.last_abort_reason: Optional[str] = None
         # 與 last_abort_reason 配套的型別化分類："no_signal"／"other"，
-        # None＝沒有中止。見 run() 的 except 區塊說明為什麼不讓呼叫端
-        # 繼續對訊息字串做子字串比對。
+        # None＝沒有中止——避免呼叫端對訊息字串做子字串比對。
         self.last_abort_kind: Optional[str] = None
         # 這一輪自動寫出的 Excel 報表路徑（沒裝 xlsxwriter 或寫檔失敗時是
         # None）。GUI 端拿它顯示「報表在哪」，不必自己重組檔名。
@@ -831,14 +815,12 @@ class FiberAlignmentScanner:
 
             # ── 階段一，必要時回頭補盲搜 ──
             # 🔴 判準是「跑完階段一有沒有確認到訊號」（self._signal_confirmed），
-            # 不是「階段一有沒有拋 NoSignalAbort」。第一版只攔例外，漏掉了
-            # 階段一**正常收斂結束**卻從未偵測到訊號的情況：
-            # `_check_signal_detectable()` 在有效樣本 <4 時走「樣本太少，
-            # 不誤殺」的放行分支，接著 `total_improvement < noise_floor`
-            # 讓外層迴圈 break，run_stage1 就這樣正常 return。實機 log
-            # 13:08 正是如此——X 軸撞限位使該輪只收到 11 筆樣本、有效的
-            # 更少，於是「階段一收斂」→ 沒有例外 → 沒有盲搜 → 階段二丟出
-            # 「起點量測失敗」。用旗標判斷同時涵蓋這兩條路徑。
+            # 不是「階段一有沒有拋 NoSignalAbort」。只攔例外會漏掉階段一
+            # 正常收斂結束、卻從未偵測到訊號的情況：`_check_signal_detectable()`
+            # 在有效樣本 <4 時放行，接著 `total_improvement < noise_floor`
+            # 讓迴圈正常 break、return。實機 log 13:08 正是如此——X 軸撞限位
+            # 使該輪只收到 11 筆樣本，於是「階段一收斂」卻沒有例外也沒有盲搜，
+            # 階段二直接丟出「起點量測失敗」。用旗標判斷同時涵蓋兩條路徑。
             stage1_aborted_no_signal = self._run_primary_algorithm(initial_step)
 
             if (
@@ -957,14 +939,11 @@ class FiberAlignmentScanner:
             idx = len(self.samples)
 
             def _early_check() -> None:
-                # Powell 完全繞過 run_stage1() 內建的訊號確認檢查（那個
-                # 檢查只在 run_stage1() 的 cycle==1 觸發）。這個 hook 讓
-                # run_stage_powell() 每完成一次真正的測量就檢查一次
-                # （見該函式 early_signal_check 參數的文件字串）——等
-                # minimize() 整個跑完（最多 max_iterations 次移動＋量測，
-                # 真機是數分鐘量級）才檢查，會讓 abort_if_no_signal 對
-                # Powell 路徑形同虛設，_signal_confirmed／量程鎖定也全程
-                # 不會觸發。
+                # Powell 完全繞過 run_stage1() 只在 cycle==1 觸發的訊號確認
+                # 檢查，這個 hook 讓 run_stage_powell() 每完成一次真正的
+                # 測量就檢查一次——等 minimize() 整個跑完（真機數分鐘量級）
+                # 才檢查，會讓 abort_if_no_signal 形同虛設，_signal_confirmed／
+                # 量程鎖定也全程不會觸發。
                 self._check_signal_detectable(
                     self.samples[idx:], raise_on_no_signal=self.abort_if_no_signal
                 )
@@ -1196,13 +1175,11 @@ class FiberAlignmentScanner:
             cur = dict(self.ctrl.positions_machine)
             targets = {ax_a: center[ax_a] + da, ax_b: center[ax_b] + db}
 
-            # 先做批次行程檢查再送指令：超出行程的格點不必真的送一次 GO
-            # 才發現走不了。盲搜的半徑常常會蓋到行程邊界外，逐點試錯的
-            # 代價（每點一次來回通訊＋一次失敗等待）在上千個格點下很可觀。
-            # 🔴 檢查走 `_targets_reachable()` 而不是直接 `check_sw_limits_batch()`：
-            # 後者比對的 `ctrl.sw_limits` 預設是空的（GUI 不填就全部放行），
-            # 光靠它，這段最該發揮作用的檢查會整個退化成 no-op——實機
-            # 2026-08-26 一輪盲搜就實撞了 50 次限位。見 `_note_limit_hit()`。
+            # 先做批次行程檢查再送指令：盲搜半徑常會蓋到行程邊界外，逐點
+            # 試錯的代價在上千個格點下很可觀。🔴 檢查走 `_targets_reachable()`
+            # 而不是直接 `check_sw_limits_batch()`：後者比對的 `ctrl.sw_limits`
+            # 預設是空的，光靠它會整個退化成 no-op——實機 2026-08-26 一輪
+            # 盲搜就實撞了 50 次限位。見 `_note_limit_hit()`。
             ok, _reason = self._targets_reachable(targets)
             if not ok:
                 blocked += 1
@@ -1321,19 +1298,15 @@ class FiberAlignmentScanner:
 
             # 無訊號偵測：只在第 1 輪跑一次，且刻意不看 total_improvement 是否已
             # 低於雜訊底限——total_improvement 是「各軸 max(0, 改善) 相加」，
-            # 純雜訊情境下方向探測的 p_plus>p0 比較沒有雜訊門檻（等同挑雜訊讀值
-            # 中較大者的選擇偏誤），多軸加總後有結構性正偏誤，可能意外跳過
-            # 「本該檢查」的時機（2026-08-12 合成資料測試踩到：3 軸純雜訊情境下
-            # total_improvement 意外大於雜訊底限，導致這裡完全沒被觸發）。
-            # range 判準（_check_signal_detectable 內部）不受此偏誤影響——其
-            # 統計期望值只隨樣本數對數成長，目前門檻在合理樣本數下有安全餘裕。
-            # 第 1 輪跑完就直接檢查，不必等 total_improvement 這個有偏誤的
-            # 中介指標開線燈。
-            # 🔴 一律呼叫（不再被 abort_if_no_signal 整個 gate 掉），只有
-            # 「判定沒訊號時要不要拋例外」受那個開關控制。原因：這個函式
-            # 同時負責在**有**訊號時設起 `_signal_confirmed`（供量程鎖定與
-            # run() 判斷要不要補盲搜），關掉開關等於連「有訊號」這個判定
-            # 也一併跳過，run() 會誤以為從未偵測到訊號而多跑一輪盲搜。
+            # 純雜訊情境下方向探測的 p_plus>p0 比較沒有雜訊門檻，多軸加總後有
+            # 結構性正偏誤，可能跳過本該檢查的時機（2026-08-12 合成資料測試
+            # 踩到：3 軸純雜訊下 total_improvement 意外大於雜訊底限）。range
+            # 判準（_check_signal_detectable 內部）不受此偏誤影響，故第 1 輪
+            # 跑完就直接檢查，不等 total_improvement 這個有偏誤的中介指標。
+            # 🔴 一律呼叫（不再被 abort_if_no_signal 整個 gate 掉），只有「判定
+            # 沒訊號時要不要拋例外」受那個開關控制——這個函式同時負責在有訊號
+            # 時設起 `_signal_confirmed`（供量程鎖定與 run() 判斷要不要補盲搜），
+            # 關掉開關會連這個判定也跳過，讓 run() 誤以為從未偵測到訊號。
             if cycle == 1:
                 self._check_signal_detectable(
                     self.samples[stage1_start_idx:],
@@ -1361,14 +1334,11 @@ class FiberAlignmentScanner:
             return True, None  # 起點都量不到，無從比較，外層會縮步或最終中止
 
         # ── 1. 方向探測（最多兩次移動）──
-        # 🔴 門檻是 `p0 + 雜訊底限`，不是 `p0`。下方爬坡迴圈一直都用這個
-        # 門檻，方向探測卻用赤裸的 `>`——這個不對稱本身就是既有註解說的
-        # 「等同挑雜訊讀值中較大者的選擇偏誤」。後果不只是統計上的偏誤：
-        # 純雜訊環境下兩側輪流「看起來比較好」，每次呼叫都會移動、於是
-        # 每次都回報未收斂，外層 while 的步長永遠不縮——搜尋不會結束。
-        # 2026-08-26 假物件重現：起點壓在限位上、讀值只有雜訊時，舊版
-        # 180 萬次移動仍在原地兩點之間擺盪。低於雜訊底限的「改善」本來
-        # 就不是可靠資訊，拿它決定方向等於讓雜訊駕駛滑台。
+        # 🔴 門檻是 `p0 + 雜訊底限`，不是赤裸的 `p0`——否則純雜訊環境下
+        # 兩側會輪流「看起來比較好」，每次呼叫都移動、步長永遠不縮，搜尋
+        # 不會結束。2026-08-26 假物件重現：起點壓在限位、讀值只有雜訊時，
+        # 舊版 180 萬次移動仍在原地擺盪。低於雜訊底限的「改善」本來就不
+        # 可靠，拿它決定方向等於讓雜訊駕駛滑台。
         floor = self._noise_floor()
         moved_plus, p_plus = self._probe(axis, step)
         if moved_plus and p_plus is not None and p_plus > p0 + floor:
@@ -1474,17 +1444,13 @@ class FiberAlignmentScanner:
         self._log(f"階段二開始，起點功率 {best_power:.4f}")
 
         # ── 初始星形設計：每軸 ±1 個臂點，逐臂取樣完畢即撤回中心 ──
-        # ⚠ 撤回中心只是「量測時」暫時回去，不是放棄找到的結果：
-        # 星形設計結束後若某個臂比中心好，要真的走到那個臂點，見下方
-        # best_arm 的處理。之前的寫法量完就撤回、只把數值記進
-        # best_power，位置卻沒有跟著移動——後面梯度下降迴圈重新算出
-        # 同一個方向、踩到同一個點時，量到的功率跟 best_power 打平
-        # （不是更好），嚴格 `>` 判斷會判定「沒有改善」而撤回，
-        # step_length 跟著減半，星形設計已經找到的方向就這樣白費，
-        # 最終回報「階段二沒有幫助」——實測用旋轉橢圓高斯耦合合成
-        # 函式踩到，星形設計量到 X-24 功率 8.9236（優於中心 8.6545），
-        # 梯度下降卻只敢踩 X-4、X-24 都因為打平 best_power 被拒絕，
-        # 20 輪後回到原點，跟純座標下降結果完全相同。
+        # ⚠ 撤回中心只是量測時暫時回去，不是放棄找到的結果：星形設計結束
+        # 後若某個臂比中心好，要真的走到那個臂點，見下方 best_arm 的處理。
+        # 舊寫法量完撤回、位置沒跟著移動，後面梯度下降踩到同一點量到的
+        # 功率跟 best_power 打平（不是更好），嚴格 `>` 判斷會判定沒有改善
+        # 而撤回，星形設計找到的方向就此白費（實測旋轉橢圓高斯合成函式
+        # 踩到：星形量到 X-24 功率 8.9236 優於中心 8.6545，梯度下降卻因
+        # 打平被拒絕，20 輪後回到原點，跟純座標下降結果相同）。
         best_arm: Optional[Tuple[str, int]] = None
         for ax in axes:
             r = max(self.step_min, int(local_radius.get(ax, self.step_min * 4)))

@@ -67,16 +67,16 @@ import matplotlib
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
 
-# 刻意不 import matplotlib.pyplot：這個模組同時被 CLI（存 PNG）與
-# gaussian_vector_sim_gui.py（用 FigureCanvasTkAgg 直接內嵌）共用，
-# 不碰 pyplot 的全域狀態機就不會有 backend 互相干擾或 Figure 洩漏的問題。
+# 刻意不 import matplotlib.pyplot：本模組同時被 CLI（存 PNG）與
+# gaussian_vector_sim_gui.py（FigureCanvasTkAgg 內嵌）共用，不碰 pyplot
+# 的全域狀態機就不會有 backend 互相干擾或 Figure 洩漏的問題。
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "Microsoft YaHei", "SimHei", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 AXES = ["X", "Y", "Z", "U", "V", "W"]
 
-# ---- 以下數值皆對照 fiber_scanner.py 的同名常數，數值也保持一致 ----
-# （fiber_scanner.py 裡的原始註解：這些是「起跳用」的保守預設，不是校準值）
+# ---- 以下數值對照 fiber_scanner.py 的同名常數，保持一致（起跳用的
+# 保守預設，不是校準值）----
 DEFAULT_STEP_MIN = 2
 DEFAULT_MAX_CYCLES = 5
 DEFAULT_NOISE_SIGMA_MULT = 3.0
@@ -532,11 +532,9 @@ def run_real_algorithm_trial(
         return baseline + delta
 
     # 起點雜訊校準：baseline／target 只在這裡（移動前）算一次，後面用來判斷
-    # 「階段一跑完後的位置，功率是不是明顯高於出發點」——刻意不在階段一跑完後
-    # 用當下位置重新校準再拿來跟自己比較，那樣兩者是同一個位置的重複量測，
-    # 差異只會是量測雜訊，比較結果沒有意義（對照 fiber_scanner.py 的
-    # _power_clearly_above_baseline()：用的是 self._noise_baseline，也就是
-    # 「校準時」的基準，不是「檢查當下」重新校準的基準）。
+    # 階段一跑完後的功率是否明顯高於出發點。刻意不在階段一跑完後用當下位置
+    # 重新校準再互比——同一位置的重複量測，差異只是雜訊，比較沒有意義
+    # （對照 fiber_scanner.py 的 _power_clearly_above_baseline()）。
     baseline, sigma = calibrate_noise(pos, cfg, rng, calibrate_noise_samples)
     total_probes += calibrate_noise_samples
     floor = noise_sigma_mult * sigma if baseline is not None else 0.0
@@ -545,9 +543,7 @@ def run_real_algorithm_trial(
     ax_a, ax_b = 0, 1  # 對照 _blind_axis_pair()：預設用搜尋軸的前兩軸
 
     # 進階段一之前，只有「起點完全讀不到」才需要先盲搜（對照 fiber_scanner.py
-    # 的 run()：`if no_baseline: ... run_stage0_blind()`）。起點讀得到就直接跑
-    # 階段一，不會因為「還沒到峰值」就預先盲搜——真機也是這樣，階段一本身就是
-    # 用來從讀得到訊號的任意起點爬到峰值的。
+    # 的 run()）。起點讀得到就直接跑階段一——那本身就是從任意起點爬到峰值用的。
     if cfg.n_axes >= 2 and baseline is None:
         blind = run_stage0_blind(pos, ax_a, ax_b, blind_step, blind_max_radius, cfg, rng, bounds,
                                   target, record_steps=record_steps)
@@ -568,9 +564,8 @@ def run_real_algorithm_trial(
     total_probes += stage1["probes"]
     _record(stage1["steps"])
 
-    # 階段一跑完後，拿當下位置的功率去跟「出發前」的 baseline／target 比較
-    # （不是重新校準）——明顯更好就當作已確認訊號；不夠好才回頭盲搜一次再重跑
-    # 階段一，對照 _power_clearly_above_baseline() 與 run() 的 auto 模式重試邏輯。
+    # 階段一跑完後，拿當下功率去跟出發前的 baseline／target 比較（不重新
+    # 校準）——明顯更好即確認訊號；不夠好才回頭盲搜一次再重跑階段一。
     ok_final, power_final = measure(pos, cfg, rng)
     total_probes += 1
     confirmed = ok_final and power_final is not None and (target is None or power_final >= target)
