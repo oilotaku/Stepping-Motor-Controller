@@ -55,7 +55,7 @@ from unittest.mock import patch
 
 import pytest
 
-import ds102_ctrl
+import core.ds102_ctrl as ds102_ctrl
 import main_ai
 from core.fiber_scanner import FiberAlignmentScanner
 

@@ -35,7 +35,7 @@ import pytest
 os.environ.setdefault("PYTHONUTF8", "1")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
-import ds102_ctrl  # noqa: E402
+import core.ds102_ctrl as ds102_ctrl  # noqa: E402
 import core.fiber_scanner as fiber_scanner  # noqa: E402
 
 

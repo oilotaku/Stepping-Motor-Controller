@@ -33,7 +33,7 @@ FiberAlignmentScanner 階段零「盲搜粗掃」回歸測試（pytest，合成�
 
 import pytest
 
-import ds102_ctrl  # 只為了 FakeCtrl.limit_direction 委派給真正的實作
+import core.ds102_ctrl as ds102_ctrl  # 只為了 FakeCtrl.limit_direction 委派給真正的實作
 import core.fiber_scanner as fs
 
 

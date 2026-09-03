@@ -34,7 +34,7 @@ ds102_ctrl.py 時就已定義在該檔（`HISTORY_MAX` 靠 `_app_setting_num()`
 """
 
 # 本檔唯一的 import，見上方〈依賴方向〉。
-from ds102_ctrl import _app_settings
+from core.ds102_ctrl import _app_settings
 
 # =============================================================================
 # 顏色主題：可由 recordings/app_settings.json 的 clr_* 欄位個別覆寫（字串，

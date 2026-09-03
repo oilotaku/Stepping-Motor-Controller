@@ -67,7 +67,7 @@ from core import fiber_scanner_advanced
 # 這裡把 GUI 端仍需要的名字重新引入自己的命名空間，其餘只有
 # DS102Controller 內部用到的常數（MAX_RETRY、WAIT_TIMEOUT 等）留在
 # ds102_ctrl.py，不在此重複定義。
-from ds102_ctrl import (
+from core.ds102_ctrl import (
     DS102Controller,
     AXES,
     AXIS_NO,

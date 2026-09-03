@@ -39,7 +39,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import main_ai
-import ds102_ctrl
+import core.ds102_ctrl as ds102_ctrl
 
 from conftest import close_gui, make_gui, pump_until
 

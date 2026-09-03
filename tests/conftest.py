@@ -47,7 +47,7 @@ os.environ.setdefault("PYTHONUTF8", "1")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 import main_ai  # noqa: E402  （需先設好上面的環境變數再 import，避免中文 log 亂碼）
-import ds102_ctrl  # noqa: E402
+import core.ds102_ctrl as ds102_ctrl  # noqa: E402
 
 
 def pump_until(root: tk.Tk, condition_fn, timeout: float = 15.0) -> None:

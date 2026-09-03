@@ -53,7 +53,7 @@ from unittest.mock import patch
 
 import pytest
 
-import ds102_ctrl
+import core.ds102_ctrl as ds102_ctrl
 import core.fiber_scanner as fs
 import core.fiber_scanner_advanced as fsa
 import main_ai

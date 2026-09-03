@@ -27,7 +27,7 @@ from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     # DS102Controller 定義於 ds102_ctrl.py。純型別提示不影響執行期，
     # ds102_ctrl.py 本身也不 import main_ai.py，不構成循環相依。
-    from ds102_ctrl import DS102Controller
+    from core.ds102_ctrl import DS102Controller
 
 # 與 main_ai.py 一致的軸命名（見上方模組說明：刻意不 import，避免循環相依）
 AXES = ["X", "Y", "Z", "U", "V", "W"]
