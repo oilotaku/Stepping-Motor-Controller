@@ -2,7 +2,7 @@
 
 Windows 桌面應用，用 Python + tkinter 控制 **駿河精機 SURUGA SEIKI DS102 / DS112 步進馬達控制箱**（RS-232C / USB 虛擬 COM 埠），用於光纖對準與光學自動化量測。
 
-滑台已與 **HP 8153A 光波萬用表**（GPIB，封裝於 [meter_GPIB.py](meter_GPIB.py)）整合，GUI 內建「光功率」與「尋光」兩個分頁，可執行自動掃描尋光（[fiber_scanner.py](fiber_scanner.py) 的 `FiberAlignmentScanner`）。光功率計尚未接上真實儀器驗證過，本機沒有 GPIB 卡可測。
+滑台已與 **HP 8153A 光波萬用表**（GPIB，封裝於 [core/meter_GPIB.py](core/meter_GPIB.py)）整合，GUI 內建「光功率」與「尋光」兩個分頁，可執行自動掃描尋光（[core/fiber_scanner.py](core/fiber_scanner.py) 的 `FiberAlignmentScanner`）。光功率計已實機連線驗證（HP 8153A，見 [CLAUDE.md](CLAUDE.md)）。
 
 ---
 
@@ -25,8 +25,8 @@ VS Code 使用者：預設 build task（`Ctrl+Shift+B`）就是執行 GUI，另�
 **本程式沒有模擬模式**——它驅動的是真實滑台，假造的回應會讓人誤以為已連上硬體。沒有硬體時要測控制邏輯，請用假的 serial 物件取代 `ctrl.ser`。
 
 ```bash
-# 跑回歸測試（假物件，不需硬體，187 項）
-venv/Scripts/python.exe -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py -v
+# 跑回歸測試（假物件，不需硬體；pytest.ini 的 testpaths=tests 會自動收集 tests/ 底下全部 verify_*.py）
+venv/Scripts/python.exe -m pytest -v
 ```
 
 VS Code 的 Testing 面板也能個別發現、個別重跑每一項（`.vscode/settings.json` 已設定 `python.testing.pytestEnabled`）。
@@ -68,29 +68,31 @@ VS Code 的 Testing 面板也能個別發現、個別重跑每一項（`.vscode/
 
 ## 檔案定位
 
-根目錄有多份相似的 DS102 程式，**改錯檔案是最常見的失誤**：
+**2026-09-03 分五步完成資料夾遷移**：只有 [main_ai.py](main_ai.py) 固定留在根目錄，其餘按用途分到 `core/`（現役核心模組）、`legacy/`（舊版對照）、`tools/`（診斷腳本）、`sim/`（無硬體模擬）、`tests/`（pytest 測試檔）。**改錯檔案／改錯路徑仍是最常見的失誤**：
 
 | 檔案 | 定位 |
 |---|---|
-| [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，約 5408 行。GUI 與各分頁邏輯都加在這裡 |
-| [ds102_ctrl.py](ds102_ctrl.py) | `DS102Controller` 本體（2026-08-17 從 main_ai.py 拆出的獨立模組，約 2326 行，完全不碰 tkinter）。不要跟下面的 `ds102_controller.py` 搞混 |
-| [ds102_controller.py](ds102_controller.py) | main_ai.py 的前一版快照（跟上面的 `ds102_ctrl.py` 是完全不同的兩個檔案）。可作對照，**不要在此新增功能** |
-| [main.py](main.py) | 廠商官方範例，是**指令格式的權威來源**。修改指令前先回頭比對 |
-| [test.py](test.py) | 無 GUI 的連線／狀態查詢腳本。名稱誤導——不是單元測試 |
-| [probe_ds102.py](probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
-| [meter_GPIB.py](meter_GPIB.py) | HP 8153A 光功率計封裝，已整合進「光功率」／「尋光」分頁，尚未接上真實儀器驗證 |
-| [fiber_scanner.py](fiber_scanner.py) | `FiberAlignmentScanner`，光纖對準尋光演算法，已接上「尋光」分頁 |
-| [verify_scan_tab.py](verify_scan_tab.py) / [verify_meter_panel.py](verify_meter_panel.py) / [verify_axis_calib.py](verify_axis_calib.py) / [verify_fiber_scanner_signal.py](verify_fiber_scanner_signal.py) | 「尋光」／「光功率」分頁／軸機械校正參數／`fiber_scanner.py` 訊號有效性判準的假物件回歸測試（57／66／50／14 項，共 187 項，pytest 測試檔，`python -m pytest verify_scan_tab.py verify_meter_panel.py verify_axis_calib.py verify_fiber_scanner_signal.py -v` 執行，或用 VS Code Testing 面板，不需硬體） |
-| [Gtest.py](Gtest.py) | 外部第三方範例，`import control` 的模組不存在於本 repo，**無法執行** |
+| [main_ai.py](main_ai.py) | **唯一的主程式（v3.0）**，約 7114 行。GUI 與各分頁邏輯都加在這裡。架構上固定留在根目錄不搬 |
+| [core/ds102_ctrl.py](core/ds102_ctrl.py) | `DS102Controller` 本體（2026-08-17 從 main_ai.py 拆出的獨立模組，完全不碰 tkinter）。不要跟下面的 `legacy/ds102_controller.py` 搞混 |
+| [legacy/ds102_controller.py](legacy/ds102_controller.py) | main_ai.py 的前一版快照（跟上面的 `core/ds102_ctrl.py` 是完全不同的兩個檔案）。可作對照，**不要在此新增功能** |
+| [legacy/main.py](legacy/main.py) | 廠商官方範例，是**指令格式的權威來源**。修改指令前先回頭比對 |
+| [tools/test.py](tools/test.py) | 無 GUI 的連線／狀態查詢腳本。名稱誤導——不是單元測試 |
+| [tools/probe_ds102.py](tools/probe_ds102.py) | 序列埠診斷工具，硬體接不上時的第一站 |
+| [core/meter_GPIB.py](core/meter_GPIB.py) | HP 8153A 光功率計封裝，已整合進「光功率」／「尋光」分頁，已實機連線驗證 |
+| [core/fiber_scanner.py](core/fiber_scanner.py) | `FiberAlignmentScanner`，光纖對準尋光演算法，已接上「尋光」分頁 |
+| [core/fiber_scanner_advanced.py](core/fiber_scanner_advanced.py) | `run_stage_powell()`，Powell 共軛方向法尋光路徑，已接進「尋光」分頁演算法下拉選單，仍未真機驗證 |
+| [sim/gaussian_vector_sim.py](sim/gaussian_vector_sim.py) / [sim/gaussian_vector_sim_gui.py](sim/gaussian_vector_sim_gui.py) | 多軸高斯耦光場數學模擬（CLI＋獨立 tkinter GUI），無硬體時觀察尋光演算法行為用，不連接硬體 |
+| [tests/](tests/) 底下十一支 `verify_*.py` | 「尋光」／「光功率」分頁／軸機械校正參數／限位同步等邏輯的假物件回歸測試（pytest 測試檔，共 436 項，`python -m pytest -v` 執行，或用 VS Code Testing 面板，不需硬體） |
+| [legacy/Gtest.py](legacy/Gtest.py) | 外部第三方範例，`import control` 的模組不存在於本 repo，**無法執行** |
 | [step-motor.txt](step-motor.txt) | 三層架構藍圖。其中 DS112 通訊細節（`\r\n`、9600、`!:` 輪詢）**全部是錯的** |
 
 ---
 
 ## main_ai.py 架構
 
-邏輯上仍是三塊，但 `DS102Controller` 現在實際定義在獨立檔案 [ds102_ctrl.py](ds102_ctrl.py)：
+邏輯上仍是三塊，但 `DS102Controller` 現在實際定義在獨立檔案 [core/ds102_ctrl.py](core/ds102_ctrl.py)：
 
-1. **`DS102Controller`**（`ds102_ctrl.py`）— 所有序列通訊集中於此，完全不碰 tkinter，main_ai.py 用 `from ds102_ctrl import DS102Controller, ...` 引入
+1. **`DS102Controller`**（`core/ds102_ctrl.py`）— 所有序列通訊集中於此，完全不碰 tkinter，main_ai.py 用 `from core.ds102_ctrl import DS102Controller, ...` 引入
 2. **`StatusBar`**（main_ai.py）— 各分頁共用的座標／連線狀態列
 3. **`DS102GUI`**（main_ai.py）— 七個分頁（儀表板 / 移動控制 / Teaching / 行程錄製 / 光功率 / 尋光 / LOG），只呼叫 controller 的公開方法
 
@@ -156,14 +158,14 @@ venv/Scripts/pyinstaller.exe --onedir --windowed --name DS102 main_ai.py
 - **程式必須放在有寫入權限的位置**（桌面、`D:\` 等），不要放 `Program Files`——它需要在自己的目錄下建 `logs/` `recordings/` `data/`。權限不足時會跳錯誤視窗說明，不會無聲關閉。
 - 不需要把 `ds102 (2).pdf` 或驅動資料夾打包進去，執行期用不到。
 - 沒有單一實例保護：兩個 exe 同時執行會搶同一個 COM 埠。
-- `DS102Controller` 拆到獨立檔案 `ds102_ctrl.py` 後仍是靜態 `from ds102_ctrl import ...`（同目錄 sibling import，跟 `fiber_scanner.py`／`meter_GPIB.py` 的匯入方式一樣），PyInstaller 能自動收進去，不需要額外的 hidden-import 宣告。
+- `DS102Controller` 拆到獨立檔案 `core/ds102_ctrl.py` 後仍是靜態 `from core.ds102_ctrl import ...`（`core/` 是一般 Python 套件，跟 `core.fiber_scanner`／`core.meter_GPIB` 的匯入方式一樣），PyInstaller 能自動收進去，不需要額外的 hidden-import 宣告。
 
 ---
 
 ## 硬體連不上時
 
-1. `venv/Scripts/python.exe probe_ds102.py --list` — 只列序列埠，不送任何指令（不會動到硬體）
-2. `venv/Scripts/python.exe probe_ds102.py` — 逐埠輪詢 `*IDN?`，依序試 38400 → 19200 → 9600 → 4800
+1. `venv/Scripts/python.exe tools/probe_ds102.py --list` — 只列序列埠，不送任何指令（不會動到硬體）
+2. `venv/Scripts/python.exe tools/probe_ds102.py` — 逐埠輪詢 `*IDN?`，依序試 38400 → 19200 → 9600 → 4800
 3. 若裝置管理員出現 **Problem Code 10 / `STATUS_DRIVER_BLOCKED`**，看起來像簽章問題但不是——見 [DRIVER_ISSUE_REPORT.md](DRIVER_ISSUE_REPORT.md)。該文件已逐條排除驅動、簽章、WDAC、HVCI、Secure Boot，**不要重複排查這些**，直接請 IT 在 SentinelOne Device Control 政策核可 `VID_0DFD&PID_0002`。
 
 ---
