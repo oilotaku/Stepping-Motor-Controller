@@ -5,21 +5,11 @@
 # 依賴套件：pyserial  (pip install pyserial)
 # GUI 框架：tkinter（Python 3 內建，無需額外安裝）
 #
-# 改善項目（v3.0）：
-#   1. 執行緒安全：positions / action_history 加入 threading.Lock 保護
-#   2. 通訊可靠性：指令逾時保護、ACK 確認、重送機制（最多 3 次）
-#   3. 行程錄製僅錄驅動指令（排除查詢類 SB?/POS?）
-#   4. 到位確認：步進/原點後輪詢 SB1? 確認 Driving 旗標清除再繼續
-#   5. 單位一律 pulse（不提供 um / mm 切換）
-#   6. 軟體行程限制（Software Limit）：超限自動攔截並警告
-#   7. Limit / 異常狀態自動彈窗警告並停止
-#   8. 連線未建立時鎖定驅動按鈕
-#   9. 速度 Profile 命名儲存與快速切換
-#  10. Teaching Point 加入「移動至此點」功能
-#  11. 實驗數據 CSV 匯出（時間戳 + 各軸位置）
-#  12. 座標偏置（Offset）：定義工作原點與機械原點分離
-#  13. EMS 解除後要求位置確認才能繼續操作
-#  14. 行程重播中鎖定其他移動操作
+# 改善項目（v3.0）：執行緒安全（Lock 保護 positions／action_history）、
+# 通訊逾時＋ACK＋重送、行程錄製排除查詢指令、到位輪詢 SB1?、單位固定
+# pulse、軟體行程限制、Limit 異常自動彈窗停止、未連線鎖定驅動按鈕、
+# 速度 Profile 命名切換、Teaching Point 一鍵移動、CSV 數據匯出、座標
+# 偏置（工作原點／機械原點分離）、EMS 解除需位置確認、重播中鎖定其他移動。
 # =============================================================================
 
 import tkinter as tk
@@ -56,17 +46,13 @@ from core.fiber_scanner import (
     export_samples_xlsx,
     _XLSXWRITER_AVAILABLE,
 )
-# 尋光的 Powell 共軛方向法（實驗性替代演算法）獨立在這個模組，見該檔開頭
-# 說明。單向 import：fiber_scanner_advanced.py 本身不 import main_ai.py，
-# 不會循環相依。這裡只讀 `_SCIPY_AVAILABLE` / `_SCIPY_IMPORT_ERROR` 兩個
-# 模組屬性決定 GUI 要不要讓使用者選到這個選項，不直接呼叫模組內的函式
-# （那是 fiber_scanner.FiberAlignmentScanner.run() 內部的事）。
+# 尋光的 Powell 共軛方向法（實驗性替代演算法）獨立在此模組，單向 import，
+# 不循環相依。這裡只讀 `_SCIPY_AVAILABLE` / `_SCIPY_IMPORT_ERROR` 決定
+# GUI 要不要提供此選項，不直接呼叫模組內函式（那是 FiberAlignmentScanner.run() 的事）。
 from core import fiber_scanner_advanced
-# DS102Controller 與其專屬的模組層級常數／函式已抽到 ds102_ctrl.py
-# （2026-08-17，架構拆分第一階段 1a，機械式搬移，行為不變）。
-# 這裡把 GUI 端仍需要的名字重新引入自己的命名空間，其餘只有
-# DS102Controller 內部用到的常數（MAX_RETRY、WAIT_TIMEOUT 等）留在
-# ds102_ctrl.py，不在此重複定義。
+# DS102Controller 與其模組層級常數／函式已抽到 ds102_ctrl.py（2026-08-17，
+# 架構拆分 1a，機械式搬移、行為不變）。這裡重新引入 GUI 端仍需要的名字；
+# 只給 DS102Controller 內部用的常數（MAX_RETRY、WAIT_TIMEOUT 等）留在原檔。
 from core.ds102_ctrl import (
     DS102Controller,
     AXES,
@@ -90,10 +76,8 @@ from core.ds102_ctrl import (
     save_homing_repeat_result,
 )
 # UI 色票（2026-08-31，模組化前置工作 3，見 docs/modularization.md〈八〉）。
-# 單向 import：ui_theme.py 只 import ds102_ctrl.py，不 import 本檔，
-# 所以依賴鏈是 ds102_ctrl → ui_theme → main_ai，沒有環。
-# 這裡刻意逐一列名而非 `import *`：main_ai.py 底下有 445 處引用，
-# 用 `import *` 會讓靜態分析完全查不到這些名字從哪來。
+# 依賴鏈 ds102_ctrl → ui_theme → main_ai，無環。逐一列名而非 `import *`：
+# 底下 445 處引用，`import *` 會讓靜態分析查不到這些名字從哪來。
 from core.ui_theme import (
     CLR_BG,
     CLR_CARD,
@@ -130,8 +114,7 @@ except ImportError as e:
 # 執行期目錄與 LOG 系統
 #
 # _app_dir()／_BASE_DIR／LOG_DIR／RECORDING_DIR／DATA_DIR／logger 已搬到
-# ds102_ctrl.py（DS102Controller 需要 RECORDING_DIR／DATA_DIR／logger），
-# 上方 import 區塊已重新引入這幾個名字，此處不重複定義。
+# ds102_ctrl.py，上方 import 已重新引入，此處不重複定義。
 # =============================================================================
 log_filename: Optional[Path] = None
 
@@ -143,12 +126,10 @@ def init_runtime() -> Tuple[bool, str]:
     """
     建立執行期目錄並初始化 LOG，回傳 (成功?, 錯誤訊息)。
 
-    **刻意不在 module import 時做這件事。** 以前 mkdir 與
-    logging.FileHandler() 都寫在模組層級，也就是在 main() 與任何 GUI
-    之前執行；一旦目錄不可寫（exe 放在 Program Files、磁碟唯讀），
-    例外會在「還沒有視窗可以顯示錯誤」的階段拋出——打包成 windowed exe
-    的話，使用者看到的就是雙擊之後什麼都沒發生，連錯誤訊息都沒有。
-    改成由 main() 呼叫並回傳結果，失敗時還來得及用 messagebox 說明。
+    刻意不在 module import 時做（以前 mkdir／FileHandler 在模組層級，
+    早於任何 GUI；目錄不可寫時例外會在還沒有視窗可顯示錯誤時拋出，
+    windowed exe 雙擊後就是靜默無反應）。改由 main() 呼叫並回傳結果，
+    失敗時還能用 messagebox 說明。
     """
     global log_filename
     try:
@@ -174,10 +155,9 @@ def init_runtime() -> Tuple[bool, str]:
         log_filename = None
         return False, f"無法建立 LOG 檔：\n{e}\n\n位置：{LOG_DIR}"
 
-    # ⚠ PyInstaller 的 --windowed 會把 sys.stdout / sys.stderr 設成 None，
-    # 而 StreamHandler() 預設綁 sys.stderr。少了這道檢查，每一筆 log 的
-    # emit() 都會踩 AttributeError 再被 logging 內部吞掉——不會崩，
-    # 但這支程式 log 量不小，等於每筆都白付一次例外成本。
+    # PyInstaller --windowed 會把 sys.stderr 設成 None，StreamHandler()
+    # 預設綁 sys.stderr；少了這道檢查每筆 log 都會踩 AttributeError（雖被
+    # logging 吞掉不會崩，但 log 量大，等於每筆白付例外成本）。
     if sys.stderr is not None:
         sh = logging.StreamHandler()
         sh.setLevel(logging.INFO)
@@ -192,20 +172,16 @@ def init_runtime() -> Tuple[bool, str]:
     return True, ""
 
 
-# _write_json_with_backup() 已搬到 ds102_ctrl.py（DS102Controller 的
-# teaching_points / speed_profiles / controller_config 持久化都要用它），
-# 上方 import 區塊已重新引入，這裡用到的地方（_save_meter_config /
-# _save_scanner_config）不必改動呼叫方式。
+# _write_json_with_backup() 已搬到 ds102_ctrl.py，上方已重新引入，
+# _save_meter_config / _save_scanner_config 呼叫方式不變。
 def _log_level_adapter(level: str, msg: str) -> None:
     """
     把 `_write_json_with_backup` 期待的 `log(level, msg)` 呼叫轉給模組 logger。
 
-    既有呼叫端（DS102Controller）傳的都是 `self._log`（(level, msg) 簽章的
-    bound method），但 meter 設定檔是模組層級函式，沒有 controller 實例
-    可用。直接傳 `logger`（`logging.Logger` 物件）不可行——`log(...)`
-    內部會呼叫 `log("WARN", msg)`，而 `Logger` 物件本身不可呼叫，會在第一次
-    寫入失敗時丟出 `TypeError`。這個轉接函式沿用 `DS102Controller._log`
-    同一套 level 對應表。
+    既有呼叫端（DS102Controller）傳的是 `self._log`（bound method），但
+    meter 設定檔是模組層級函式、沒有 controller 實例。直接傳 `logger`
+    不可行——`Logger` 物件本身不可呼叫，`log("WARN", msg)` 會在第一次
+    寫入失敗時丟出 `TypeError`。此轉接函式沿用 `DS102Controller._log` 同一套 level 對應表。
     """
     getattr(
         logger,
@@ -217,10 +193,8 @@ def _load_meter_config(log=None) -> dict:
     """
     讀取光功率計連線設定（GPIB 位址／channel／波長）。找不到或壞檔都回空字典。
 
-    log：選用的 `(level, msg)` 簽章回呼。呼叫端若已有 DS102Controller 實例
-    （目前只在 DS102GUI.__init__，此時 self.ctrl 已建立），應傳 `self.ctrl._log`，
-    讀取失敗才會同時進 GUI 的 LOG 分頁與匯出的歷程檔，而不只是寫進 log 檔。
-    不傳則退回只寫模組 logger（例如測試腳本直接呼叫，沒有 GUI 可用）。
+    log：選用的 `(level, msg)` 回呼。有 DS102Controller 實例時（DS102GUI.__init__）
+    應傳 `self.ctrl._log`，讀取失敗才會同時進 GUI 的 LOG 分頁；不傳則只寫模組 logger（如無 GUI 的測試腳本）。
     """
     return _load_json_settings(
         RECORDING_DIR / "meter_config.json",
@@ -234,11 +208,9 @@ def _save_meter_config(data: dict, log=None) -> None:
     """
     整份覆寫光功率計連線設定。
 
-    不需要比照 teaching_points 的 `_points_loaded` 拒寫保護——那道保護
-    是為了防止「累積型集合」被空的記憶體狀態覆寫掉既有內容；這裡的欄位
-    只有位址／channel／波長三個純量值，整份覆寫本來就是正確行為。
-
-    log：見 `_load_meter_config` 的說明，同一套規則。
+    不需要比照 teaching_points 的 `_points_loaded` 拒寫保護——那是為防止
+    累積型集合被空狀態覆寫；此處只有三個純量欄位，整份覆寫即為正確行為。
+    log 參數同 `_load_meter_config`。
     """
     _write_json_with_backup(
         RECORDING_DIR / "meter_config.json", data, log=log or _log_level_adapter
@@ -257,10 +229,8 @@ def _load_scanner_config(log=None) -> dict:
 
 def _save_scanner_config(data: dict, log=None) -> None:
     """
-    整份覆寫尋光演算法設定。欄位大多是純量值，不需要 teaching_points 那種
-    拒寫保護；例外是 `selected_axes`（使用者勾選的搜尋軸清單，字串
-    list），但它同樣沒有「累積型集合被空狀態覆寫」的風險——每次存檔都是
-    當下六個勾選框的完整快照，整份覆寫本來就是正確行為，不需要另外處理。
+    整份覆寫尋光演算法設定。欄位大多是純量值，不需 teaching_points 那種
+    拒寫保護；`selected_axes`（勾選軸清單）同樣每次都是完整快照，整份覆寫即正確行為。
     """
     _write_json_with_backup(
         RECORDING_DIR / "scanner_config.json", data, log=log or _log_level_adapter
@@ -268,29 +238,26 @@ def _save_scanner_config(data: dict, log=None) -> None:
 
 
 # _load_app_settings() / _app_setting_num() / _app_settings 已搬到
-# ds102_ctrl.py（HISTORY_MAX 需要靠 _app_setting_num() 覆寫，避免
-# ds102_ctrl.py 反過來 import main_ai.py），這裡改用上方 import 區塊
-# 重新引入的 _app_settings / _app_setting_num。
+# ds102_ctrl.py（HISTORY_MAX 需要用 _app_setting_num() 覆寫，避免反向 import），
+# 這裡改用上方重新引入的名字。
 #
 # AXES / AXIS_NO / NO_AXIS / MODE_CONTINUE / MODE_STEP / MODE_ORIGIN /
-# UNIT_PULSE 同樣搬到 ds102_ctrl.py（UNIT_PULSE 只有該檔內部用到，不重新
-# 引入）。ORG_MODES 不搬——DS102Controller 完全沒用到它，純粹是 GUI 下拉選單。
+# UNIT_PULSE 同樣搬到 ds102_ctrl.py（UNIT_PULSE 只該檔內部用，不重新引入）。
+# ORG_MODES 不搬——DS102Controller 用不到，純粹是 GUI 下拉選單。
 
 # =============================================================================
 # 常數定義
 # =============================================================================
 # 原點模式清單。
 #
-# 🔴 刻意從 1 開始，不提供 ORG 0。move_origin() 第一件事就是送
-# `AXI{n}:MEMSW0 {type}`，選 ORG 0 等於把該軸復歸樣式寫成 Type0＝不執行。
-# 後果三重：GO ORG 空等 180 秒逾時、復歸樣式被永久覆蓋（實機值
-# X=2/Y=1/Z=2）、把 controller_config.json 剛還原的設定當場毀掉。
+# 刻意從 1 開始，不提供 ORG 0：move_origin() 第一步送 `AXI{n}:MEMSW0
+# {type}`，選 ORG 0 等於把該軸復歸樣式寫成 Type0＝不執行，會導致 GO ORG
+# 空等 180 秒逾時、復歸樣式被永久覆蓋（實機值 X=2/Y=1/Z=2）。
 ORG_MODES = [f"ORG {i}" for i in range(1, 13)]
 
-# 尋光「演算法」下拉選單：代碼（存進 scanner_config.json、傳給
-# FiberAlignmentScanner.run(algorithm=...)）→ 顯示標籤。與 ORG_MODES 不同的
-# 既有慣例（見 _scan_blind_mode_labels）：Combobox 存的是**顯示標籤字串**，
-# 換算回代碼一律查反向 map，不可用 .index()（ORG_MODES 差一位就是前車之鑑）。
+# 尋光「演算法」下拉選單：代碼（存進 scanner_config.json，傳給
+# FiberAlignmentScanner.run(algorithm=...)）→ 顯示標籤。Combobox 存的是
+# **顯示標籤字串**，換算回代碼一律查反向 map，不可用 .index()（見 ORG_MODES 的前車之鑑）。
 ALGO_LABELS = {
     "coordinate_descent": "座標下降（三階段，含可選階段二精修）",
     "powell": "Powell 共軛方向法（實驗性，未真機驗證）",
@@ -298,15 +265,12 @@ ALGO_LABELS = {
 
 # _FINITE_MOVE_RE / _is_finite_move / MAX_RETRY / WAIT_TIMEOUT /
 # WAIT_INTERVAL / JOG_WATCH_INTERVAL / _POLL_QUERIES / HISTORY_MAX /
-# STOP_LOCK_TIMEOUT / CONFIG_FILE 只有 DS102Controller 內部用到，已搬到
-# ds102_ctrl.py，不在此重新引入。COMM_FAIL_THRESHOLD 兩邊都用到，已在
-# 上方 import 區塊重新引入。
+# STOP_LOCK_TIMEOUT / CONFIG_FILE 只 DS102Controller 內部用，已搬到
+# ds102_ctrl.py，不重新引入。COMM_FAIL_THRESHOLD 兩邊都用，已引入。
 #
-# ⚠ NON_RECORDING_JSON 在 main_ai.py 邏輯裡同樣沒被直接用到（IDE 會標成
-# unused import），但不能移除——verify_meter_panel.py 直接讀
-# `main_ai.NON_RECORDING_JSON` 做斷言，拿掉會讓那支回歸測試整支炸掉
-# （2026-08-17 實際踩過：清死 import 時被重跑測試抓到）。改動這裡前務必
-# 先跑 verify_meter_panel.py，不要只憑 grep 或 IDE 診斷判斷。
+# NON_RECORDING_JSON 在此檔邏輯裡沒被直接用到（IDE 會標 unused import），
+# 但不能移除——verify_meter_panel.py 直接讀 `main_ai.NON_RECORDING_JSON`
+# 做斷言，拿掉會讓那支回歸測試炸掉（2026-08-17 實際踩過）。改動前務必先跑該測試。
 
 # 背景位置刷新間隔（秒）。每輪對每個已啟用軸送一筆 POS?（實測約 56ms／筆），
 # 四軸約 0.22s，設 0.5s 讓序列埠仍有餘裕給移動中的到位輪詢。
@@ -324,9 +288,8 @@ LOG_TEXT_MAX_LINES = _app_setting_num(_app_settings, "log_text_max_lines", 2000,
 # POSITION_POLL_INTERVAL(0.5s) 的資料更新即可，設 10ms 純屬浪費。
 # 可由 app_settings.json 的 ui_redraw_interval 覆寫。
 UI_REDRAW_INTERVAL = _app_setting_num(_app_settings, "ui_redraw_interval", 100, int)
-# 橫幅「合併視窗」：這段時間內連續來的訊息會排隊依序顯示（避免互相覆蓋），
-# 超過就直接換掉目前這則——超過表示新訊息多半是使用者剛按下按鈕的回饋，
-# 那不該排隊等好幾秒才出現。
+# 橫幅「合併視窗」：此時間內連續訊息排隊依序顯示（避免互相覆蓋），超過
+# 就直接換掉目前這則（多半是使用者剛按下按鈕的即時回饋，不該排隊等）。
 # 可由 app_settings.json 的 banner_coalesce_sec 覆寫。
 BANNER_COALESCE_SEC = _app_setting_num(_app_settings, "banner_coalesce_sec", 1.0, float)
 # 光功率面板自動輪詢的預設間隔（秒）。
@@ -340,24 +303,20 @@ SCAN_PLOT_REDRAW_INTERVAL = _app_setting_num(
     _app_settings, "scan_plot_redraw_interval", 250, int
 )
 
-# 顏色主題已搬到 ui_theme.py（2026-08-31），上方的 `from ui_theme import
-# ...` 把十個名字重新引入本模組命名空間，底下 445 處 `CLR_*` 引用與
-# monkeypatch `main_ai.CLR_*` 都不受影響。搬出去的理由：CLR_* 是唯一橫跨
-# 全部七個分頁的 UI 常數，留在 main_ai.py 會讓任何想搬出去的 GUI 程式碼
-# 反過來 import main_ai.py，形成循環相依。完整說明見 ui_theme.py docstring。
+# 顏色主題已搬到 ui_theme.py（2026-08-31），上方重新引入十個 CLR_* 名字，
+# 底下 445 處引用與 monkeypatch `main_ai.CLR_*` 不受影響。搬出理由：CLR_*
+# 橫跨全部七個分頁，留在此檔會讓其他 GUI 模組反向 import main_ai.py 成環。
 #
-# ⚠ `_app_settings` / `_app_setting_num` 沒有跟著搬去 ui_theme.py：它們
-# 定義在 ds102_ctrl.py（HISTORY_MAX 需要），搬走會讓 ds102_ctrl.py 反過來
-# import ui_theme.py，變成新的環。上方各項 UI 節奏常數因此維持原樣。
+# `_app_settings` / `_app_setting_num` 沒跟著搬：它們定義在 ds102_ctrl.py
+# （HISTORY_MAX 需要），搬去 ui_theme.py 會讓 ds102_ctrl.py 反向 import 成新的環。
 
 
 
 # =============================================================================
 # 後端控制器
 #
-# DS102Controller 已搬到 ds102_ctrl.py（2026-08-17，機械式搬移，行為不變）。
-# 上方 import 區塊已用 `from ds102_ctrl import DS102Controller` 重新引入
-# 這個名字，DS102GUI.__init__ 的 `self.ctrl = DS102Controller()` 不必修改。
+# DS102Controller 已搬到 ds102_ctrl.py（2026-08-17，機械式搬移，行為不變），
+# 上方已重新引入，DS102GUI.__init__ 的 `self.ctrl = DS102Controller()` 不必修改。
 # =============================================================================
 
 # =============================================================================
@@ -430,18 +389,14 @@ class StatusBar(tk.Frame):
         """
         刷新各軸工作座標（機械位置扣除 offset，單位 pulse）。
 
-        三種狀態要能一眼分辨，這是控制台的基本要求：
-          未連線   → 全部「—」，絕不顯示 0（0 幾乎就在限位開關上）
-          失聯     → 座標轉為警告色並標示「已停止更新」
-          正常     → 顯示數值，右側標註資料年齡
-        另外把**當前選取軸**highlight 出來——選錯軸就是驅動錯的滑台，
-        而軸選擇器只存在於兩個分頁，其餘分頁完全看不出選的是哪一軸。
+        三種狀態要能一眼分辨：未連線→全部「—」（絕不顯示 0，0 幾乎就在
+        限位開關上）；失聯→警告色＋「已停止更新」；正常→顯示數值＋資料
+        年齡。另把**當前選取軸**highlight 出來——選錯軸就是驅動錯的滑台，
+        而軸選擇器只存在於兩個分頁，其餘分頁看不出選的是哪一軸。
 
-        ⚠ 刻意不在這裡附加 μm 估算：這顆 Label 是 width=10 的固定寬度
-        （六軸要並排塞進同一條 StatusBar），Consolas 10pt bold 底下連
-        原本的 pulse 數字都常常頂到邊界，再接一段「≈ 1234.5 μm」只會
-        被截斷或把整條 bar 撐爆。μm 估算的必顯示位置是儀表板
-        （_redraw_positions），這裡不做。
+        刻意不附加 μm 估算：這顆 Label 是 width=10 固定寬度（六軸要並排
+        塞進同一條 StatusBar），Consolas 10pt bold 底下 pulse 數字本已頂
+        邊界，再接「≈ 1234.5 μm」只會截斷或撐爆整條 bar。μm 估算顯示在儀表板（_redraw_positions），這裡不做。
         """
         connected = self.ctrl.connected
         stale = self.ctrl.comm_stale
@@ -473,7 +428,7 @@ class StatusBar(tk.Frame):
             self._age_var.set("未連線")
             self._age_lbl.config(fg=CLR_MUTED)
         elif stale:
-            self._age_var.set("⚠ 已停止更新")
+            self._age_var.set("已停止更新")
             self._age_lbl.config(fg=CLR_DANGER)
         else:
             age = self.ctrl.position_age()
@@ -492,42 +447,32 @@ class StatusBar(tk.Frame):
 @dataclass(frozen=True)
 class LongOperation:
     """
-    一項「長時間背景作業」的註冊項目（2026-08-31 前置1，見
-    docs/modularization.md）。
+    一項「長時間背景作業」的註冊項目（2026-08-31 前置1，見 docs/modularization.md）。
 
-    在這之前，每新增一種長時間作業（重播／全軸原點復歸／原點復歸重現性
-    量測／尋光），作者都必須自己記得手動接進 6 個散落的位置：
-    `_update_stat_ui` 的 busy 判斷、`_start_poller` 的經過時間、`_do_stop`、
-    `_on_escape`、`_toggle_connect` 的中斷分支、`_on_close`。實際上**已經
-    漏過**——尋光在前四個位置裡漏了三個（architect 2026-08-31 複審抓到，
-    症狀是尋光中按 Esc／■ Stop 滑台停一下又自己繼續走）。改成註冊表之後，
-    新增作業只要在 `_register_long_ops()` 多寫一筆，漏接在結構上不可能發生。
+    改成註冊表之前，每新增一種長時間作業（重播／全軸原點復歸／原點復歸
+    重現性量測／尋光）都要自己記得手動接進 6 個散落位置（`_update_stat_ui`
+    忙碌判斷、`_start_poller` 經過時間、`_do_stop`、`_on_escape`、
+    `_toggle_connect` 中斷分支、`_on_close`），實際上已經漏過（architect
+    2026-08-31 複審抓到尋光漏了三個，症狀是按 Esc／■ Stop 滑台停一下又
+    自己繼續走）。現在新增作業只要在 `_register_long_ops()` 多寫一筆，漏接結構上不可能發生。
 
-    🔴 **這張表只服務兩件事：「UI 忙碌顯示」與「停止請求分派」。**
-    絕不可以拿它當移動守衛，也不可以把 `ctrl.motion_active` /
-    `ctrl.scanning_active` 併進來——那是 docs/fiber-scan.md 明列的紅線
-    （`motion_active` 只判斷「要不要占用其他硬體資源」；把 `scanning_active`
-    放進移動守衛曾讓所有收斂測試卡死）。
+    **只服務「UI 忙碌顯示」與「停止請求分派」兩件事，絕不可當移動守衛**，
+    也不可併入 `ctrl.motion_active` / `ctrl.scanning_active`（docs/fiber-scan.md
+    紅線：後者放進移動守衛曾讓所有收斂測試卡死）。
 
-    🔴 **除了 `key` / `label`，每個欄位都是 callable，這是刻意的。**
-    註冊發生在 `__init__` 早期，而部分依賴物件（例如
-    `_org_repeat_elapsed_var` 要等 `_build_card_origin_repeatability()`、
-    `_active_scanner` 要等使用者按下開始）當下根本還不存在。全部走 callable
-    表示每個欄位都在「被呼叫的當下」才解析 `self` 的屬性，註冊表因此完全
-    不受 `__init__` 內的建構順序影響——這正是 docs/modularization.md 第 21
-    行點名的那類初始化順序相依，這裡從一開始就避開，而不是靠註解提醒。
+    **除 `key`/`label` 外每個欄位都是 callable**：註冊發生在 `__init__`
+    早期，部分依賴物件（`_org_repeat_elapsed_var`、`_active_scanner`）
+    當下還不存在，callable 讓每個欄位在被呼叫當下才解析 `self` 屬性，不受建構順序影響。
 
     欄位：
-      key          內部識別字串（log 與測試用，不顯示給使用者）
-      label        給人看的作業名稱，`_busy_reasons()` 用它組訊息
-      is_running   () -> bool，作業是否進行中（唯一的 busy 判準）
-      request_stop () -> None，請求該作業收工；**None 代表這項作業沒有
-                   軟體停止機制**（全軸原點復歸就是這種：`origin_all()`
-                   不收 stop_event，只能靠 `ctrl.stop()` 讓當下那一軸的
-                   `_wait_origin_done()` 結束）。呼叫端一律要判斷 None。
-      started_at   () -> float，本輪起算的 time.time() 基準；與
-                   `show_elapsed` 必須成對出現，其一為 None 就不計時。
-      show_elapsed (str) -> None，把格式化好的 "MM:SS" 寫進對應的 StringVar。
+      key          內部識別字串（log／測試用）
+      label        作業名稱，`_busy_reasons()` 組訊息用
+      is_running   () -> bool，唯一的 busy 判準
+      request_stop () -> None，請求收工；**None 代表沒有軟體停止機制**
+                   （例：全軸原點復歸的 `origin_all()` 不收 stop_event，
+                   只能靠 `ctrl.stop()` 讓當下那軸的 `_wait_origin_done()` 結束）。呼叫端一律要判斷 None。
+      started_at   () -> float，本輪計時基準；須與 `show_elapsed` 成對出現，其一 None 就不計時。
+      show_elapsed (str) -> None，把 "MM:SS"寫進對應 StringVar。
     """
 
     key: str
@@ -541,38 +486,26 @@ class LongOperation:
 @dataclass(frozen=True)
 class PowerReading:
     """
-    「最近一次成功的光功率讀值」快取（2026-08-31 前置2，見
-    docs/modularization.md〈九〉）。
+    「最近一次成功的光功率讀值」快取（2026-08-31 前置2，見 docs/modularization.md〈九〉）。
 
-    在這之前，這份快取是 `_pm_last_value` / `_pm_last_ok_time` 兩個裸欄位，
-    由「光功率」與「尋光」**兩個分頁各自直接指派**。2026-08-31 的模組化複審
-    把它列為專案裡唯一一組「跨分頁共用的未命名可變狀態」——比「互相呼叫對方
-    的私有方法」更難查，因為連呼叫點都 grep 不到，只能靠記得去搜欄位名。
-    收斂成一個具名物件之後，寫入只走 `_pm_note_reading()` /
-    `_pm_clear_reading()`，讀取只走 `self._pm_reading`。
+    此前是 `_pm_last_value` / `_pm_last_ok_time` 兩個裸欄位，由「光功率」與
+    「尋光」兩分頁各自直接指派——2026-08-31 複審列為專案裡唯一一組跨分頁
+    共用的未命名可變狀態，比互相呼叫私有方法更難查（連呼叫點都 grep 不到）。
+    收斂成具名物件後，寫入只走 `_pm_note_reading()`/`_pm_clear_reading()`，讀取只走 `self._pm_reading`。
 
-    🔴 **frozen（不可變）是刻意的，而且是這個設計唯一真正的技術理由。**
-    寫入端全部在 Tk 主執行緒（背景輪詢與單次查詢都走 `root.after` 回主
-    執行緒；`_scan_plot_extend` 掛在 `_redraw_scan_plot` 這條 `root.after`
-    鏈上），但**讀取端不是**：`_get_last_pm_value()` 由
-    `DS102Controller._record_data_point()` 在 `_wait_axis_stop()` 的等待
-    迴圈裡呼叫，跑在移動執行緒上。原本 value 與 ok_time 是兩行各自指派，
-    移動執行緒有機會讀到「新的 value 配舊的 ok_time」這種撕裂組合；換成
-    frozen dataclass 後，更新是**單一次屬性重新指派**（GIL 下不可分割），
-    讀取端拿到的必定是同一次讀值的完整快照。
+    **frozen（不可變）是唯一真正的技術理由**：寫入端全在 Tk 主執行緒，
+    但讀取端不是——`_get_last_pm_value()` 由 `DS102Controller._record_data_point()`
+    在 `_wait_axis_stop()` 等待迴圈裡呼叫，跑在移動執行緒。原本 value／
+    ok_time 兩行各自指派，移動執行緒有機會讀到「新 value 配舊 ok_time」的
+    撕裂組合；frozen dataclass 的更新是單一次屬性重新指派（GIL 下不可分割），讀取端必定拿到同一次讀值的完整快照。
 
-    ⚠ 這只是把原本就存在的跨執行緒讀取變得一致，**沒有**、也不宣稱新增
-    任何鎖保護。不要因為它現在有名字就假設它是執行緒安全的容器——真正的
-    保證只有「單一寫入執行緒 ＋ 不可變快照」這一條。
+    這只是讓既有的跨執行緒讀取變得一致，**沒有**新增鎖保護——保證只有「單一寫入執行緒＋不可變快照」這一條。
 
     欄位：
-      value    最近一次成功讀值（dBm）。None＝從未讀到過可信讀值
-      ok_time  該次讀值當下的 time.time()。0.0＝從未成功讀到（`_pm_update_age_label`
-               用 `<= 0` 判斷要不要顯示「—」，沿用原本 `_pm_last_ok_time` 的語意）
-      source   "meter"＝光功率分頁自己的查詢／背景輪詢；"scan"＝尋光分頁的
-               sample callback 轉貼。**純診斷用**，沒有任何邏輯依它分流——
-               加這個欄位是為了讓將來看到一筆可疑讀值時，能直接知道它從哪
-               條路徑進來，不必回頭推理當下 scanning_active 是什麼狀態。
+      value    最近一次成功讀值（dBm）；None＝從未讀到過
+      ok_time  該次讀值的 time.time()；0.0＝從未成功（`_pm_update_age_label` 用 `<= 0` 判斷要不要顯示「—」）
+      source   "meter"＝光功率分頁自身查詢／輪詢；"scan"＝尋光 sample
+               callback 轉貼。純診斷用，不影響任何分流邏輯。
     """
 
     value: Optional[float] = None
@@ -593,14 +526,11 @@ class DS102GUI:
         self.ctrl.set_power_reader(self._get_last_pm_value)
 
         # ── B 類安全設定檔（safety_settings.json）驗證結果 ──
-        # _safety_setting_rejections 是 ds102_ctrl 模組層級清單，在模組載入
-        # 當下（比任何 DS102Controller 實例、比 init_runtime() 的 FileHandler
-        # 都早）就已經定案，程式生命週期內不會再變動。裡面的訊息只進了
-        # Python 內建 logging，不會進到 GUI 的 LOG 分頁（那邊是 ctrl._log()
-        # 寫入 action_history 的另一條獨立路徑）。這裡逐則補寫一次，讓「橫幅
-        # 說有 N 項 → 使用者去 LOG 分頁篩 WARN → 看到 N 條對應明細」這條路徑
-        # 成立。橫幅本身的顯示（會用到 _flash_banner，需要 _build_banner()
-        # 先建好 widget）放在 __init__ 尾端、_build_notebook() 之後。
+        # _safety_setting_rejections 是 ds102_ctrl 模組層級清單，在模組載入時
+        # （早於任何 DS102Controller 實例）就已定案，之後不再變動。裡面的訊息
+        # 只進了內建 logging，不會進 GUI 的 LOG 分頁（那是 ctrl._log() 的另一條
+        # 獨立路徑）。這裡逐則補寫一次，讓「橫幅提示 N 項 → LOG 分頁篩 WARN →
+        # 看到明細」這條路徑成立。橫幅顯示本身放在 __init__ 尾端、_build_notebook() 之後（需要 _build_banner() 先建好 widget）。
         for _msg in _safety_setting_rejections:
             self.ctrl._log("WARN", f"[安全設定] {_msg}")
 
@@ -608,12 +538,10 @@ class DS102GUI:
         self._scanning = threading.Event()  # GUI 層忙碌旗標，比照 self._homing 的既有模式
         self._active_scanner: Optional["FiberAlignmentScanner"] = None
         self._scan_axis_step_vars = {}  # {軸名: tk.StringVar}，_build_tab_scan 建立分頁時才會實際填入
-        # ⚠ _scan_stage2_var 不在這裡建立——它跟其餘會被 scanner_config.json
-        # 覆寫預設值的欄位一樣，要等 _build_tab_scan 讀到
-        # self._scanner_cfg_pending 後才建立（見該處 `cfg.get("enable_stage2",
-        # False)`）。若先建立成寫死的 BooleanVar(value=False)，存檔的
-        # enable_stage2 欄位就永遠讀不回來（測試案例 22e 抓到：使用者勾選
-        # 過就存檔，下次開程式勾選框卻永遠回到未勾選）。
+        # _scan_stage2_var 不在這裡建立，要等 _build_tab_scan 讀到
+        # self._scanner_cfg_pending 後才建立（`cfg.get("enable_stage2", False)`）。
+        # 若先建成寫死的 BooleanVar(value=False)，存檔的 enable_stage2 就永遠
+        # 讀不回來（測試案例 22e 抓到：勾選過存檔，下次開程式又回到未勾選）。
         self._scan_status_var = tk.StringVar(value="尚未開始")
         self._scan_elapsed_var = tk.StringVar(value="00:00")
         # 上一輪搜尋的結束狀態，供「匯出 Excel」把「完成／中止」與中止原因
@@ -629,10 +557,9 @@ class DS102GUI:
         self._scanner_cfg_pending: dict = _load_scanner_config(log=self.ctrl._log)
 
         # ── 尋光即時軌跡圖（第三階段新增）──
-        # sample_cb 跑在 scanner 的背景執行緒，matplotlib／tkinter API 都不能
-        # 在那裡呼叫（Python 3.14 tkinter 會丟 RuntimeError）。做法是資料寫入
-        # 與重繪分離：背景執行緒只把 Sample 塞進這個 list，_redraw_scan_plot
-        # 固定節奏在主執行緒把它清空、套進圖表。
+        # sample_cb 跑在 scanner 背景執行緒，matplotlib／tkinter API 不能在
+        # 那裡呼叫（Python 3.14 tkinter 會丟 RuntimeError）。資料寫入與重繪
+        # 分離：背景執行緒只把 Sample 塞進這個 list，_redraw_scan_plot 固定節奏在主執行緒清空、套進圖表。
         self._scan_plot_lock = threading.Lock()
         self._scan_plot_pending: List = []  # List[Sample]，背景執行緒寫入、主執行緒讀取清空
         self._scan_samples: List = []  # List[Sample]，完整歷史（主執行緒專用，供重繪整張圖）
@@ -648,10 +575,9 @@ class DS102GUI:
         self._pm_auto_poll = tk.BooleanVar(value=False)
         self._pm_poll_interval = tk.StringVar(value=str(METER_POLL_INTERVAL))
         self._pm_comm_failures = 0
-        # 最近一次成功讀值（供 CSV 記錄與「幾秒前」標籤取用）。
-        # 🔴 唯一寫入者是 _pm_note_reading() / _pm_clear_reading()，不要在
-        # 任何地方直接指派這個欄位——「尋光」分頁曾經直接寫舊的兩個裸欄位，
-        # 那正是前置2 要消滅的東西（見 PowerReading 的 docstring）。
+        # 最近一次成功讀值（供 CSV 記錄與「幾秒前」標籤取用）。唯一寫入者是
+        # _pm_note_reading()/_pm_clear_reading()，不要直接指派——「尋光」分頁
+        # 曾直接寫舊的兩個裸欄位，正是前置2 要消滅的東西（見 PowerReading docstring）。
         self._pm_reading = PowerReading()
         self._pm_power_var = tk.StringVar(value="—")
         self._pm_unit_var = tk.StringVar(value="")
@@ -768,19 +694,19 @@ class DS102GUI:
         # 明細已在上面（ctrl 建立後）補寫完畢，此處只負責橫幅文案。
         _n_rejected = len(_safety_setting_rejections)
         if _n_rejected == 1:
-            self._flash_banner(f"⚠ 安全設定檔：{_safety_setting_rejections[0]}")
+            self._flash_banner(f"安全設定檔：{_safety_setting_rejections[0]}")
         elif _n_rejected >= 2:
             self._flash_banner(
-                f"⚠ 安全設定檔有 {_n_rejected} 項欄位超出合法範圍，"
+                f"安全設定檔有 {_n_rejected} 項欄位超出合法範圍，"
                 f"已改用內建預設值（詳見 LOG／儀表板「系統狀態」）"
             )
 
-        self.ctrl._log("INFO", "DS102  圖形化控制器啟動")
+        self.ctrl._log("INFO", "DS102 圖形化控制器啟動")
 
     # =========================================================================
     # 長時間背景作業註冊表
     #
-    # 🔴 新增任何「跑在自己的背景執行緒、會持續驅動硬體」的作業時，
+    # 新增任何「跑在自己的背景執行緒、會持續驅動硬體」的作業時，
     #    **唯一該做的事就是在 _register_long_ops() 多寫一筆**。不要再自己
     #    去 _update_stat_ui / _start_poller / _do_stop / _on_escape /
     #    _toggle_connect / _on_close 手動接線——那六個位置現在全部改成
@@ -794,11 +720,10 @@ class DS102GUI:
         （playback_running / _homing / _scanning / _org_repeat_running），
         沒有新增也沒有移除任何一項。
         """
-        # ⚠ 每個欄位一律包成 lambda，不要寫成 `self._stop_playback.set` 這種
-        # 綁定方法。綁定方法會在註冊當下就把 Event/StringVar 實例抓進閉包，
-        # 於是這張表反過來要求「註冊必須排在那些物件建立之後」——正是本次
-        # 重構要消滅的那種初始化順序相依；更糟的是若日後有人重新指派
-        # `self._scanning = threading.Event()`，註冊表會靜默地繼續盯著舊物件。
+        # 每個欄位一律包成 lambda，不要寫成 `self._stop_playback.set` 這種
+        # 綁定方法——那會在註冊當下就把 Event/StringVar 實例抓進閉包，反而
+        # 要求「註冊必須排在那些物件建立之後」（本次重構要消滅的相依），
+        # 且若日後重新指派 `self._scanning = threading.Event()`，表會靜默盯著舊物件。
         self._long_ops: Tuple[LongOperation, ...] = (
             LongOperation(
                 key="playback",
@@ -812,12 +737,10 @@ class DS102GUI:
                 key="homing",
                 label="全軸原點復歸",
                 is_running=lambda: self._homing.is_set(),
-                # 🔴 request_stop 是 None，不是漏寫：ctrl.origin_all() 不收
-                # stop_event，沒有任何軟體旗標能讓它提前收工。唯一能縮短它的
-                # 是呼叫端本來就會送的 ctrl.stop()——那會讓當下那一軸的
-                # _wait_origin_done() 提早結束，但整批仍會依序跑完其餘軸。
-                # 要改成可中止必須動 ds102_ctrl.origin_all() 的簽章，屬於
-                # 另一件事，不在前置1 的範圍內。
+                # request_stop 是 None，不是漏寫：ctrl.origin_all() 不收
+                # stop_event。唯一能縮短它的是呼叫端本來就會送的
+                # ctrl.stop()，讓當下那軸的 _wait_origin_done() 提早結束，
+                # 但整批仍依序跑完其餘軸。改成可中止需動 origin_all() 簽章，不在前置1 範圍內。
             ),
             LongOperation(
                 key="scan",
@@ -833,9 +756,8 @@ class DS102GUI:
                 is_running=lambda: self._org_repeat_running.is_set(),
                 request_stop=lambda: self._org_repeat_stop_event.set(),
                 started_at=lambda: self._org_repeat_start_time,
-                # ⚠ 這一項是延後求值最有感的地方：_org_repeat_elapsed_var
-                # 要等 _build_card_origin_repeatability() 才建立，而
-                # _register_long_ops() 跑在 _build_notebook() 之前。
+                # 延後求值在此最有感：_org_repeat_elapsed_var 要等
+                # _build_card_origin_repeatability() 才建立，而 _register_long_ops() 跑在 _build_notebook() 之前。
                 show_elapsed=lambda txt: self._org_repeat_elapsed_var.set(txt),
             ),
         )
@@ -866,14 +788,12 @@ class DS102GUI:
         把停止請求分派給所有長時間背景作業。
 
         **刻意不先判斷 `is_running()`**，理由有二：
-        1. 三個 request_stop 都是冪等的旗標設定，而且各自的啟動流程
-           （`_do_play_rec` 的 `_stop_playback.clear()`、
-           `_do_start_org_repeat` 的 `_org_repeat_stop_event.clear()`）
-           都會在下一輪開始前把旗標清掉，殘留的 set 不會誤殺下一輪。
-        2. 「進行中旗標」與「停止目標」不是同一個物件，兩者的 set/clear
-           時序有極短的交錯窗口（例如 `_scanning.set()` 早於
-           `_active_scanner = scanner`）。用 is_running() 當閘門等於把這個
-           窗口變成漏接窗口，而漏接正是這張表要消滅的東西。
+        1. 三個 request_stop 都是冪等的旗標設定，各自啟動流程（`_do_play_rec`
+           的 `_stop_playback.clear()`、`_do_start_org_repeat` 的
+           `_org_repeat_stop_event.clear()`）都會在下一輪開始前清掉，殘留 set 不會誤殺下一輪。
+        2. 「進行中旗標」與「停止目標」不是同一個物件，set/clear 時序有極短
+           交錯窗口（例如 `_scanning.set()` 早於 `_active_scanner = scanner`）。
+           用 is_running() 當閘門等於把這個窗口變成漏接窗口——正是這張表要消滅的東西。
 
         每一項各自 try/except：這是「使用者按下停止」的路徑，任何一項
         request_stop 拋例外都不可以吃掉其餘作業的停止請求。
@@ -910,16 +830,13 @@ class DS102GUI:
         """
         建立一條可自動消失的提醒橫幅。
 
-        限位是很常見的正常狀況（點動到底、教點超界），以前每次都跳 modal
-        messagebox，使用者必須按確認、期間整個 UI 停擺。改用這條橫幅：
-        看得到、不擋操作、幾秒後自己收起來。
+        限位是常見正常狀況（點動到底、教點超界），以前每次跳 modal
+        messagebox 讓 UI 停擺。改用這條橫幅：看得到、不擋操作、幾秒後自己收起來。
         """
-        # ⚠ 橫幅**常駐 pack**、高度固定，閒置時只是變成背景色。
-        # 以前是有訊息才 pack、逾時 pack_forget，結果整個 notebook 會上下
-        # 跳動約 30px——而觸發橫幅最頻繁的情境正是「長按點動撞到限位」，
-        # 按鈕就在手指下方位移。Tk 的隱式指標抓取保證這次的 release 仍送到
-        # 原 widget（放開即停不受影響），但**下一次點擊**很可能落在錯位的
-        # 目標上，而點動按鈕旁邊就是停止鍵。
+        # 橫幅**常駐 pack**、高度固定，閒置時只是變回背景色。以前是有訊息
+        # 才 pack、逾時 pack_forget，會讓 notebook 上下跳動約 30px——而觸發
+        # 橫幅最頻繁的情境正是「長按點動撞到限位」，按鈕就在手指下方位移，
+        # 下一次點擊很可能落在錯位目標上（點動按鈕旁邊就是停止鍵）。
         self._banner = tk.Frame(self.root, bg=CLR_BG, height=30)
         self._banner.pack(fill="x", side="top")
         self._banner.pack_propagate(False)
@@ -952,24 +869,18 @@ class DS102GUI:
         """
         顯示提醒，ms 毫秒後自動收起。
 
-        短時間內來第二則訊息時**排隊依序顯示**，不會互相覆蓋。
-        以前是直接覆寫同一個變數並重設倒數——連線成功時若同時有
-        「已從設定檔還原」與「復歸樣式未設定」兩則，第一則會在顯示 0ms
-        後被蓋掉，實質上永遠看不到。
+        短時間內來第二則訊息時**排隊依序顯示**，不會互相覆蓋。以前直接
+        覆寫同一變數並重設倒數，連線成功時「已從設定檔還原」與「復歸樣式
+        未設定」兩則會讓第一則顯示 0ms 就被蓋掉。
 
-        `color` 預設 `CLR_WARN`（與改動前所有既有呼叫點行為一致）。
-        2026-08-21 為「原點復歸重現性量測中止在非原點狀態」這種比一般
-        警告更嚴重的情境新增——呼叫端可傳 `CLR_DANGER` 拉高視覺急迫性，
-        不需要另外新增一套獨立的橫幅機制。
+        `color` 預設 `CLR_WARN`。2026-08-21 為「原點復歸重現性量測中止在
+        非原點狀態」這種更嚴重情境新增——呼叫端可傳 `CLR_DANGER` 拉高急迫性，不需另建獨立機制。
         """
         try:
             if self._banner_after_id:
-                # 只有「幾乎同時」湧入的訊息才排隊。這正是佇列要解決的情境：
-                # 連線成功時「已從設定檔還原」與「復歸樣式未設定」兩則在同一個
-                # 事件裡連續觸發，舊寫法會讓第一則顯示 0ms 就被蓋掉。
-                #
-                # 但若目前這則已經顯示一段時間，新訊息多半是使用者剛按下
-                # 某個按鈕的回饋——那不該排隊等好幾秒才出現，直接換掉。
+                # 只有「幾乎同時」湧入的訊息才排隊（解決上面連線成功時
+                # 兩則連續觸發、第一則被蓋掉的情境）。若目前這則已顯示一段
+                # 時間，新訊息多半是使用者剛按下按鈕的回饋，不該排隊等，直接換掉。
                 if time.time() - self._banner_shown_at < BANNER_COALESCE_SEC:
                     if (msg, ms, color) not in self._banner_queue:
                         self._banner_queue.append((msg, ms, color))
@@ -1013,13 +924,10 @@ class DS102GUI:
         self.root.title("DS102 / DS112 步進馬達控制器 ")
         self.root.configure(bg=CLR_BG)
         self.root.minsize(1020, 720)
-        # 開機預設最大化，不猜固定像素尺寸——新卡片陸續增多後，沒有明確
-        # geometry() 時 Tk 只照 widget 最小需求開窗，內容容易被擠壓成需要
-        # 捲動。用 state("zoomed")（Windows 專用，保留標題列/工作列）自動
-        # 吃滿螢幕可用空間，使用者仍可自行拖曳還原。
-        # 🔴 "zoomed" 是 Windows 專用 state，Linux（含 Xvfb 測試環境）會丟
-        # TclError，失敗時退回 attributes("-zoomed", True)，兩者都不支援
-        # 時保持預設視窗大小（不影響功能，只是開窗不是最大化）。
+        # 開機預設最大化：沒有明確 geometry() 時 Tk 只照 widget 最小需求
+        # 開窗，卡片一多內容就會被擠壓成需要捲動。state("zoomed")（Windows
+        # 專用）自動吃滿螢幕，使用者仍可自行拖曳還原。Linux（含 Xvfb 測試
+        # 環境）會丟 TclError，退回 attributes("-zoomed", True)，兩者都不支援時保持預設大小。
         try:
             self.root.state("zoomed")
         except tk.TclError:
@@ -1031,7 +939,7 @@ class DS102GUI:
 
         # Escape = 停止所有軸。機台旁操作時滑鼠不一定在手上，而停止鍵
         # 只存在於「移動控制」分頁。bind_all 讓它在任何分頁、任何焦點下都有效。
-        # ⚠ 緊急停止**刻意不綁鍵盤**：誤觸後還要走解除流程並確認各軸位置，
+        # 緊急停止**刻意不綁鍵盤**：誤觸後還要走解除流程並確認各軸位置，
         #   代價比多按一次滑鼠高。
         self.root.bind_all("<Escape>", self._on_escape)
 
@@ -1104,7 +1012,7 @@ class DS102GUI:
         right.pack(side="right", padx=16, pady=8)
         self._ems_btn = tk.Button(
             right,
-            text="⛔  緊急停止",
+            text="緊急停止",
             bg=CLR_DANGER,
             fg="white",
             font=("Segoe UI", 11, "bold"),
@@ -1118,7 +1026,7 @@ class DS102GUI:
 
         self._home_btn = tk.Button(
             right,
-            text="🏠  全軸原點復歸",
+            text="全軸原點復歸",
             bg=CLR_INFO,
             fg="white",
             font=("Segoe UI", 11, "bold"),
@@ -1322,11 +1230,10 @@ class DS102GUI:
         stat_row = tk.Frame(stat_card, bg=CLR_CARD)
         stat_row.pack(fill="x", padx=12, pady=8)
         self._stat_vars: Dict[str, tk.StringVar] = {}
-        # 安全設定檔驗證結果是靜態值（模組載入時就定案，程式生命週期內不會
-        # 再變動），在此直接讀一次決定文字即可，不掛進 _update_stat_ui 的
-        # 100ms 週期性重繪——那是給連線狀態／可用軸數這類會變動的值用的。
+        # 安全設定檔驗證結果是靜態值（模組載入時就定案，不會再變動），直接
+        # 讀一次即可，不掛進 _update_stat_ui 的 100ms 週期重繪（那是給連線狀態／可用軸數這類會變動的值用的）。
         _n_rejected = len(_safety_setting_rejections)
-        _safety_val = "內建預設" if _n_rejected == 0 else f"⚠ {_n_rejected} 項已回退"
+        _safety_val = "內建預設" if _n_rejected == 0 else f"{_n_rejected} 項已回退"
         for i, (key, lbl, val) in enumerate(
             [
                 ("conn", "連線狀態", "未連線"),
@@ -1608,10 +1515,9 @@ class DS102GUI:
         """
         軸機械校正參數：純顯示用的 pulse→μm 估算換算表。
 
-        跟 DRDIV 是兩個不同語意的數字，刻意不互相關聯或自動代入
-        （division 是使用者自己讀實體開關填的，DRDIV 是控制器內部一個
-        跟實體開關無關的軟體暫存器，見 ds102_ctrl.py 的 axis_drdiv 註解）。
-        這張卡片完全不影響任何移動/限位/教點邏輯，錯了也不會有警報。
+        跟 DRDIV 是兩個不同語意的數字，刻意不互相關聯或自動代入（division
+        是使用者讀實體開關填的，DRDIV 是控制器內部與實體開關無關的軟體
+        暫存器，見 ds102_ctrl.py 的 axis_drdiv 註解）。此卡片不影響任何移動/限位/教點邏輯，錯了也不會有警報。
         """
         calib_card = self._card(
             scr,
@@ -1628,7 +1534,7 @@ class DS102GUI:
         ).pack(anchor="w", padx=12, pady=(2, 0))
         tk.Label(
             calib_card,
-            text="⚠ 估算值——導程/步進角/分度值任一填錯，顯示的 μm 就會是錯的，"
+            text="估算值——導程/步進角/分度值任一填錯，顯示的 μm 就會是錯的，"
                  "不會有任何警報或攔截。",
             bg=CLR_CARD,
             fg=CLR_WARN,
@@ -1769,10 +1675,10 @@ class DS102GUI:
                 local_errors.append(f"{ax}: 導程/步進角須為數字、分度值須為整數")
                 continue
 
-            # math.isfinite() 排除 inf/nan——float("inf")/float("nan") 不會拋
-            # ValueError，且兩者都滿足 x <= 0 為 False，沒有這道檢查會被下面
-            # 的正數判斷放行，算出 "≈ nan μm" 這種顯示（GUI 端跟 ds102_ctrl.py
-            # 的 set_axis_calib()/estimate_um() 要用同一套檢查，不能只擋一邊）。
+            # math.isfinite() 排除 inf/nan：float("inf")/float("nan") 不會拋
+            # ValueError 且滿足 x <= 0 為 False，沒這道檢查會被下面正數判斷
+            # 放行，算出 "≈ nan μm"。GUI 端要跟 ds102_ctrl.py 的
+            # set_axis_calib()/estimate_um() 用同一套檢查，不能只擋一邊。
             if not math.isfinite(lead) or lead <= 0:
                 local_errors.append(f"{ax}: 導程需為正數")
                 continue
@@ -1812,9 +1718,9 @@ class DS102GUI:
         """
         清除單一軸的機械校正參數。
 
-        `_apply_axis_calib()` 把「三欄全空」當成「本次不動這軸」（避免使用者
-        不小心清掉一欄就整軸消失），所以清除需要一個獨立、明確的入口——
-        這顆按鈕就是。這軸本來就沒設定時不彈任何視窗，按下去沒反應是合理的。
+        `_apply_axis_calib()` 把「三欄全空」當成「本次不動這軸」（避免
+        誤刪一欄就整軸消失），所以清除需要獨立入口——這顆按鈕就是。
+        這軸本來沒設定時不彈視窗，按下去沒反應是合理的。
         """
         existing = self.ctrl.axis_calib.get(ax)
         if not existing:
@@ -1863,7 +1769,7 @@ class DS102GUI:
         ).pack(anchor="w", padx=12, pady=(2, 4))
         tk.Label(
             card,
-            text="⚠ 量測期間會暫停該軸的韌體軟體限位（結束後自動還原）。過程中\n"
+            text="量測期間會暫停該軸的韌體軟體限位（結束後自動還原）。過程中\n"
                  "請勿手動點動同一軸。只有成功完成原點復歸的組合才會把座標\n"
                  "強制寫回 0；中途失敗、逾時或被緊急停止中斷則不會歸零，畫面\n"
                  "會明確警示，需重新執行原點復歸後才能繼續其他操作。",
@@ -1913,12 +1819,10 @@ class DS102GUI:
         ).pack(anchor="w")
         preset_row = tk.Frame(off_f, bg=CLR_CARD)
         preset_row.pack(fill="x", pady=(4, 0))
-        # 三顆常用值列在清單上，刻意避開 0——0 幾乎等於原地不動，對重現性
-        # 量測沒有意義。🔴 100 不預設勾選（2026-08-21 COM2 實機驗證後改）：
-        # 原點落在限位開關上，開關本身有實體作用寬度（實測 X 軸約
-        # 100~150 pulse），offset=100 量到的是軸從未真正脫離開關作用區的
-        # 資料，不該預設勾選一組先天不具代表性的資料；想量開關寬度的人
-        # 仍可自己勾選。
+        # 三顆常用值刻意避開 0（等於原地不動，對重現性量測沒意義）。100
+        # 不預設勾選（2026-08-21 COM2 實機驗證後改）：原點落在限位開關上，
+        # 開關有實體作用寬度（實測 X 軸約 100~150 pulse），offset=100
+        # 量到的是軸從未真正脫離開關作用區的資料，不該預設勾選；想量開關寬度可自行勾選。
         self._org_repeat_offset_preset_vars: Dict[int, tk.BooleanVar] = {}
         for val, default_checked in ((100, False), (1000, True), (5000, True)):
             var = tk.BooleanVar(value=default_checked)
@@ -2044,13 +1948,11 @@ class DS102GUI:
     def _collect_org_repeat_offsets(self) -> List[int]:
         """
         收集勾選的常用 offset + 自訂欄位（逗號分隔），去重、只留正整數、
-        格式錯的片段直接忽略（不因為使用者手滑打錯一個逗號就整批擋下，
-        跟尋光分頁「格式錯就讓函式庫走預設」同一種寬容原則）。
+        格式錯的片段直接忽略（跟尋光分頁「格式錯就讓函式庫走預設」同一種寬容原則）。
 
-        🔴 排除的是「非正數」，不是只排除 0——負的 offset 一樣沒有物理
-        意義（方向已經由 direction 決定），而且會讓漂移門檻
-        `abs(p_i) > 0.25 * offset` 因為 offset<0 恆成立，每一輪都被
-        誤判成「偵測到累積漂移」（architect 2026-08-21 審查建議）。
+        排除的是「非正數」，不只 0——負的 offset 沒有物理意義（方向已由
+        direction 決定），且會讓漂移門檻 `abs(p_i) > 0.25 * offset` 因
+        offset<0 恆成立、每輪都誤判成偵測到漂移（architect 2026-08-21 審查建議）。
         """
         offsets: List[int] = []
         for val, var in self._org_repeat_offset_preset_vars.items():
@@ -2144,11 +2046,10 @@ class DS102GUI:
             or self._homing.is_set()
             or self._scanning.is_set()
         ):
-            # ⚠ 上面的條件刻意**不**改成 _any_long_op_running()：它額外含有
-            # ctrl.measuring_active / ctrl.scanning_active 這兩個控制器層級
-            # 旗標，那是註冊表（只服務 UI 忙碌顯示與停止分派）不該涵蓋的。
-            # 這裡只借用 _busy_reasons() 讓訊息說出實際在忙什麼；若擋下來的
-            # 是那兩個控制器旗標，_busy_reasons() 會是空的，退回原本的通稱。
+            # 上面的條件刻意**不**改成 _any_long_op_running()：那額外含有
+            # ctrl.measuring_active / ctrl.scanning_active 兩個控制器層級
+            # 旗標，是註冊表（只服務忙碌顯示與停止分派）不該涵蓋的。這裡只
+            # 借用 _busy_reasons() 說明實際在忙什麼；若擋下的是那兩個旗標，_busy_reasons() 會是空的，退回通稱。
             reasons = "／".join(self._busy_reasons()) or "重播／尋光／復歸／量測"
             self._flash_banner(f"已有其他作業（{reasons}）進行中，請稍後再試")
             return
@@ -2185,10 +2086,8 @@ class DS102GUI:
                 st, _ = self.ctrl.query_status(axis_no)
                 side = self.ctrl.limit_direction(st)
                 if side in ("CW", "CCW"):
-                    # 離開方向＝目前所壓限位的反方向——原點復歸後座標
-                    # 幾乎必然停在某一側限位附近（見 CLAUDE.md〈座標 0
-                    # 幾乎就落在限位開關上〉），這是唯一站得住腳的自動
-                    # 判定依據。
+                    # 離開方向＝目前所壓限位的反方向（原點復歸後座標幾乎
+                    # 必然停在某側限位附近，見 CLAUDE.md〈座標 0 幾乎就落在限位開關上〉），是唯一站得住腳的自動判定依據。
                     directions[ax] = "CCW" if side == "CW" else "CW"
                 else:
                     unresolved.append(ax)
@@ -2228,11 +2127,11 @@ class DS102GUI:
             f"組合總數：{n_combos}\n\n"
             f"預估時間：無法精確預估，視軸數／offset／速度而定，"
             f"可能長達數十分鐘。\n\n"
-            f"⚠ 每個軸開始量測前，會先執行一次原點復歸建立基準\n"
+            f"每個軸開始量測前，會先執行一次原點復歸建立基準\n"
             f"　（不假設目前位置就是原點）。\n"
-            f"⚠ 量測期間會暫停該軸的韌體軟體限位，結束後自動還原。\n"
-            f"⚠ 量測進行中請勿手動點動同一軸，避免與量測動作互相干擾。\n"
-            f"⚠ 每個 (軸, offset) 組合只有在成功完成一次原點復歸時才會把\n"
+            f"量測期間會暫停該軸的韌體軟體限位，結束後自動還原。\n"
+            f"量測進行中請勿手動點動同一軸，避免與量測動作互相干擾。\n"
+            f"每個 (軸, offset) 組合只有在成功完成一次原點復歸時才會把\n"
             f"　座標強制寫回 0；若中途失敗、逾時或被緊急停止中斷，滑台\n"
             f"　可能停在非原點的任意位置，此時**不會**自動歸零，畫面會\n"
             f"　明確警示，需重新執行原點復歸後才能繼續其他操作。\n\n"
@@ -2284,11 +2183,9 @@ class DS102GUI:
                     stop_event=self._org_repeat_stop_event,
                 )
             except Exception as e:  # 背景執行緒的例外不可讓旗標卡在 set
-                # ⚠ `except X as e` 的 e 會在區塊結束時被自動 del，
-                # root.after(0, ...) 的 lambda 是非同步排程、真正執行時
-                # 區塊早已結束——直接在 lambda 裡引用 e 會是 NameError
-                # （_do_start_scan 的 _run() 已踩過同一個坑）。先轉成字串
-                # 存進區域變數，讓 lambda 捕捉的是它而非 e。
+                # `except X as e` 的 e 會在區塊結束時自動 del，root.after
+                # 的 lambda 是非同步排程、執行時區塊早已結束，直接引用 e
+                # 會是 NameError（_do_start_scan 的 _run() 已踩過同一個坑）。先轉成字串存進區域變數再讓 lambda 捕捉。
                 logger.exception("原點復歸重現性量測執行緒發生未預期例外")
                 err_msg = f"未預期例外: {e}"
                 self.root.after(0, lambda: self._on_org_repeat_done(None, err_msg))
@@ -2319,10 +2216,8 @@ class DS102GUI:
         else:
             drift_txt = "否"
 
-        # offset 未脫離出發側限位開關作用區：資料有效但跟其他 offset
-        # 不可直接比較（M1 的免費副產品 left_switch 彙整而成），用
-        # CLR_WARN 標色而非 CLR_DANGER——那個顏色保留給 origin_lost
-        # 這種真正失敗、座標系已失準的情境，兩者嚴重度不同。
+        # offset 未脫離出發側限位開關作用區：資料有效但跟其他 offset 不可
+        # 直接比較，用 CLR_WARN 而非 CLR_DANGER（後者保留給 origin_lost 這種真正失敗、座標系已失準的情境）。
         row_tags = ("below_switch",) if result_dict.get("offset_below_switch") else ()
 
         self._org_repeat_tree.insert(
@@ -2340,14 +2235,13 @@ class DS102GUI:
             tags=row_tags,
         )
 
-        # 🔴 座標系已失準是比一般失敗更嚴重的狀態（之後 goto 教點／限位
-        # 比對全部會跟著偏移），不能只靜靜躺在結果表格的備註欄裡等使用者
-        # 自己發現——跟撞限位同等級的嚴重度，用橫幅＋CLR_DANGER 主動示警
-        # （architect 2026-08-21 審查要求）。
+        # 座標系已失準比一般失敗更嚴重（之後 goto 教點／限位比對全部跟著
+        # 偏移），不能只躺在結果表格備註欄等使用者自己發現——跟撞限位同等
+        # 級，用橫幅＋CLR_DANGER 主動示警（architect 2026-08-21 審查要求）。
         if result_dict.get("origin_lost"):
             ax = result_dict.get("axis", "?")
             self._flash_banner(
-                f"🔴 {ax} 軸座標系已失準（原點復歸重現性量測中途中止，"
+                f"{ax} 軸座標系已失準（原點復歸重現性量測中途中止，"
                 f"未強制歸零），請重新執行原點復歸後再操作",
                 20000,
                 color=CLR_DANGER,
@@ -2362,7 +2256,7 @@ class DS102GUI:
 
         if err is not None:
             self._org_repeat_status_var.set("發生例外")
-            self._flash_banner(f"⚠ 原點復歸重現性量測發生例外：{err}", 12000)
+            self._flash_banner(f"原點復歸重現性量測發生例外：{err}", 12000)
             return
         if result is None:
             self._org_repeat_status_var.set("已中止")
@@ -2373,7 +2267,7 @@ class DS102GUI:
             csv_path, json_path = save_homing_repeat_result(result)
         except OSError as e:
             self._org_repeat_status_var.set("完成，但存檔失敗")
-            self._flash_banner(f"⚠ 量測完成，但存檔失敗：{e}", 12000)
+            self._flash_banner(f"量測完成，但存檔失敗：{e}", 12000)
             self.ctrl._log("ERROR", f"[復歸重現性量測] 存檔失敗: {e}")
             return
 
@@ -2381,7 +2275,7 @@ class DS102GUI:
         self._org_repeat_json_path_var.set(json_path)
         if aborted:
             self._org_repeat_status_var.set("已中止，部分資料已存檔")
-            self._flash_banner("⚠ 原點復歸重現性量測已中止，部分資料已存檔", 8000)
+            self._flash_banner("原點復歸重現性量測已中止，部分資料已存檔", 8000)
         else:
             self._org_repeat_status_var.set("完成，已存檔")
             self._flash_banner("✔ 原點復歸重現性量測完成，已存檔", 6000)
@@ -2524,7 +2418,7 @@ class DS102GUI:
         tk.Label(
             pos_row, text="Position:", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 9)
         ).pack(side="left")
-        # ⚠ 唯讀顯示，與下方的輸入框分開。
+        # 唯讀顯示，與下方的輸入框分開。
         # 以前兩者共用 _ctrl_pos_var：輪詢每 100ms 覆寫它，使用者打到一半的
         # 數字會被清掉；反過來看，欄位裡的數字像是「即將設定的值」，實際是
         # 「剛讀回來的值」，兩種語意疊在同一個 widget 上。
@@ -2768,7 +2662,7 @@ class DS102GUI:
             return
 
         ax = NO_AXIS.get(self.ctrl.axis_no, self.ctrl.axis_no)
-        # ⚠ 這裡要的是**機械座標**：set_position() 寫的是控制器的 POS 暫存器，
+        # 這裡要的是**機械座標**：set_position() 寫的是控制器的 POS 暫存器，
         # 而畫面上的「Position:」顯示的是工作座標（已扣 offset）。設過工作原點
         # 之後兩者差一個 offset，直接拿顯示值當「由 X 改寫為 Y」會誤導使用者。
         cur_mach = self.ctrl.positions_machine.get(ax)
@@ -3080,16 +2974,10 @@ class DS102GUI:
         """
         行程錄製分頁。
 
-        卡片順序刻意依「實際操作動線」排，而不是依功能分類：
-
-            行程錄製      ← 錄一段新的
-            已儲存行程    ← 選一個既有的（這是下面兩張卡的資料來源）
-            步驟明細      ← 顯示上面選取那一筆的內容，可改延遲
-            重播設定      ← 跑它
-
-        以前「步驟明細」排在「已儲存行程」**上面**，但它的內容是由下方
-        清單的選取事件填進去的——資料來源在消費者下方。要編輯既有行程的
-        延遲得先往下捲選行程、再往上捲看步驟、再往下捲按重播。
+        卡片順序刻意依「實際操作動線」排、非依功能分類：行程錄製（錄新的）
+        →已儲存行程（選既有的，是下面兩卡的資料來源）→步驟明細（顯示上方
+        選取內容，可改延遲）→重播設定（跑它）。以前「步驟明細」排在
+        「已儲存行程」上面，但內容是由下方清單選取事件填入——編輯延遲得先往下捲選行程、再往上看步驟、再往下按重播。
         """
         self._add_status_bar(parent)
         scr = self._scrollable(parent)
@@ -3184,7 +3072,7 @@ class DS102GUI:
         # 區分「會寫檔」與「只影響這次」
         tk.Label(
             gd,
-            text="⚠ 會覆蓋並存檔",
+            text="會覆蓋並存檔",
             bg=CLR_CARD,
             fg=CLR_WARN,
             font=("Segoe UI", 8, "bold"),
@@ -3272,7 +3160,7 @@ class DS102GUI:
 
         tk.Label(
             play_card,
-            text="⚠ 重播會直接重送錄下來的原始指令，"
+            text="重播會直接重送錄下來的原始指令，"
                  "不經過軟體限位檢查、也不做 PULS 取整正規化。"
                  "執行前請先確認各軸位置。",
             bg=CLR_CARD,
@@ -3301,7 +3189,7 @@ class DS102GUI:
 
     def _do_start_rec(self):
         self.ctrl.start_recording(self._rec_name_var.get().strip())
-        self._rec_status_var.set("🔴 錄製中")
+        self._rec_status_var.set("錄製中")
         self._rec_start_btn.state(["disabled"])
         self._rec_stop_btn.state(["!disabled"])
         self._rec_step_timer()
@@ -3395,10 +3283,9 @@ class DS102GUI:
         """
         批次把所有步驟的延遲設成同一個值，並寫回行程檔。
 
-        ⚠ **所有檢查都要在動畫面之前完成。** 舊寫法先把 tree 上每一列的
-        延遲欄改掉，才發現沒選行程 → 跳警告 return，結果是「檔案沒寫、
-        記憶體沒改，但螢幕上滿屏都是新值」。使用者按完確認會合理認為
-        已生效——這正是「其實沒生效卻顯示成功」。
+        **所有檢查都要在動畫面之前完成。** 舊寫法先改掉 tree 上每列延遲
+        欄才發現沒選行程而 return，結果是「檔案沒寫、記憶體沒改，但螢幕
+        上滿屏都是新值」——顯示成功但其實沒生效。
         """
         rec = self._selected_recording()
         if rec is None:
@@ -3456,7 +3343,7 @@ class DS102GUI:
             f"步數：{n_steps}　重複：{repeat} 輪\n"
             f"每輪間隔：{cycle_delay} ms\n"
             f"預估最短時間：{est_s:.1f} 秒（不含到位等待）\n\n"
-            f"⚠ 重播不檢查軟體限位，也不做 PULS 取整正規化。\n"
+            f"重播不檢查軟體限位，也不做 PULS 取整正規化。\n"
             f"請先確認各軸目前位置足以完整跑完這段行程。",
             icon="warning",
             default="no",
@@ -3502,13 +3389,12 @@ class DS102GUI:
         """
         停止重播——**同時要真的把馬達停下來**。
 
-        舊寫法只有 `self._stop_playback.set()`，而 play_recording 收到旗標後
-        直接 return，不送任何停止指令。若中斷的那一步是 `GO CWJ`（連續點動，
-        沒有終點），錄製檔裡負責收尾的 `STOP 0` 就永遠送不出去了，該軸會
-        一路跑到硬體限位——按鈕寫「停止」，失效方向卻是「繼續移動」。
+        舊寫法只有 `self._stop_playback.set()`，play_recording 收到旗標
+        後直接 return、不送停止指令。若中斷那一步是 `GO CWJ`（連續點動
+        無終點），錄製檔裡收尾的 `STOP 0` 永遠送不出去，該軸會一路跑到
+        硬體限位——按鈕寫「停止」，實際卻繼續移動。
 
-        先送 STOP 再 set 旗標：stop() 有 STOP_LOCK_TIMEOUT(0.15s) 上限，
-        在主執行緒呼叫可以接受，而且越早送出滑台滑行越短。
+        先送 STOP 再 set 旗標：stop() 有 STOP_LOCK_TIMEOUT(0.15s) 上限，主執行緒呼叫可接受，且越早送出滑台滑行越短。
         """
         if self.ctrl.connected:
             self.ctrl.stop()
@@ -3821,22 +3707,19 @@ class DS102GUI:
         階段二勾選狀態連動「進階設定」裡的局部半徑／軸縮放係數 Entry 可否編輯。
 
         改走 `_refresh_scan_entry_states()`，不再自己整批 `.config(state=...)`
-        ——那樣會覆寫掉「軸未勾選」這個獨立條件算出來的 disabled 狀態
-        （AND 合成邏輯必須集中在單一函式，兩個 handler 各自局部覆寫會
-        重演 `_update_stat_ui` 曾經不認得「復歸中」被覆寫的那類 bug）。
+        （那樣會覆寫掉「軸未勾選」這個獨立條件算出的 disabled 狀態——AND
+        合成邏輯必須集中在單一函式，否則會重演 `_update_stat_ui` 曾不認得「復歸中」被覆寫的那類 bug）。
         """
         self._refresh_scan_entry_states()
 
     def _refresh_scan_entry_states(self):
         """
         依「軸是否勾選」×「階段二總開關」兩個獨立條件的 AND，合成起始
-        步長／階段二 Entry 的可編輯狀態。任何一個條件改變（軸勾選框、
-        階段二總開關）都呼叫這個函式重新算一次，不要各自局部
-        `.config(state=...)`——那樣一個 handler 的結果會被另一個蓋掉。
+        步長／階段二 Entry 的可編輯狀態。任何一個條件改變都呼叫此函式
+        重新算一次，不要各自局部 `.config(state=...)`（一個 handler 的結果會被另一個蓋掉）。
 
         matplotlib 未安裝時 `_build_tab_scan` 提早 return，這些 widget
-        字典根本不存在，這裡直接跳過（呼叫端可能是 `_on_connect_result`
-        這類不知道尋光分頁有沒有建成的通用流程）。
+        字典不存在，這裡直接跳過（呼叫端可能是不知道尋光分頁是否建成的通用流程如 `_on_connect_result`）。
         """
         if not hasattr(self, "_scan_axis_selected_vars"):
             return
@@ -3880,7 +3763,7 @@ class DS102GUI:
         self._refresh_scan_entry_states()
         is_powell = self._scan_algo_is_powell()
         if is_powell:
-            # 🔴 用預設的 pack() 重新顯示會被接到 card1 最尾端（此時
+            # 用預設的 pack() 重新顯示會被接到 card1 最尾端（此時
             # self._scan_stage2_cb 已經 pack 過），警示文字會跑到勾選框
             # 下面而非原本設計的位置。用 before= 釘回它原本建立時的位置
             # （階段二 checkbox 之前）。
@@ -3899,11 +3782,10 @@ class DS102GUI:
         """
         依目前勾選的搜尋軸，重算盲搜「掃描平面」下拉的可選配對。
 
-        沿用 `_scan_pair_combo` 已建立的既有慣例：**存字串（"X-Y"）而非
-        index**，清單長度隨勾選軸變動，存 index 一定會錯位。使用者原本
-        選的配對若仍在新清單裡就保留，否則退回空字串（＝交給演算法自動
-        取前兩軸），不要靜默改選成另一組軸——那會讓滑台往使用者沒預期
-        的方向掃。
+        沿用 `_scan_pair_combo` 既有慣例：**存字串（"X-Y"）而非 index**，
+        清單長度隨勾選軸變動，存 index 一定錯位。原選配對若仍在新清單裡
+        就保留，否則退回空字串（交給演算法自動取前兩軸），不要靜默改選
+        成另一組軸（會讓滑台往非預期方向掃）。
         """
         if not hasattr(self, "_scan_blind_plane_combo"):
             return
@@ -3921,11 +3803,9 @@ class DS102GUI:
         """
         即時估算盲搜的格點數與粗略耗時，顯示在設定欄位下方。
 
-        格點數是 `(2×半徑÷格距 + 1)²`——平方成長，把半徑加倍或格距減半
-        都會讓點數變成四倍。使用者很容易在不知情下設出一個要跑數小時的
-        組合，而那個後果要等滑台真的開始掃才會顯現。每點耗時用
-        `settle_sec + 一次 GPIB 讀值 + 一次移動` 的保守估計值，只是量級
-        參考，不是準確預測。
+        格點數是 `(2×半徑÷格距 + 1)²`——平方成長，半徑加倍或格距減半都會
+        讓點數變成四倍，使用者容易在不知情下設出要跑數小時的組合。每點
+        耗時用 `settle_sec + 一次 GPIB 讀值 + 一次移動` 的保守估計，只是量級參考、非準確預測。
         """
         if not hasattr(self, "_scan_blind_estimate_var"):
             return
@@ -3933,10 +3813,10 @@ class DS102GUI:
             step = int(self._scan_blind_step_var.get())
             radius = int(self._scan_blind_radius_var.get())
         except (ValueError, AttributeError):
-            self._scan_blind_estimate_var.set("⚠ 格距／半徑需為整數")
+            self._scan_blind_estimate_var.set("格距／半徑需為整數")
             return
         if step <= 0 or radius < 0:
-            self._scan_blind_estimate_var.set("⚠ 格距需 > 0、半徑需 ≥ 0")
+            self._scan_blind_estimate_var.set("格距需 > 0、半徑需 ≥ 0")
             return
         n_rings = radius // step
         points = (2 * n_rings + 1) ** 2
@@ -4166,7 +4046,7 @@ class DS102GUI:
             ).pack(anchor="w", pady=(0, 4))
         self._scan_algo_warn_lbl = tk.Label(
             card1,
-            text="⚠ Powell 共軛方向法目前僅通過假物件測試，尚未真機驗證；"
+            text="Powell 共軛方向法目前僅通過假物件測試，尚未真機驗證；"
                  "xtol/ftol/懲罰係數皆為保守起跳值。建議先在低風險行程小範圍試跑並全程留意。",
             bg=CLR_CARD, fg=CLR_WARN, font=("Segoe UI", 8), justify="left", wraplength=300,
         )
@@ -4216,7 +4096,7 @@ class DS102GUI:
             variable=self._scan_abort_no_signal_var, command=self._on_scan_abort_toggle,
         ).pack(anchor="w", padx=12, pady=(0, 2))
         self._scan_abort_warn_lbl = tk.Label(
-            card2, text="⚠ 取消勾選後，偵測不到訊號也會繼續跑完整段搜尋",
+            card2, text="取消勾選後，偵測不到訊號也會繼續跑完整段搜尋",
             bg=CLR_CARD, fg=CLR_WARN, font=("Segoe UI", 8), justify="left", wraplength=300,
         )
         if not self._scan_abort_no_signal_var.get():
@@ -4507,25 +4387,21 @@ class DS102GUI:
     def _build_scan_plot(self, parent):
         """
         建立尋光分頁的嵌入式即時圖：上排「配對投影／座標變化趨勢」並排、
-        下排功率收斂全寬，圖表下方一列數值摘要（目前功率／最佳功率／
-        樣本數／目前座標）。
+        下排功率收斂全寬，圖表下方一列數值摘要（目前功率／最佳功率／樣本數／目前座標）。
 
         用單一 Figure + gridspec（而非三張獨立 Figure）：三張子圖共用一次
         draw_idle()，重繪成本比三個獨立 canvas 各自 draw 低。
 
-        2026-08-19「尋光彈性選軸」（1~6 軸）之前，左上／右上固定畫 XY／XZ
-        投影，選了 X/Y/Z 以外的軸組合時兩張子圖都會半殘。改成：左上是
-        可切換軸對的 2D 投影（`_scan_ax_xy`，名字沿用但語意變成「配對
-        投影」，可切換到任意兩軸組合）、右上是多軸 1D 相對位移趨勢線
-        （`_scan_ax_xz`，語意變成「趨勢線」，天生支援任意 1~6 軸、不需要
-        配對）。gridspec 骨架不變。
+        2026-08-19「尋光彈性選軸」（1~6 軸）之前左上／右上固定畫 XY／XZ
+        投影，選了 X/Y/Z 以外組合時兩張子圖都會半殘。改成：左上是可切換
+        軸對的 2D 投影（`_scan_ax_xy`，語意變成「配對投影」）、右上是多軸
+        1D 相對位移趨勢線（`_scan_ax_xz`，天生支援任意 1~6 軸不需配對）。gridspec 骨架不變。
         """
         chart_card = self._card(parent, "即時軌跡與收斂")
 
         # ── 「投影軸對」控制列：搜尋軸數決定顯示模式，見 _update_scan_pair_
         # controls。三個元件建立時就都建好，之後只切換 pack/pack_forget，
-        # 不把整條列 pack_forget——避免像橫幅那樣造成版面跳動（見 CLAUDE.md
-        # 〈第四批修正〉）。內容物切換不影響這條列本身的存在。
+        # 不整條列 pack_forget（避免像橫幅那樣造成版面跳動，見 CLAUDE.md〈第四批修正〉）。
         pair_ctrl = tk.Frame(chart_card, bg=CLR_CARD)
         pair_ctrl.pack(fill="x", padx=12, pady=(2, 0))
         self._scan_pair_label = tk.Label(
@@ -4537,13 +4413,11 @@ class DS102GUI:
             pair_ctrl, text="", bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)
         )
         # 目前 Combobox／靜態文字所代表的候選配對清單（"X-Y" 這種字串），
-        # 由 _update_scan_pair_controls 依這次搜尋軸重建；空清單＝只選了
-        # 1 軸、沒有配對可言。存字串而非 index，理由跟 ORG_MODES 一樣：
-        # 避免「清單起始位置不同、index 換算差一位」這類錯誤。
+        # 由 _update_scan_pair_controls 依這次搜尋軸重建；空清單＝只選 1
+        # 軸、無配對可言。存字串而非 index，理由同 ORG_MODES（避免清單起始位置不同、index 換算差一位）。
         self._scan_pair_options: List[str] = []
-        # 這次搜尋涵蓋哪些軸（_scan_plot_reset 當下算出的 selected_axes，
-        # 依 AXES 固定順序排序）。scanner.active_axes 落地前的過渡態
-        # （active is None）用這份頂替，見 _scan_redraw_figure。
+        # 這次搜尋涵蓋哪些軸（_scan_plot_reset 當下算出、依 AXES 固定順序
+        # 排序）。scanner.active_axes 落地前的過渡態（active is None）用這份頂替，見 _scan_redraw_figure。
         self._scan_last_selected_axes: List[str] = []
 
         self._scan_fig = Figure(figsize=(8, 5.5), dpi=100, facecolor=CLR_CARD)
@@ -4569,8 +4443,7 @@ class DS102GUI:
         # 配對投影：走過的路徑（細線、低對比）+ 起點／目前位置／最佳點
         # （不同色 marker）+ 無效樣本（叉號）。用 set_data / set_offsets
         # 重繪既有 artist，不必每輪 ax.clear() 重畫全部。標題與軸標籤隨
-        # 目前選取的軸對動態更新（見 _scan_redraw_figure），這裡先給
-        # 通用預設值。
+        # 選取軸對動態更新（見 _scan_redraw_figure），這裡先給通用預設值。
         (self._scan_line_xy_path,) = self._scan_ax_xy.plot(
             [], [], "-", color=CLR_MUTED, linewidth=0.8, zorder=1
         )
@@ -4590,9 +4463,8 @@ class DS102GUI:
             fontsize=6, facecolor=CLR_CARD, edgecolor=CLR_BORDER, labelcolor=CLR_TEXT, loc="best"
         )
 
-        # 「僅選取 1 軸，無法顯示 2D 投影」防呆文字——2 軸以上都至少有一組
-        # 配對可畫，只有剛好 1 軸時完全沒有配對可言。用疊在子圖中央的文字
-        # 取代散點/軌跡，見 _scan_redraw_figure。
+        # 「僅選取 1 軸，無法顯示 2D 投影」防呆文字（2 軸以上都至少有一組
+        # 配對可畫）。用疊在子圖中央的文字取代散點/軌跡，見 _scan_redraw_figure。
         self._scan_pair_unavail_text = self._scan_ax_xy.text(
             0.5, 0.5, "", transform=self._scan_ax_xy.transAxes,
             ha="center", va="center", color=CLR_MUTED, fontsize=8, wrap=True,
@@ -4600,9 +4472,8 @@ class DS102GUI:
 
         # 座標變化趨勢：固定六條線（每軸一條），重繪時只更新這次搜尋涵蓋的
         # 軸，不動態增減 artist 數量。顏色刻意不用 CLR_ACCENT／CLR_DANGER／
-        # CLR_WARN／CLR_INFO——這幾色在本專案是「目前選取軸」「警報」等
-        # 全域語意，這裡的「軸」是搜尋範圍，混用會誤導。X/Y/Z 用 CLR_TEXT、
-        # U/V/W 用 CLR_MUTED 分群，同群組內再用線型分軸。
+        # CLR_WARN／CLR_INFO（這幾色在本專案是「目前選取軸」「警報」等全域
+        # 語意，混用會誤導）。X/Y/Z 用 CLR_TEXT、U/V/W 用 CLR_MUTED 分群，同群組內再用線型分軸。
         trend_style = {
             "X": (CLR_TEXT, "-"), "Y": (CLR_TEXT, "--"), "Z": (CLR_TEXT, ":"),
             "U": (CLR_MUTED, "-"), "V": (CLR_MUTED, "--"), "W": (CLR_MUTED, ":"),
@@ -4627,10 +4498,8 @@ class DS102GUI:
         )
 
         self._scan_canvas = FigureCanvasTkAgg(self._scan_fig, master=chart_card)
-        # 用 draw_idle() 而非 draw()：建構當下圖表全空（沒有任何樣本點），
-        # 沒有必要在 __init__ 同步完成算圖，改成排進 Tk 主迴圈下一輪 idle
-        # 才畫，量測約省下 180~230ms 的啟動阻塞時間（gridspec + 中文字型
-        # 標籤的首次算版成本），視覺上沒有任何差異。
+        # 用 draw_idle() 而非 draw()：建構當下圖表全空，沒必要在 __init__
+        # 同步算圖，排進 Tk 下一輪 idle 才畫，量測約省 180~230ms 啟動阻塞（gridspec + 中文字型首次算版成本），視覺上無差異。
         self._scan_canvas.draw_idle()
         self._scan_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
@@ -4708,13 +4577,11 @@ class DS102GUI:
     def _scan_plot_reset(self, selected_axes=None):
         """
         清空尋光圖表資料與數值摘要，並依這次搜尋涵蓋的軸數重建「投影軸對」
-        控制列與趨勢線圖例。在 _do_start_scan 開始新一輪尋光時呼叫
-        （主執行緒／按鈕回呼，早於背景執行緒啟動，此時 scanner.active_axes
-        還沒有值），避免上一輪殘留的軌跡疊在新一輪上面。
+        控制列與趨勢線圖例。在 _do_start_scan 開始新一輪尋光時呼叫（主
+        執行緒／按鈕回呼，早於背景執行緒啟動，此時 scanner.active_axes 還沒有值），避免上一輪殘留軌跡疊在新一輪上。
 
         selected_axes 對應 _do_start_scan 裡使用者這次勾選的搜尋軸。省略
-        （None）時退回讀取目前 GUI 勾選狀態——供既有呼叫端（測試在案例
-        之間單純想清空圖表、不關心控制列細節）沿用舊的免參數呼叫方式。
+        （None）時退回讀取目前 GUI 勾選狀態，供既有呼叫端沿用舊的免參數呼叫方式。
         """
         if selected_axes is None:
             selected_axes = [ax for ax in AXES if self._scan_axis_selected_vars[ax].get()]
@@ -4757,11 +4624,10 @@ class DS102GUI:
         """
         `FiberAlignmentScanner` 的 sample_cb，跑在 scanner 的背景執行緒。
 
-        🔴 只能做資料寫入，不能碰 matplotlib 或 tkinter widget——實測
-        FigureCanvasTkAgg.draw_idle() 從背景執行緒呼叫會丟
-        RuntimeError: main thread is not in main loop（Python 3.14 的
-        tkinter 強制檢查）。真正的重繪在 _redraw_scan_plot（主執行緒，
-        root.after 固定節奏）進行，這裡只把樣本堆進待處理佇列。
+        只能做資料寫入，不能碰 matplotlib 或 tkinter widget——實測
+        FigureCanvasTkAgg.draw_idle() 從背景執行緒呼叫會丟 RuntimeError:
+        main thread is not in main loop（Python 3.14 tkinter 強制檢查）。
+        真正重繪在 _redraw_scan_plot（主執行緒、root.after 固定節奏），這裡只把樣本堆進待處理佇列。
         """
         with self._scan_plot_lock:
             self._scan_plot_pending.append(sample)
@@ -4770,17 +4636,13 @@ class DS102GUI:
         """
         主執行緒、固定節奏（SCAN_PLOT_REDRAW_INTERVAL）把 sample_cb 累積的
         樣本套進圖表。跟 _start_poller 同一種自我重新排程模式，在
-        _build_tab_scan 建立分頁時啟動一次，之後跑到程式結束為止——不需要
-        尋光開始/結束時另外啟動/停止這條迴圈。
+        _build_tab_scan 建立分頁時啟動一次、跑到程式結束，不需尋光開始/結束時另外啟動/停止。
 
-        尋光沒在跑時 _scan_plot_pending 理應是空的（sample_cb 不會被呼叫），
-        這裡仍然檢查 self._scanning 再處理，避免尋光剛結束、佇列裡還有
-        最後幾筆待處理樣本時被跳過而遺漏。
+        尋光沒在跑時 _scan_plot_pending 理應是空的，這裡仍檢查 self._scanning
+        再處理，避免尋光剛結束、佇列裡還有最後幾筆待處理樣本時被跳過。
 
-        ⚠ `_pm_sync_scan_notice()` 的呼叫已於 2026-08-20 搬去 `_start_poller`
-        （100ms、不受「有沒有裝 matplotlib」影響的節奏）——這條迴圈整條
-        在沒裝 matplotlib 時不會執行，之前掛在這裡會讓光功率分頁的提示列
-        在那種環境下永遠不會被同步，這裡不再重複呼叫。
+        `_pm_sync_scan_notice()` 已於 2026-08-20 搬去 `_start_poller`（不受
+        有沒有裝 matplotlib 影響的 100ms 節奏）——此迴圈沒裝 matplotlib 時不會執行，之前掛在這裡會讓提示列永遠不同步。
         """
         try:
             with self._scan_plot_lock:
@@ -4790,12 +4652,11 @@ class DS102GUI:
         except tk.TclError:
             return  # widget 已被銷毀（關閉流程中），安靜收工
         except Exception:
-            # 🔴 這條迴圈靠自我重新排程（最下面那行 root.after）延續到程式
+            # 這條迴圈靠自我重新排程（最下面那行 root.after）延續到程式
             # 結束。若重新排程那行在 try 區塊外，_scan_plot_extend／
-            # _scan_redraw_figure 丟出 tk.TclError 以外的任何例外都會讓
-            # 這條鏈結永久斷掉，且 --windowed 打包後 sys.stderr 是 None、
-            # 連 traceback 都看不到，等同靜默失效。記錄但不 return，讓下面
-            # 的重新排程照樣執行，下一輪還有機會恢復正常。
+            # _scan_redraw_figure 丟出 tk.TclError 以外的例外都會讓鏈結
+            # 永久斷掉，且 --windowed 打包後 sys.stderr 是 None、連
+            # traceback 都看不到，等同靜默失效。記錄但不 return，讓下面重新排程照樣執行，下一輪還有機會恢復。
             logger.exception("尋光即時圖表重繪失敗，本輪跳過")
         self.root.after(SCAN_PLOT_REDRAW_INTERVAL, self._redraw_scan_plot)
 
@@ -4831,14 +4692,12 @@ class DS102GUI:
             self._scan_best_power_var.set(f"{self._scan_best_power:.2f}")
 
         # 這批樣本裡最新一筆有效讀值也轉貼給光功率分頁——尋光期間背景輪詢
-        # 已暫停（見 _pm_should_poll() 的 motion_active 判斷），光功率分頁
-        # 不會有其他資料來源。
+        # 已暫停（見 _pm_should_poll() 的 motion_active 判斷），光功率分頁不會有其他資料來源。
         #
-        # 🔴 這裡只呼叫一個具名方法，不直接碰光功率分頁的任何欄位或 widget。
-        # 舊寫法曾是「A 分頁的繪圖函式直接指派 B 分頁的快取欄位＋三個
-        # widget」，跟 _pm_refresh_status_line() 的 scanning_active 分支
-        # 重複，是兩份會走鐘的真相來源。狀態文字與前景色現在完全由
-        # _pm_refresh_status_line() 決定（_pm_note_reading 會呼叫它）。
+        # 這裡只呼叫一個具名方法，不直接碰光功率分頁的欄位或 widget。舊
+        # 寫法曾是「A 分頁繪圖函式直接指派 B 分頁快取欄位＋三個 widget」，
+        # 跟 _pm_refresh_status_line() 的 scanning_active 分支重複，是兩份
+        # 會走鐘的真相來源。狀態文字與前景色現在完全由 _pm_refresh_status_line() 決定。
         if valid_samples := [s for s in samples if s.ok and s.power is not None]:
             self._pm_note_reading(valid_samples[-1].power, source="scan")
 
@@ -4861,9 +4720,7 @@ class DS102GUI:
 
         # ── 配對投影：目前 Combobox／靜態文字選取的軸對，一定源自
         # _scan_plot_reset 依這次搜尋軸算出的 _scan_pair_options，本身就是
-        # 選定範圍內的合法配對，不需要再對 active_axes 額外判斷可用性——
-        # 跟舊版 XY/XZ 寫死時不同（那時使用者可能只搜 X/Z，卻仍畫著沒
-        # 意義的 XY 投影）。
+        # 選定範圍內的合法配對，不需再對 active_axes 額外判斷可用性（跟舊版 XY/XZ 寫死時不同，那時可能只搜 X/Z 卻仍畫沒意義的 XY 投影）。
         pair_options = self._scan_pair_options
         if not pair_options:
             axis_name = self._scan_last_selected_axes[0] if self._scan_last_selected_axes else "?"
@@ -4919,12 +4776,10 @@ class DS102GUI:
             else:
                 self._scan_scatter_xy_bad.set_offsets(empty_xy)
 
-        # ── 座標變化趨勢：active_axes 是 scanner.run() 開始後才會有值，
-        # 尚未落地（active is None）的極短暫過渡態沿用 _scan_plot_reset
-        # 當時算好的 selected_axes，等下一輪重繪自然校正（已知的既有
-        # 結論，見 CLAUDE.md〈尋光彈性選軸〉，不特別處理）。x 軸序號邏輯
-        # 跟下面的功率收斂子圖同一套：用樣本在整批歷史裡的原始序號，
-        # 無效樣本直接跳過（不重新壓縮編號），y 軸是相對起點的位移量。
+        # ── 座標變化趨勢：active_axes 是 scanner.run() 開始後才有值，尚未
+        # 落地（active is None）的極短暫過渡態沿用 _scan_plot_reset 算好的
+        # selected_axes，等下一輪重繪自然校正（見 CLAUDE.md〈尋光彈性選
+        # 軸〉，不特別處理）。x 軸序號邏輯跟下面功率收斂子圖同一套：用樣本原始序號，無效樣本直接跳過，y 軸是相對起點的位移量。
         scanner = self._active_scanner
         active = getattr(scanner, "active_axes", None) if scanner else None
         trend_axes = active if active else self._scan_last_selected_axes
@@ -4986,9 +4841,8 @@ class DS102GUI:
 
         # 四個速度欄位與可選的 f_speed_min 都是原始文字輸入，直接組進
         # DS102 指令字串或送進 float()。float() 能接受 "nan"／"inf"／負值，
-        # 但這些值送進控制器毫無意義（可能被整條拒收，或讓滑台用未定義
-        # 速度移動）——一律在打開確認對話框之前擋下，不該讓使用者看到注定
-        # 失敗的確認視窗，也不能讓壞值走到已送出序列埠指令那一步才發現。
+        # 但這些值送進控制器毫無意義，一律在打開確認對話框之前擋下，不該
+        # 讓使用者看到注定失敗的確認視窗，也不能讓壞值送到序列埠指令才發現。
         def _validate_speed(raw: str, label: str) -> float:
             try:
                 value = float(raw)
@@ -5020,22 +4874,19 @@ class DS102GUI:
         axis_summary = " ".join(f"{ax}={self._scan_axis_step_vars[ax].get()}" for ax in selected_axes)
         axes_txt = "、".join(selected_axes)
         stage2_txt = "啟用" if self._scan_stage2_var.get() else "不啟用"
-        # 演算法：跟 blind_mode 同一個既有慣例，Combobox 存標籤字串，這裡
-        # 反解成內部代碼。不合法的值（理論上不會發生，防禦用）一律退回
-        # 座標下降；「選了 Powell 但 scipy 不可用」這個情況刻意不在這裡
-        # 靜默降級——留給下面 self._scanning.set() 之前那道明確的防線，
-        # 讓使用者看到清楚的錯誤訊息，而不是被悄悄改成別的演算法。
+        # 演算法：跟 blind_mode 同一個既有慣例，Combobox 存標籤字串、這裡
+        # 反解成內部代碼。不合法的值（防禦用）一律退回座標下降；「選了
+        # Powell 但 scipy 不可用」刻意不在這裡靜默降級，留給下面明確的防線讓使用者看到清楚錯誤，而非被悄悄改成別的演算法。
         algo_label = self._scan_algo_var.get()
         algorithm = self._scan_algo_label_algos.get(algo_label, "coordinate_descent")
         if algorithm not in ("coordinate_descent", "powell"):
             algorithm = "coordinate_descent"
         if algorithm == "powell":
-            algo_line = "Powell 共軛方向法（⚠ 未真機驗證，起跳參數）"
-            # Powell 不吃「起始步長」（見 _refresh_scan_entry_states 的
-            # 註解），對使用者顯示那一行是誤導；真正生效的是這裡的
-            # max_iterations（函式評估次數上限），改列這個才對得上實際
-            # 行為。跟下面 _run() 讀 powell_max_iter 時同一個變數來源，
-            # 這裡提早、獨立解析一次只是給確認對話框看，不影響那邊。
+            algo_line = "Powell 共軛方向法（未真機驗證，起跳參數）"
+            # Powell 不吃「起始步長」（見 _refresh_scan_entry_states 註解），
+            # 對使用者顯示那行是誤導；真正生效的是 max_iterations（函式
+            # 評估次數上限），改列這個才對得上實際行為。跟下面 _run() 讀
+            # powell_max_iter 同一變數來源，這裡提早獨立解析一次只給確認對話框看，不影響那邊。
             try:
                 _powell_max_iter_preview = int(self._scan_powell_max_iter_var.get())
             except (ValueError, AttributeError):
@@ -5049,8 +4900,7 @@ class DS102GUI:
         abort_txt = "是" if self._scan_abort_no_signal_var.get() else "否"
 
         # 盲搜是本專案單次自動運動量最大的操作（可達上千個格點），規模必須
-        # 攤在確認對話框裡，不能只寫在設定卡片上——使用者按下開始的那一刻
-        # 才是真正要為這段機械運動負責的時點。
+        # 攤在確認對話框裡，不能只寫在設定卡片上（使用者按下開始那一刻才是真正要為這段機械運動負責的時點）。
         blind_mode = self._scan_blind_label_modes.get(
             self._scan_blind_mode_var.get(), GUI_DEFAULT_BLIND_MODE
         )
@@ -5074,10 +4924,10 @@ class DS102GUI:
             f"無訊號時中止：{abort_txt}\n"
             f"階段零盲搜：{blind_txt}\n"
             f"預估時間：無法精確預估，過去測試單輪落在數十秒到數分鐘不等\n\n"
-            f"⚠ 尋光不保證找到訊號，也不代表光纖已對準——搜尋結束仍請自行確認\n"
+            f"尋光不保證找到訊號，也不代表光纖已對準——搜尋結束仍請自行確認\n"
             f"　光功率讀值是否落在可接受範圍。\n"
-            f"⚠ 過程中「光功率」分頁的讀值改由本頁提供，該分頁的自動輪詢會暫停。\n"
-            f"⚠ 開始前請確認：光纖已初步耦合、光功率計已連線且讀值正常、\n"
+            f"過程中「光功率」分頁的讀值改由本頁提供，該分頁的自動輪詢會暫停。\n"
+            f"開始前請確認：光纖已初步耦合、光功率計已連線且讀值正常、\n"
             f"　目前位置在行程範圍內有足夠的移動空間可供搜尋。\n\n"
             f"確定要開始嗎？",
             icon="warning", default="no",
@@ -5103,7 +4953,7 @@ class DS102GUI:
                 "min_valid_power_dbm": self._scan_min_valid_power_var.get(),
                 "enable_stage2": self._scan_stage2_var.get(),
                 # 跟 blind_mode 同類——跨次搜尋穩定的設定，該存。
-                # 🔴 scipy 不可用時 Combobox 不包含 Powell 選項，使用者選
+                # scipy 不可用時 Combobox 不包含 Powell 選項，使用者選
                 # 不到它，這裡存的 `algorithm` 必定是 coordinate_descent；
                 # 若設定檔原本有 "powell"，每次在 scipy 不可用的環境啟動
                 # 都會被覆寫掉。裝回 scipy 後使用者需要重新手動選一次。
@@ -5123,12 +4973,10 @@ class DS102GUI:
             log=self.ctrl._log,
         )
 
-        # 🔴 最後一道防線：選了 Powell 但這個環境沒裝 scipy。UI 端的
-        # Combobox 已經不讓使用者選到這個組合（未裝 scipy 時 values 只有
-        # 座標下降），但設定檔可能存過舊的 powell 選擇、或未來 UI 邏輯
-        # 有漏洞——一律在啟動背景執行緒之前擋下並給清楚訊息，不要讓它
-        # 進到 _run() 裡才炸：那會被 _run() 的 `except Exception` 接住，
-        # 誤分類成「未預期例外」，使用者看不出真正原因是缺套件。
+        # 最後一道防線：選了 Powell 但這個環境沒裝 scipy。UI 端 Combobox
+        # 已不讓使用者選到這組合，但設定檔可能存過舊選擇、或未來 UI 邏輯
+        # 有漏洞——一律在啟動背景執行緒前擋下並給清楚訊息，不讓它進到
+        # _run() 才炸（會被 `except Exception` 接住誤分類成「未預期例外」，看不出真正原因是缺套件）。
         if algorithm == "powell" and not fiber_scanner_advanced._SCIPY_AVAILABLE:
             messagebox.showerror(
                 "缺少 scipy",
@@ -5159,11 +5007,9 @@ class DS102GUI:
                 initial_step[ax] = int(var.get())
             except ValueError:
                 initial_step[ax] = 64
-        # 以下全部必須在主執行緒讀出來存進區域變數——tkinter Variable.get()
-        # 不可從背景執行緒呼叫（Python 3.14 的 tkinter 會直接丟
-        # RuntimeError: main thread is not in main loop，2026-08-17 實測
-        # 踩到），下面的 _run() 跑在背景執行緒，不能在裡面呼叫任何
-        # self._scan_*_var.get()。
+        # 以下全部必須在主執行緒讀出存進區域變數——tkinter Variable.get()
+        # 不可從背景執行緒呼叫（Python 3.14 tkinter 會丟 RuntimeError: main
+        # thread is not in main loop，2026-08-17 實測踩到），下面 _run() 跑在背景執行緒，不能呼叫 self._scan_*_var.get()。
         enable_stage2 = self._scan_stage2_var.get()
 
         def _parse_float_or_none(s):
@@ -5194,9 +5040,8 @@ class DS102GUI:
         powell_max_iter = _parse_int(self._scan_powell_max_iter_var.get(), 200)
 
         # 型別刻意混雜（str/int/float/bool），Pylance 對 **kwargs 展開會因此
-        # 把每個參數都推論成聯集型別而報一串資訊等級提示——都是誤報，
-        # 實際值在 _parse_int/_parse_float 已轉成 FiberAlignmentScanner
-        # 建構子要求的正確型別。
+        # 把每個參數都推論成聯集型別而報一串資訊等級提示，都是誤報——
+        # 實際值在 _parse_int/_parse_float 已轉成 FiberAlignmentScanner 建構子要求的正確型別。
         scanner_kwargs = {
             "l_speed": self._scan_l_speed_var.get().strip() or "50",
             "f_speed": self._scan_f_speed_var.get().strip() or "10000",
@@ -5226,8 +5071,7 @@ class DS102GUI:
             "on_signal_found": self._on_scan_signal_found,
         }
         # 掃描平面存的是 "X-Y" 這種字串（跟 _scan_pair_combo 同一個既有慣例，
-        # 存 index 會在清單長度變動時整組差一位）。留空＝交給演算法自動取
-        # 本次搜尋軸的前兩軸，這裡就不傳這個參數。
+        # 存 index 會在清單長度變動時整組差一位）。留空＝交給演算法自動取本次搜尋軸的前兩軸，這裡不傳這個參數。
         blind_plane_raw = self._scan_blind_plane_var.get().strip()
         if blind_plane_raw and "-" in blind_plane_raw:
             pa, _, pb = blind_plane_raw.partition("-")
@@ -5275,12 +5119,10 @@ class DS102GUI:
             self.root.after(0, lambda: self._scan_status_var.set(msg))
             self.ctrl._log("INFO", f"[尋光] {msg}")
 
-        # 🔴 f_speed／f_speed_min 是未經驗證的原始文字輸入，FiberAlignmentScanner
+        # f_speed／f_speed_min 是未經驗證的原始文字輸入，FiberAlignmentScanner
         # 建構子內部直接 float() 轉換、失敗就丟 ValueError——此時 _scanning
-        # 已經 set()、兩個按鈕也已切換成「搜尋中」狀態，若不在這裡接住，
-        # 例外會直接炸穿 _do_start_scan()：背景執行緒從未啟動，
-        # _on_scan_done() 也就永遠不會被呼叫去解鎖畫面，UI 會卡死在
-        # 「掃描中」，開始鍵永久按不下去。
+        # 已 set()、兩個按鈕已切換成「搜尋中」，若不在這裡接住，例外會炸穿
+        # _do_start_scan()：背景執行緒從未啟動，_on_scan_done() 永遠不會被呼叫解鎖畫面，UI 卡死在「掃描中」、開始鍵永久按不下去。
         try:
             scanner = FiberAlignmentScanner(
                 self.ctrl, self._scanner_power_query,
@@ -5308,12 +5150,11 @@ class DS102GUI:
                     powell_max_iterations=powell_max_iter,
                     **run_kwargs,
                 )
-                # 🔴 FiberAlignmentScanner.run() 內部把所有中止事件都自己接住、
-                # 正常 return（刻意設計，中止是正常結束路徑），所以這裡的
-                # `except ScanAbort` 只會接到 run() 開頭那兩個前置檢查（防呆）。
-                # 要分辨「真的收斂完成」還是「中途被中止」，必須在 run() 正常
-                # 返回後讀 scanner.last_abort_reason（曾漏讀，導致 EMS／使用者
-                # 停止／無訊號中止全部被誤報成「✔ 尋光完成」）。
+                # FiberAlignmentScanner.run() 內部把所有中止事件自己接住、
+                # 正常 return（中止是正常結束路徑），所以這裡的 `except
+                # ScanAbort` 只會接到 run() 開頭那兩個前置檢查（防呆）。要
+                # 分辨「真的收斂完成」還是「中途被中止」，必須在 run() 正常
+                # 返回後讀 scanner.last_abort_reason（曾漏讀，導致 EMS／使用者停止／無訊號中止全部被誤報成「尋光完成」）。
                 if scanner.last_abort_reason is None:
                     self.root.after(0, lambda: self._on_scan_done(kind="completed", result=result, err=None))
                 else:
@@ -5323,10 +5164,9 @@ class DS102GUI:
                     )
                     self.root.after(0, lambda: self._on_scan_done(kind=kind, result=None, err=err_msg))
             except ScanAbort as e:
-                # ⚠ `except X as e` 的 e 會在 except 區塊結束時被自動 del，
-                # 而 root.after(0, ...) 是非同步排程、lambda 真正執行時區塊
-                # 早已結束——直接在 lambda 裡引用 e 會是 NameError。
-                # 先把訊息轉成字串存進區域變數，讓 lambda 捕捉的是它而非 e。
+                # `except X as e` 的 e 會在區塊結束時自動 del，root.after
+                # 是非同步排程、lambda 執行時區塊早已結束，直接引用 e 會是
+                # NameError。先轉成字串存進區域變數，讓 lambda 捕捉的是它而非 e。
                 err_msg = str(e)
                 kind = self._classify_scan_abort(err_msg)
                 self.root.after(0, lambda: self._on_scan_done(kind=kind, result=None, err=err_msg))
@@ -5342,16 +5182,13 @@ class DS102GUI:
         """
         把中止資訊分類成 _on_scan_done 認得的 kind。
 
-        `abort_kind` 是 `scanner.last_abort_kind`（型別化分類，"no_signal"／
-        "other"／None）。**有值時優先採信**——它由 fiber_scanner 依例外型別
-        直接產生，不受訊息文字改動影響。2026-08-26 新增盲搜時一口氣多了四
-        種無訊號中止訊息，全都不含舊版比對的那個子字串，純字串比對會讓它們
-        統統掉進「其他錯誤」分支、失去專屬的 no_signal 呈現。
+        `abort_kind` 是 `scanner.last_abort_kind`（"no_signal"／"other"／
+        None）。**有值時優先採信**——由 fiber_scanner 依例外型別直接產生，
+        不受訊息文字改動影響（2026-08-26 新增盲搜後多了四種無訊號中止
+        訊息，都不含舊版比對子字串，純字串比對會讓它們掉進「其他錯誤」）。
 
-        字串比對保留兩個用途：一是判斷 user_stopped（`_check_abort()` 拋的
-        兩則訊息是完整字串、逐字相符，型別上都是普通 ScanAbort 無從分辨）；
-        二是 `abort_kind` 為 None 時的向下相容（舊版 scanner 物件、或直接
-        以訊息字串呼叫本函式的既有測試）。
+        字串比對保留兩個用途：判斷 user_stopped（`_check_abort()` 拋的兩則
+        訊息逐字相符，型別上都是普通 ScanAbort 無從分辨）；`abort_kind` 為 None 時的向下相容。
         """
         if err_msg in ("使用者中止搜尋", "EMS 觸發，搜尋中止"):
             return "user_stopped"
@@ -5385,13 +5222,11 @@ class DS102GUI:
         self._scan_stop_btn.config(state="disabled")
         self._restore_meter_auto_range()
 
-        # scanner.run() 內 sample_cb 是同步呼叫，跑到這裡時所有樣本理論上
-        # 早就已經 append 進 _scan_plot_pending——但 _redraw_scan_plot 把
-        # pending 併入 _scan_samples／更新 _scan_sample_count 是靠 250ms
-        # 節奏的 root.after，而這裡的 root.after(0, ...) 有機會搶在下一輪
-        # 節奏之前先執行，導致讀到的 _scan_sample_count 少算最後一批。
-        # 手動跑一次跟 _redraw_scan_plot 一樣的搬移邏輯，確保訊息裡的樣本數
-        # 是這輪真正的最終值。
+        # scanner.run() 內 sample_cb 是同步呼叫，跑到這裡時樣本理論上早就
+        # append 進 _scan_plot_pending——但 _redraw_scan_plot 併入
+        # _scan_samples／更新 _scan_sample_count 是靠 250ms 節奏的
+        # root.after，這裡的 root.after(0, ...) 有機會搶在下一輪節奏之前
+        # 執行，導致讀到的 _scan_sample_count 少算最後一批。手動跑一次同樣的搬移邏輯，確保訊息裡的樣本數是這輪真正的最終值。
         try:
             with self._scan_plot_lock:
                 pending, self._scan_plot_pending = self._scan_plot_pending, []
@@ -5416,7 +5251,7 @@ class DS102GUI:
                 "未偵測到可用訊號，搜尋已中止 — 請確認光纖已耦合、光功率計連線正常後再重試"
             )
             self.ctrl._log("WARN", f"[尋光] {err}")
-        else:  # "aborted_other" 或 "exception"
+        else:  # "aborted_other"或 "exception"
             self._scan_status_var.set(f"已結束（{err}）")
             messagebox.showerror(
                 "尋光異常結束",
@@ -5434,13 +5269,11 @@ class DS102GUI:
         把目前記憶體裡的尋光樣本另存成 Excel。
 
         跟 `FiberAlignmentScanner.persist_samples()` 每輪自動寫進
-        `recordings/scans/` 的那份是**同一個產生器**（`export_samples_xlsx`），
-        差別只在這裡讓使用者挑存檔位置——要交出去給別人看的那份通常不會想
-        放在程式目錄底下。
+        `recordings/scans/` 的是**同一個產生器**（`export_samples_xlsx`），
+        差別只在這裡讓使用者挑存檔位置（要交出去給別人看的通常不想放在程式目錄底下）。
 
         資料來源是 `self._scan_samples`（主執行緒專用的完整歷史），不是
-        scanner 實例——搜尋結束後 `_active_scanner` 已經被清成 None，但畫面
-        上的樣本還在，使用者這時才想到要匯出是很正常的操作順序。
+        scanner 實例——搜尋結束後 `_active_scanner` 已清成 None，但畫面上的樣本還在，使用者這時才想匯出是正常操作順序。
         """
         # 併入還沒被 250ms 重繪節奏搬過來的最後一批，理由同 _on_scan_done：
         # 搜尋剛結束就馬上按匯出時，尾巴那幾筆有機會還卡在 pending。
@@ -5484,17 +5317,15 @@ class DS102GUI:
     def _show_scan_no_signal_notice(self, msg: str):
         """
         顯示「無訊號中止」常駐提示列。狀態驅動但不跟著 scanning_active
-        自動收回——刻意留著直到使用者按「知道了」，避免搜尋已經因為
-        無訊號中止而使用者沒注意到（跟 _pm_scan_notice 那種「尋光進行中」
-        的自動收放提示不是同一種語意）。
+        自動收回——刻意留著直到使用者按「知道了」，避免搜尋因無訊號中止
+        而使用者沒注意到（跟 _pm_scan_notice「尋光進行中」的自動收放提示不是同一種語意）。
         """
-        self._scan_no_signal_notice_label.config(text=f"⚠ {msg}")
-        # ⚠ 用 winfo_manager() 而非 winfo_ismapped() 判斷是否已顯示：這個
-        # 提示列在「尋光」分頁裡，切到別的分頁時 winfo_ismapped() 對未選取
-        # 分頁下的元件一律回傳 False，會讓收回邏輯誤判「本來就沒顯示」而
-        # 不呼叫 pack_forget()，提示殘留到切回分頁時還在。winfo_manager()
-        # 只反映 pack()/pack_forget() 呼叫過沒有，不受分頁選取影響（同
-        # _pm_scan_notice 的判斷方式）。
+        self._scan_no_signal_notice_label.config(text=f"{msg}")
+        # 用 winfo_manager() 而非 winfo_ismapped() 判斷是否已顯示：此提示列
+        # 在「尋光」分頁裡，切到別的分頁時 winfo_ismapped() 對未選取分頁下
+        # 的元件一律回傳 False，會讓收回邏輯誤判「本來就沒顯示」而不呼叫
+        # pack_forget()、提示殘留到切回分頁時還在。winfo_manager() 只反映
+        # pack()/pack_forget() 呼叫過沒有，不受分頁選取影響（同 _pm_scan_notice 的判斷方式）。
         if self._scan_no_signal_notice.winfo_manager() == "":
             self._scan_no_signal_notice.pack(side="top", fill="x", after=self._scan_toolbar)
 
@@ -5681,16 +5512,14 @@ class DS102GUI:
         顯示限位／異常提醒。
 
         刻意「不」做兩件以前會做的事：
-          1. 不再呼叫 ctrl.stop()。`STOP 0` 是停**全部**軸，但觸發限位的
-             只有一軸；其他軸正在進行的動作沒有理由被連坐。該軸自己早已
-             被控制器擋停，不需要軟體再補一刀。
-          2. 不再用 messagebox 強制確認。它是 modal 的，會卡住整個 UI 直到
-             使用者按下確認——限位是很常見的正常狀況（點動到底、教點超界），
-             每次都要按一下非常干擾，而且期間畫面完全不更新。
+          1. 不再呼叫 ctrl.stop()。`STOP 0` 停全部軸，但觸發限位的只有
+             一軸，其他軸沒理由被連坐——該軸自己早已被控制器擋停。
+          2. 不再用 messagebox 強制確認——modal 會卡住整個 UI，而限位是
+             常見正常狀況（點動到底、教點超界），每次都按非常干擾。
 
         改用畫面上的橫幅提示：會自己淡出，不阻塞任何操作。
         """
-        self._flash_banner(f"⚠ {title}：{msg}")
+        self._flash_banner(f"{title}：{msg}")
 
     # =========================================================================
     # 連線 / EMS
@@ -5704,17 +5533,15 @@ class DS102GUI:
     def _toggle_connect(self):
         if self.ctrl.connected:
             # 所有長時間背景作業都要在 disconnect() 之前收到停止請求：它們
-            # 只認自己的旗標、不看連線狀態，少了這步就會繼續對已經關閉的
-            # 序列埠打指令。原點復歸重現性量測最壞情況會空等一輪 30s
-            # （_wait_axis_stop）加一輪 180s（_wait_origin_done）逾時才發現，
-            # 卡住一個多小時（architect 2026-08-21 審查）；尋光則是同一個
-            # bug 的第二個入口（_on_close 修過、這裡以前漏了，2026-08-31 審查）。
-            # 分派放在 ctrl.stop() 之前，讓背景執行緒盡早知道要收工。
+            # 只認自己的旗標、不看連線狀態，少了這步會繼續對已關閉的序列埠
+            # 打指令。原點復歸重現性量測最壞情況會空等 30s+180s 逾時才發現
+            # （卡住一個多小時，architect 2026-08-21 審查）；尋光是同一個
+            # bug 的第二個入口（_on_close 修過、這裡以前漏了，2026-08-31
+            # 審查）。分派放在 ctrl.stop() 之前，讓背景執行緒盡早知道要收工。
             self._request_stop_long_ops()
             # 中斷期間鎖住按鈕：stop()/disconnect() 搬進背景執行緒後，
             # _toggle_connect() 會立刻返回，此時 self.ctrl.connected 仍是
-            # True，若不 disable 按鈕，使用者連點會疊出第二條中斷執行緒
-            # （architect 2026-09-03 審查）。
+            # True，若不 disable 按鈕，使用者連點會疊出第二條中斷執行緒（architect 2026-09-03 審查）。
             self._conn_btn.config(text="中斷中...", state="disabled", bg=CLR_WARN)
 
             def _do_disconnect():
@@ -5817,19 +5644,17 @@ class DS102GUI:
             unset = self.ctrl.homing_unconfigured
             # 韌體軟體限位（CWSLP?/CCWSLP?）連線時已同步進 ctrl.sw_limits
             # （見 ds102_ctrl.sync_sw_limits_from_controller）。先刷新
-            # 〈軟體行程限制〉卡片的「目前生效」欄，再把結果告訴使用者：
-            # 這治不好「預設沒保護」的病根（韌體限位出廠即停用），只是
-            # 讓兩層限位彼此同步、把無保護狀態從不可見變成可見。
+            # 〈軟體行程限制〉卡片的「目前生效」欄，再告訴使用者結果——
+            # 這治不好「預設沒保護」的病根（韌體限位出廠即停用），只是讓兩層限位彼此同步、把無保護狀態變可見。
             self._refresh_sw_limit_display()
             sw_synced = self.ctrl.sw_limits_synced
             sw_unprotected = self.ctrl.sw_limits_unprotected
             # 「沒有任何行程保護」是這幾則橫幅裡唯一跟立即安全有關的一則
-            # ——_flash_banner 是序列播放、不重疊，排最後要等其他幾則播完
-            # 才會出現，這段期間使用者已經可以點動了。因此刻意排在最前面，
-            # 讓最重要的警示最先被看到（architect 審查抓到的排序問題）。
+            # （_flash_banner 序列播放不重疊，排最後要等其他幾則播完才出現，
+            # 這段期間使用者已可點動）。因此刻意排最前面，讓最重要的警示最先被看到（architect 審查抓到的排序問題）。
             if sw_unprotected:
                 self._flash_banner(
-                    f"⚠ 軸 {'、'.join(sw_unprotected)} 沒有任何行程保護"
+                    f"軸 {'、'.join(sw_unprotected)} 沒有任何行程保護"
                     f"（韌體限位停用、程式端未設定），長按點動只靠機械限位擋",
                     14000,
                 )
@@ -5841,7 +5666,7 @@ class DS102GUI:
                 )
             if unset:
                 self._flash_banner(
-                    f"⚠ 軸 {'、'.join(unset)} 的復歸樣式未設定（MEMSW0=0），"
+                    f"軸 {'、'.join(unset)} 的復歸樣式未設定（MEMSW0=0），"
                     f"原點復歸會略過這些軸。設好之後按「儲存控制器設定」，"
                     f"下次連線就會自動補回。",
                     14000,
@@ -5949,21 +5774,17 @@ class DS102GUI:
         """
         算出光功率浮動視窗要開在哪裡，回傳 (x, y)。
 
-        🔴 **主視窗預設是最大化開機**（`_build_window()` 的
-        `state("zoomed")`），此時「主視窗右緣 + 10」必定落在螢幕外，
-        視窗會被建立在看不到的地方——2026-08-26 使用者回報「全螢幕下
-        會消失」即此。原本那段程式的註解還寫著「簡單且不會跑到螢幕外」，
-        正好寫反：它只在主視窗沒有佔滿螢幕寬度時才成立。
+        **主視窗預設最大化開機**（`_build_window()` 的 `state("zoomed")`），
+        此時「主視窗右緣 + 10」必定落在螢幕外，視窗會建在看不到的地方
+        （2026-08-26 使用者回報「全螢幕下會消失」即此；原本那段程式的
+        註解「簡單且不會跑到螢幕外」寫反了，只在主視窗未佔滿螢幕寬度時才成立）。
 
-        規則：優先放在主視窗右緣外側（不擋操作區）；只要那個位置會超出
-        螢幕右緣，就退回主視窗**內側**右上角。內側位置只要主視窗本身看得
-        到就一定看得到，所以多螢幕情境下最差也只是保守地放進主視窗裡，
-        不會消失。最後再把 x／y 夾回螢幕範圍，避免主視窗被拖到負座標
-        或螢幕外時把浮動視窗一起帶出去。
+        規則：優先放主視窗右緣外側（不擋操作區）；超出螢幕右緣就退回主
+        視窗**內側**右上角（多螢幕情境下最差也是保守放進主視窗裡，不會
+        消失）。最後把 x／y 夾回螢幕範圍，避免主視窗被拖到負座標或螢幕外時把浮動視窗一起帶出去。
 
-        寫成不碰 tkinter 的純函式（引數全部由呼叫端量測後傳入），是為了
-        能直接用假數值驗證各種螢幕／視窗尺寸組合，不必真的把測試視窗
-        最大化——見 verify_meter_panel.py::TestPmFloatPosition。
+        寫成不碰 tkinter 的純函式（引數由呼叫端量測後傳入），方便用假
+        數值驗證各種螢幕／視窗尺寸組合，不必真的最大化測試視窗——見 verify_meter_panel.py::TestPmFloatPosition。
         """
         x = root_x + root_w + margin
         if x + win_w > screen_w:
@@ -5980,13 +5801,10 @@ class DS102GUI:
         """
         開關獨立光功率浮動視窗（供移動控制／光功率兩分頁的核取方塊共用）。
 
-        ⚠ ttk.Checkbutton 是「先翻轉 variable，再呼叫 command」，所以本函式
-        必須依 self._pm_float_open 的**新值**決定要開還是要關。原本的寫法
-        無條件當成「開」，取消勾選時只會 lift() 而不會關閉視窗，核取方塊
-        與視窗狀態從此永久不同步（勾選框顯示未勾、視窗卻還在，之後每次點
-        擊都只是把它拉到最上層，視窗再也關不掉）——2026-08-26 使用者回報
-        「浮動視窗失效」即此。兩個分頁共用同一個 BooleanVar，所以任一邊
-        desync 之後另一邊也跟著失效。
+        ttk.Checkbutton 是「先翻轉 variable，再呼叫 command」，本函式必須
+        依 self._pm_float_open 的**新值**決定開或關。原本的寫法無條件當成
+        「開」，取消勾選時只會 lift() 而不關閉視窗，核取方塊與視窗狀態從
+        此永久不同步（2026-08-26 使用者回報「浮動視窗失效」即此）。兩個分頁共用同一個 BooleanVar，任一邊 desync 後另一邊也跟著失效。
         """
         if not self._pm_float_open.get():
             self._close_pm_float_window()
@@ -6093,7 +5911,7 @@ class DS102GUI:
         """
         同步「立即查詢／自動輪詢／輪詢間隔／量程」這幾類元件的啟用狀態。
 
-        phase: "disconnected" / "connected"（"connecting" 由呼叫端各自處理
+        phase: "disconnected" / "connected"（"connecting"由呼叫端各自處理
         連線按鈕本身，不影響這裡管的其他元件——它們在連線中與未連線時
         狀態相同，都是 disabled）。
         """
@@ -6129,13 +5947,11 @@ class DS102GUI:
         """
         scanning = self.ctrl.scanning_active
         notice = self._pm_scan_notice
-        # ⚠ 用 winfo_manager() 而非 winfo_ismapped() 判斷是否已顯示：使用者
-        # 尋光期間通常留在「尋光」分頁，這代表「光功率」分頁十之八九不是
-        # 當下選取的分頁，而 winfo_ismapped() 只反映目前實際畫在螢幕上，
-        # 未選取分頁底下的元件永遠回傳 False。用它當守衛時，尋光結束但
-        # 使用者不在「光功率」分頁會讓還原邏輯整段被誤判跳過，畫面卡在
-        # 「尋光中」直到下次尋光剛好切到這個分頁才被動修正。winfo_manager()
-        # 只反映 pack()/pack_forget() 呼叫過沒有，不受分頁選取影響。
+        # 用 winfo_manager() 而非 winfo_ismapped() 判斷是否已顯示：尋光期間
+        # 使用者通常留在「尋光」分頁，「光功率」分頁十之八九非當下選取，
+        # 而 winfo_ismapped() 對未選取分頁下的元件一律回傳 False，會讓
+        # 「尋光結束但不在光功率分頁」的還原邏輯被誤判跳過、畫面卡在
+        # 「尋光中」。winfo_manager() 只反映 pack()/pack_forget() 呼叫過沒有，不受分頁選取影響。
         mapped = notice.winfo_manager() != ""
         if scanning and not mapped:
             notice.pack(fill="x", padx=8, pady=(4, 0), before=self._pm_num_row)
@@ -6205,14 +6021,14 @@ class DS102GUI:
             # 先歸零 _pm_comm_failures 再記錄讀值：_pm_note_reading() 內部
             # 會呼叫 _pm_refresh_status_line()，而那支的第二順位分支就是看
             # _pm_comm_failures，順序反過來會讓恢復當下的那一輪仍顯示
-            # 「⚠ 已停止更新」，多等一輪 100ms 才校正回來。
+            # 「 已停止更新」，多等一輪 100ms 才校正回來。
             self._pm_note_reading(val, source="meter")
         else:
             self._pm_comm_failures += 1
             if self._pm_comm_failures == COMM_FAIL_THRESHOLD:
                 detail = self.meter.last_error_detail if self.meter is not None else ""
                 self.ctrl._log("WARN", f"連續讀不到光功率，畫面數值已不可信：{detail}")
-                banner = "⚠ 光功率讀值已停止更新，請檢查 GPIB 連線"
+                banner = "光功率讀值已停止更新，請檢查 GPIB 連線"
                 if detail:
                     banner += f"（{detail}）"
                 self._flash_banner(banner)
@@ -6230,16 +6046,14 @@ class DS102GUI:
         """
         供 DS102Controller.set_power_reader 使用：回傳最近一次成功讀值的快取。
 
-        刻意不在這裡呼叫 self.meter.get_power()——這個方法會被
+        刻意不在這裡呼叫 self.meter.get_power()——此方法會被
         _record_data_point() 從移動等待迴圈裡呼叫，觸發新的 GPIB 查詢會
         把單次約 110~130ms 的 I/O 延遲疊加進軸的到位判斷。連續失敗達
-        COMM_FAIL_THRESHOLD（畫面已顯示「已停止更新」）時視為不可信，
-        回傳 None 讓 CSV 該欄留空，而不是寫入一個過期的舊數值。
+        COMM_FAIL_THRESHOLD 時視為不可信，回傳 None 讓 CSV 該欄留空，而非寫入過期舊數值。
 
-        🔴 **這是 `self._pm_reading` 唯一的跨執行緒讀取點**（跑在移動執行緒
-        上，其餘讀寫全在 Tk 主執行緒）。`PowerReading` 是 frozen 的，所以
-        這裡拿到的必定是某一次讀值的完整快照，不會出現「新的 value 配舊的
-        ok_time」——但沒有鎖，也不需要鎖，理由見 PowerReading 的 docstring。
+        **這是 `self._pm_reading` 唯一的跨執行緒讀取點**（跑在移動執行緒
+        上，其餘讀寫全在 Tk 主執行緒）。`PowerReading` 是 frozen 的，這裡
+        拿到的必定是某次讀值的完整快照，不會撕裂——沒有鎖也不需要鎖，理由見 PowerReading docstring。
         """
         if self.meter is None or self._pm_comm_failures >= COMM_FAIL_THRESHOLD:
             return None
@@ -6266,13 +6080,11 @@ class DS102GUI:
         """
         尋光結束後把光功率計還原成自動量程。
 
-        🔴 少了這一步，「尋光在無光位置沒反應」這個 bug 會以更隱蔽的形式
-        復發：上一輪尋光鎖定的量程會留到下一輪，而下一輪的起點常常又是
-        無光的——固定量程在那裡必定 underrange，回傳 sentinel，演算法又
-        變成一步都不動。鎖定量程是**單次搜尋內**的最佳化，不該跨輪存活。
+        少了這一步，「尋光在無光位置沒反應」這個 bug 會以更隱蔽的形式
+        復發：上一輪鎖定的量程會留到下一輪，而下一輪起點常常又是無光的
+        （固定量程必定 underrange、回傳 sentinel，演算法又一步不動）。鎖定量程是**單次搜尋內**的最佳化，不該跨輪存活。
 
-        不論這一輪是完成、中止還是出錯都要還原，所以掛在 _on_scan_done
-        的最前面（那是所有結束路徑的唯一匯流點）。
+        不論這輪是完成、中止還是出錯都要還原，所以掛在 _on_scan_done 最前面（所有結束路徑的唯一匯流點）。
         """
         meter = self.meter
         if meter is None or getattr(meter, "range_auto", True):
@@ -6288,19 +6100,16 @@ class DS102GUI:
         尋光第一次確認「真的量到訊號」時由演算法呼叫（背景執行緒）。
 
         用途是把光功率計從自動量程切成鎖定量程：自動量程每次讀值都要讓
-        儀器自己找檔位，尋光動輒上百次量測，省下來的時間相當可觀。
+        儀器自己找檔位，尋光動輒上百次量測，省下的時間相當可觀。
 
-        🔴 這是**樂觀最佳化，不是必要步驟**。鎖定之後功率會從底噪一路爬
-        到耦合峰值，可能跨數十 dB 而超出鎖定檔位——那時由
-        meter_GPIB.get_power() 自己偵測 sentinel、切回自動量程並重讀
-        （見該檔的自動退回邏輯）。**沒有那道保護就絕對不可以在這裡鎖**，
-        否則演算法會在接近峰值時突然拿到一連串無效讀值，剛好在最需要
-        精度的地方失明。
+        這是**樂觀最佳化，不是必要步驟**。鎖定之後功率會從底噪一路爬到
+        耦合峰值，可能跨數十 dB 超出鎖定檔位——那時由 meter_GPIB.get_power()
+        自己偵測 sentinel、切回自動量程並重讀。**沒有那道保護就絕對不可
+        以在這裡鎖**，否則演算法會在接近峰值時突然拿到一串無效讀值，剛好在最需要精度的地方失明。
 
-        跑在 scanner 的背景執行緒上，所以：不碰任何 tkinter widget（狀態
-        文字一律 root.after 回主執行緒），meter 本身有自己的 RLock，而且
-        尋光期間 _pm_should_poll() 因 scanning_active 為真而暫停背景輪詢，
-        這條執行緒是當下唯一的 GPIB 使用者。
+        跑在 scanner 背景執行緒上：不碰任何 tkinter widget（狀態文字一律
+        root.after 回主執行緒），meter 有自己的 RLock，且尋光期間
+        _pm_should_poll() 因 scanning_active 為真而暫停背景輪詢，這條執行緒是當下唯一的 GPIB 使用者。
         """
         meter = self.meter
         if meter is None or not getattr(meter, "range_auto", False):
@@ -6322,17 +6131,14 @@ class DS102GUI:
           source="meter"  光功率分頁自己的「立即查詢」與背景輪詢（`_on_meter_reading`）
           source="scan"   尋光分頁的 sample callback 轉貼（`_scan_plot_extend`）
 
-        🔴 **這個方法存在的目的就是讓「尋光」分頁不必知道光功率分頁有哪些
+        **這個方法存在的目的就是讓「尋光」分頁不必知道光功率分頁有哪些
         欄位與 widget。** 尋光期間背景輪詢因 `_pm_should_poll()` 的
-        `motion_active` 判斷而暫停，光功率分頁沒有其他資料來源，所以尋光
-        必須把讀值轉貼過來——但轉貼的方式應該是呼叫一個具名方法，不是伸手
-        進另一個分頁改五個欄位。
+        `motion_active` 判斷而暫停，光功率分頁沒有其他資料來源，尋光必須
+        把讀值轉貼過來——但應呼叫具名方法，不是伸手進另一分頁改五個欄位。
 
-        刻意**不碰** `_pm_comm_failures`：那是背景輪詢自己的失聯計數。尋光
-        期間它本來就沒在跑，被這裡累加或歸零都會污染尋光結束後的失聯判斷
-        （這是搬進來之前 `_scan_plot_extend` 就已經寫明的既有約定，不是新
-        規則）。文字說明與前景色一律交給 `_pm_refresh_status_line()`（它
-        自己是那一組的唯一寫入者），這裡只負責數值與狀態燈。
+        刻意**不碰** `_pm_comm_failures`：那是背景輪詢自己的失聯計數，尋光
+        期間本來就沒在跑，被這裡累加或歸零都會污染尋光結束後的失聯判斷。
+        文字說明與前景色一律交給 `_pm_refresh_status_line()`（唯一寫入者），這裡只負責數值與狀態燈。
         """
         self._pm_reading = PowerReading(value=value, ok_time=time.time(), source=source)
         self._pm_power_var.set(f"{value:.2f}")
@@ -6349,19 +6155,16 @@ class DS102GUI:
         """
         清掉快取，回到「沒有任何可信讀值」的初始狀態。
 
-        連線成功與中斷連線兩條路徑共用。⚠ **這裡順帶修掉一處不對稱**：
-        原本 `_on_meter_connect_result` 只把 `_pm_last_ok_time` 歸零、
-        沒有清 `_pm_last_value`，而 `_disconnect_meter` 只清 `_pm_last_value`、
-        沒有歸零 `_pm_last_ok_time`。前者的後果是「連上新的光功率計、還沒
-        讀到第一筆值之前，`_get_last_pm_value()` 會回傳上一個 session 的舊
-        數值」，那個值會直接寫進 data/*.csv 的 dbm 欄位而沒有任何標記。
-        實務上很難踩到（UI 上連線鍵是 toggle，連線前必定經過
-        `_disconnect_meter`），但既然兩條路徑本來就該表達同一件事，就沒有
-        理由讓它們各清一半。
+        連線成功與中斷連線兩條路徑共用。**這裡順帶修掉一處不對稱**：原本
+        `_on_meter_connect_result` 只把 `_pm_last_ok_time` 歸零、沒清
+        `_pm_last_value`，而 `_disconnect_meter` 只清 `_pm_last_value`、
+        沒歸零 `_pm_last_ok_time`——前者會讓連上新光功率計、還沒讀到第一
+        筆值之前，`_get_last_pm_value()` 回傳上個 session 的舊數值並直接
+        寫進 CSV 的 dbm 欄位而無任何標記。兩條路徑本該表達同一件事，不該各清一半。
 
-        不碰 `_pm_power_var` / `_pm_unit_var` / 燈號：那兩條路徑對這些
-        widget 的處理各不相同（連線成功要顯示「—」＋MUTED、中斷還要改連線
-        鈕與整批 widget 狀態），維持各自處理，這裡只管快取本身。
+        不碰 `_pm_power_var` / `_pm_unit_var` / 燈號：兩條路徑對這些 widget
+        的處理各不相同（連線成功顯示「—」＋MUTED、中斷還要改連線鈕與整批
+        widget 狀態），維持各自處理，這裡只管快取本身。
         """
         self._pm_reading = PowerReading()
 
@@ -6378,14 +6181,11 @@ class DS102GUI:
         唯一寫入者。優先序：未連線 > 通訊失敗 > 尋光中 > 移動中 > 正常。
 
         掛在 `_start_poller`（100ms、不做 I/O、一定會跑）而非
-        `_redraw_scan_plot`（250ms，僅在裝了 matplotlib 時才會執行——
-        掛在那條鏈上會讓「移動中」這個新狀態在沒裝 matplotlib 的環境下
-        完全失效）。`_on_meter_reading`／`_pm_sync_scan_notice` 也會在
-        各自的事件當下呼叫一次，讓畫面立即反映，不必多等一輪 100ms。
+        `_redraw_scan_plot`（250ms，僅裝了 matplotlib 才執行——掛在那會
+        讓「移動中」這個新狀態在沒裝 matplotlib 時完全失效）。
+        `_on_meter_reading`／`_pm_sync_scan_notice` 也在各自事件當下呼叫一次，讓畫面立即反映。
 
-        只管「文字說明＋前景色」這組顯示狀態，不碰 `_pm_power_var`／
-        `_pm_unit_var`（實際數值文字）——那些各自的資料來源（背景輪詢／
-        尋光 sample callback）本來就知道該顯示什麼數字，不屬於這裡。
+        只管「文字說明＋前景色」，不碰 `_pm_power_var`／`_pm_unit_var`（各自資料來源本來就知道該顯示什麼數字，不屬於這裡）。
         """
         if self.meter is None:
             self._pm_status_var.set("未連線")
@@ -6395,7 +6195,7 @@ class DS102GUI:
         if self._pm_comm_failures >= COMM_FAIL_THRESHOLD:
             detail = self.meter.last_error_detail if self.meter is not None else ""
             self._pm_status_var.set(
-                f"⚠ 已停止更新（{detail}）" if detail else "⚠ 已停止更新"
+                f"已停止更新（{detail}）" if detail else "已停止更新"
             )
             self._pm_status_lbl.config(fg=CLR_DANGER)
             self._pm_power_lbl.config(fg=CLR_DANGER)
@@ -6510,10 +6310,9 @@ class DS102GUI:
         """
         取得下拉目前選的復歸樣式編號；未選或不合法時回 None。
 
-        ⚠ 不可用 `ORG_MODES.index(...)`：ORG_MODES 從 "ORG 1" 開始，
-        index 會差一位（"ORG 1" 的 index 是 0）。而且舊寫法的
-        `else 0` fallback 正好會送出 MEMSW0 0＝把復歸樣式毀掉。
-        一律直接解析字串裡的數字，解析不出來就回 None、不動作。
+        不可用 `ORG_MODES.index(...)`：ORG_MODES 從 "ORG 1" 開始，index
+        會差一位，且舊寫法的 `else 0` fallback 正好會送出 MEMSW0 0＝把
+        復歸樣式毀掉。一律直接解析字串裡的數字，解析不出來就回 None、不動作。
         """
         raw = self._org_mode_var.get().strip()
         m = re.match(r"ORG\s+(\d+)$", raw)
@@ -6527,7 +6326,7 @@ class DS102GUI:
         org_type = self._selected_org_type()
         if org_type is None:
             self._flash_banner(
-                "⚠ 尚未取得此軸的復歸樣式，無法執行原點返回。"
+                "尚未取得此軸的復歸樣式，無法執行原點返回。"
                 "請先連線；若下拉是空的，表示控制器的 MEMSW0 未設定"
                 "（可到儀表板的「控制器設定」還原）。",
                 10000,
@@ -6606,7 +6405,7 @@ class DS102GUI:
                 "請確認各軸已移離危險位置，\n且操作環境安全後再解除。\n\n確認解除？",
             ):
                 self.ctrl.release_ems()
-                self._ems_btn.config(text="⛔  緊急停止", bg=CLR_DANGER)
+                self._ems_btn.config(text="緊急停止", bg=CLR_DANGER)
                 if self.ctrl.connected:
                     self._set_drive_buttons_state("normal")
 
@@ -6628,7 +6427,7 @@ class DS102GUI:
         # UI_REDRAW_INTERVAL 就會把下面這行鎖定解掉，於是一顆寫著
         # 「復歸中…」的按鈕變成可按的。
         self._homing.set()
-        self._home_btn.config(state="disabled", text="🏠  復歸中…")
+        self._home_btn.config(state="disabled", text="復歸中…")
         self._set_drive_buttons_state("disabled")
         l, f, r, s = self._get_spd()
 
@@ -6646,13 +6445,13 @@ class DS102GUI:
 
         def _progress(ax, state):
             self.root.after(
-                0, lambda: self._home_btn.config(text=f"🏠  {ax} {state}")
+                0, lambda: self._home_btn.config(text=f"{ax} {state}")
             )
 
         def _done(ok, msg):
             # 先清旗標再還原狀態，否則 _update_stat_ui 會再把它鎖回去
             self._homing.clear()
-            self._home_btn.config(state="normal", text="🏠  全軸原點復歸")
+            self._home_btn.config(state="normal", text="全軸原點復歸")
             if self.ctrl.connected and not self.ctrl.ems_active:
                 self._set_drive_buttons_state("normal")
             for sb in self._status_bars:
@@ -6842,7 +6641,7 @@ class DS102GUI:
         self._refresh_sw_limit_display()
         if cleared:
             self._flash_banner(
-                f"⚠ 已清除 {len(cleared)} 個軸的程式端行程限制", 8000
+                f"已清除 {len(cleared)} 個軸的程式端行程限制", 8000
             )
         else:
             self._flash_banner("✔ 軟體行程限制已套用", 5000)
@@ -6863,7 +6662,7 @@ class DS102GUI:
     # =========================================================================
     def _start_data_log(self):
         self.ctrl.start_data_log()
-        self._dlog_status_var.set("🔴 記錄中")
+        self._dlog_status_var.set("記錄中")
         self._dlog_start_btn.state(["disabled"])
         self._dlog_stop_btn.state(["!disabled"])
         if "dlog" in self._stat_vars:
@@ -6888,7 +6687,7 @@ class DS102GUI:
         if stale and not self._comm_warned:
             self._comm_warned = True
             self._flash_banner(
-                "⚠ 讀不到控制器回應，畫面上的座標已停止更新、不可信。"
+                "讀不到控制器回應，畫面上的座標已停止更新、不可信。"
                 "請檢查 USB／電源，或重新連線。",
                 15000,
             )
@@ -6904,7 +6703,7 @@ class DS102GUI:
 
         if "conn" in self._stat_vars:
             self._stat_vars["conn"].set(
-                "⚠ 失聯" if stale
+                "失聯" if stale
                 else ("已連線" if self.ctrl.connected else "未連線")
             )
         if "axes" in self._stat_vars:
@@ -6912,17 +6711,15 @@ class DS102GUI:
                 str(self.ctrl.axis_count) if self.ctrl.connected else "—"
             )
         if "ems" in self._stat_vars:
-            self._stat_vars["ems"].set("⚠️ EMS" if self.ctrl.ems_active else "正常")
+            self._stat_vars["ems"].set(" EMS" if self.ctrl.ems_active else "正常")
         if "play" in self._stat_vars:
             self._stat_vars["play"].set(
-                "🔴 重播中" if self.ctrl.playback_running else "閒置"
+                "重播中" if self.ctrl.playback_running else "閒置"
             )
-        # ⚠ 這段每 UI_REDRAW_INTERVAL 就跑一次，會覆蓋掉別處設定的按鈕狀態。
+        # 這段每 UI_REDRAW_INTERVAL 就跑一次，會覆蓋掉別處設定的按鈕狀態。
         # 以前只認得 playback_running 與 ems_active，不認得「復歸中」，
-        # 所以 _do_home_all 剛鎖上的按鈕會在 100ms 後全部復活——包含那顆
-        # 文字還停在「🏠 復歸中…」的按鈕，再按一次就疊出第二條復歸執行緒。
-        # 現在改由長時間作業註冊表供應：新增作業只要在 _register_long_ops()
-        # 註冊一筆，這裡自動涵蓋，不需要（也不應該）再手動加旗標。
+        # 所以 _do_home_all 剛鎖上的按鈕會在 100ms 後全部復活，再按一次就
+        # 疊出第二條復歸執行緒。現在改由長時間作業註冊表供應：新增作業只要在 _register_long_ops() 註冊一筆，這裡自動涵蓋，不需要手動加旗標。
         if self._any_long_op_running():
             self._set_drive_buttons_state("disabled")
         elif self.ctrl.connected and not self.ctrl.ems_active:
@@ -6973,7 +6770,7 @@ class DS102GUI:
                 if ax == cur_ax:
                     bits.append("● 選取中")
                 if stale:
-                    bits.append("⚠ 已停止更新")
+                    bits.append("已停止更新")
                 else:
                     age = self.ctrl.position_age()
                     bits.append("即時" if age < 1.5 else f"{age:.0f}s 前")
@@ -6984,17 +6781,13 @@ class DS102GUI:
         # 移動控制分頁的「Position:」以前只由 _poll_status()／_async_query()
         # 寫入，疊起來造成「ORG 時分頁座標與 StatusBar 座標對不起來」：
         #   1. _poll_status() 只在 status == "Driving" 時續輪，復歸途中的
-        #      「Detect origin」與壓限位（樣式 5/6）都不是 Driving，數字
-        #      停在中途值不再更新。
-        #   2. 全軸原點復歸（_do_home_all → origin_all）根本沒觸發過這兩條
-        #      路徑，整趟復歸這顆數字完全不動，收尾強制寫 POS 0 時才突然
-        #      跳到 0，跟 StatusBar 差距最刺眼。
+        #      「Detect origin」與壓限位（樣式 5/6）都不是 Driving，數字停在中途值不再更新。
+        #   2. 全軸原點復歸（_do_home_all → origin_all）沒觸發過這兩條
+        #      路徑，整趟復歸這顆數字完全不動，收尾強制寫 POS 0 時才突然跳到 0，跟 StatusBar 差距最刺眼。
         #   3. 它們寫的是 query_status() 的機械座標（未扣 offset），而
-        #      StatusBar／儀表板顯示工作座標，設過工作原點後兩者永遠差一
-        #      個 offset，跟有沒有在復歸無關。
+        #      StatusBar／儀表板顯示工作座標，設過工作原點後兩者永遠差一個 offset，跟有沒有在復歸無關。
         # 統一改由這條 100ms 重繪迴圈供應，與其餘座標顯示同一份快取、同一
-        # 節奏；移動中的高頻更新不受影響，query_status() 仍寫 _positions_pulse，
-        # 只是不再自己畫。
+        # 節奏；移動中的高頻更新不受影響，query_status() 仍寫 _positions_pulse，只是不再自己畫。
         cur_pos_txt = "—"
         if connected and cur_ax and int(AXIS_NO[cur_ax]) <= n_axes:
             cur_pos_txt = f"{pos_work.get(cur_ax, 0.0):,.0f}"
@@ -7051,8 +6844,7 @@ class DS102GUI:
             while not self._shutting_down.is_set():
                 # scanning_active 排除比照 playback_running 的既有模式：
                 # 演算法的 hot loop 對移動+量測的時間預算很緊（0.5~1s 量級），
-                # 這條背景輪詢若繼續搶 _serial_lock，會讓演算法自己的
-                # move_step / _wait_axis_stop 排隊等候，白白吃掉預算。
+                # 這條背景輪詢若繼續搶 _serial_lock，會讓演算法自己的 move_step / _wait_axis_stop 排隊等候、白白吃掉預算。
                 if (
                     self.ctrl.connected
                     and not self.ctrl.playback_running
@@ -7074,10 +6866,8 @@ class DS102GUI:
         self._shutting_down.set()
         # 所有長時間背景作業都跑在自己的迴圈裡（不是靠 _shutting_down 這類
         # 現成旗標），關窗時要讓它們知道視窗正在關閉才會主動收工。少了這步，
-        # 例如尋光的 _run() 會繼續跑 scanner.run()，下一步對已經 disconnect()
-        # 的序列埠操作大機率拋例外，且 _run() 例外處理排的 root.after(0, ...)
-        # 這時 root 可能已經 destroy()，會在背景執行緒炸出未接住的例外
-        # （architect 審查抓到的問題）。
+        # 例如尋光的 _run() 會繼續跑 scanner.run()，對已 disconnect() 的
+        # 序列埠操作大機率拋例外，且 root 此時可能已 destroy()，會在背景執行緒炸出未接住的例外（architect 審查抓到的問題）。
         self._request_stop_long_ops()
         if self.ctrl.connected:
             self.ctrl.stop()
