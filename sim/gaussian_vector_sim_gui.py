@@ -57,7 +57,7 @@ class GaussianVectorSimApp:
 
         header = ttk.Frame(axes_box)
         header.pack(fill=tk.X, padx=4, pady=(4, 0))
-        for col, text in enumerate(("軸", "中心 (pulse)", "σ 寬度 (pulse)")):
+        for col, text in enumerate(("軸", "中心 (pulse)", "σ 寬度 (pulse)", "範圍下限 (pulse)", "範圍上限 (pulse)")):
             ttk.Label(header, text=text, width=12 if col else 6).grid(row=0, column=col, padx=2)
 
         for axis in AXES:
@@ -66,18 +66,23 @@ class GaussianVectorSimApp:
             var_used = tk.BooleanVar(value=(axis in ("X", "Y")))
             var_center = tk.StringVar(value="0")
             var_sigma = tk.StringVar(value="5000")
+            var_range_min = tk.StringVar(value="-15000")
+            var_range_max = tk.StringVar(value="15000")
             ttk.Checkbutton(row, text=axis, variable=var_used, width=4).grid(row=0, column=0, padx=2)
             ttk.Entry(row, textvariable=var_center, width=12).grid(row=0, column=1, padx=2)
             ttk.Entry(row, textvariable=var_sigma, width=12).grid(row=0, column=2, padx=2)
-            self._axis_rows[axis] = {"used": var_used, "center": var_center, "sigma": var_sigma}
+            ttk.Entry(row, textvariable=var_range_min, width=12).grid(row=0, column=3, padx=2)
+            ttk.Entry(row, textvariable=var_range_max, width=12).grid(row=0, column=4, padx=2)
+            self._axis_rows[axis] = {
+                "used": var_used, "center": var_center, "sigma": var_sigma,
+                "range_min": var_range_min, "range_max": var_range_max,
+            }
 
         cond_box = ttk.Labelframe(parent, text="場條件")
         cond_box.pack(fill=tk.X, pady=8)
         self._peak_power = self._add_field(cond_box, "尖峰功率 (dBm)", "-10")
         self._noise_floor = self._add_field(cond_box, "雜訊底 (dBm)", "-60")
         self._noise_std = self._add_field(cond_box, "量測雜訊標準差 (dB)", "0.05")
-        self._grid_min = self._add_field(cond_box, "繪圖範圍下限 (pulse)", "-15000")
-        self._grid_max = self._add_field(cond_box, "繪圖範圍上限 (pulse)", "15000")
         self._grid_points = self._add_field(cond_box, "格點數（每軸）", "25")
 
         sim_box = ttk.Labelframe(parent, text="搜尋演算法條件（對照 fiber_scanner.py 同名參數）")
@@ -146,7 +151,7 @@ class GaussianVectorSimApp:
 
     # ---------- 執行 ----------
 
-    def _collect_config(self) -> tuple[GaussianFieldConfig, tuple[float, float], dict]:
+    def _collect_config(self) -> tuple[GaussianFieldConfig, np.ndarray, dict]:
         selected = [axis for axis in AXES if self._axis_rows[axis]["used"].get()]
         if not selected:
             raise ValueError("至少要勾選一個軸")
@@ -163,9 +168,14 @@ class GaussianVectorSimApp:
             noise_std_db=float(self._noise_std.get()),
             seed=int(self._seed.get()),
         )
-        grid_range = (float(self._grid_min.get()), float(self._grid_max.get()))
-        if grid_range[1] <= grid_range[0]:
-            raise ValueError("繪圖範圍上限必須大於下限")
+        # 每軸各自一組範圍（不是全軸共用一組）：多軸時各軸的中心與 σ 尺度常常差很多
+        # （例如 Z 軸對焦行程遠比 X/Y 橫向對準行程長），共用同一組範圍會讓格點解析度
+        # 完全罩不住尺度較小的軸——這正是「3 軸模擬時 X-Y 讀不到數值」的根因，
+        # 對照 gaussian_vector_sim.py 的 --grid-range 早就支援每軸各自一組 (min,max)。
+        grid_range = np.array([[float(self._axis_rows[a]["range_min"].get()),
+                                 float(self._axis_rows[a]["range_max"].get())] for a in selected])
+        if np.any(grid_range[:, 1] <= grid_range[:, 0]):
+            raise ValueError("每一軸的範圍上限必須大於下限")
 
         run_params = {
             "grid_points": int(self._grid_points.get()),
@@ -193,7 +203,7 @@ class GaussianVectorSimApp:
         self._status_var.set("模擬中…")
         threading.Thread(target=self._run_worker, args=(cfg, grid_range, run_params), daemon=True).start()
 
-    def _run_worker(self, cfg: GaussianFieldConfig, grid_range: tuple[float, float], run_params: dict) -> None:
+    def _run_worker(self, cfg: GaussianFieldConfig, grid_range: np.ndarray, run_params: dict) -> None:
         try:
             search_kwargs = {
                 "step_min": run_params["step_min"],
