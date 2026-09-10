@@ -791,6 +791,29 @@ class DS102Controller:
             or self._motion_depth > 0
         )
 
+    def _manual_ops_blocked(self) -> bool:
+        """
+        使用者／GUI 發起的移動入口是否應被擋下（EMS／重播／尋光／量測任一
+        進行中）。2026-09 起收斂 move_continue/move_step/move_origin/
+        origin_all/goto_point 五處原本逐字相同的守衛條件，機械性去重、
+        零行為變更。
+
+        🔴 只給上述五個「使用者發起」的入口用。
+        🔴 絕對不可用於 scan_move_step()／_do_move_step()／_do_origin()——
+           那三個是無守衛層，把 scanning_active 放進去曾讓所有收斂測試卡死
+           （scanner 呼叫自己的移動被自己設的旗標擋住），見 motion_active
+           docstring 同一個陷阱。
+        🔴 不要把 motion_active／_motion_depth 併進來（那是「要不要占用其他
+           硬體資源」的判斷，語意不同），也不要為這四個旗標加鎖——維持既有
+           的非原子讀取語義，加鎖只會引入新的取鎖順序問題。
+        """
+        return (
+            self.ems_active
+            or self.playback_running
+            or self.scanning_active
+            or self.measuring_active
+        )
+
     def set_offset_here(self, axis_no: str) -> None:
         """將當前位置設為工作原點（offset = 目前機械位置）"""
         ax = NO_AXIS.get(axis_no)
@@ -1457,7 +1480,7 @@ class DS102Controller:
           1. 出發前：已經在該方向的軟體限位上就拒絕啟動
           2. 移動中：背景執行緒監看座標，越界立刻送 STOP
         """
-        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
+        if self._manual_ops_blocked():
             return
 
         ax = NO_AXIS.get(axis_no)
@@ -1589,7 +1612,7 @@ class DS102Controller:
         自己的移動也一併擋下（`scanning_active` 存在的目的是擋「其他
         來源」，不是擋演算法本身）。
         """
-        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
+        if self._manual_ops_blocked():
             return False
         return self._do_move_step(axis_no, direction, amount, l_speed, f_speed, rate, s_rate, wait_done)
 
@@ -1789,7 +1812,7 @@ class DS102Controller:
         `measure_homing_repeatability()` 直接呼叫它），這裡維持原本
         「復歸後檢查 POS、視情況強制歸零」的收尾邏輯逐字不變。
         """
-        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
+        if self._manual_ops_blocked():
             return False
         # 用 _motion_scope 標記移動期間（見 _do_move_step 同一段註解）。
         # origin_all 會巢狀呼叫本方法，_motion_scope 用計數器正確處理巢狀。
@@ -1863,6 +1886,27 @@ class DS102Controller:
             self._serial_write_read(f"AXI{axis_no}:CWSLE?"),
             self._serial_write_read(f"AXI{axis_no}:CCWSLE?"),
         )
+
+    def _restore_soft_limits(self, axis_no: str, saved: Tuple[str, str]) -> None:
+        """
+        還原單軸韌體軟體限位（origin_all / measure_homing_repeatability 的
+        finally 共用）。讀不到原值一律還原成啟用(1)，絕不 fallback 到停用：
+        `cw or '0'` 這種寫法在 _serial_write_read 三次失敗回傳空字串時會變成
+        停用，等於序列埠壅塞一下就把韌體端唯一可靠的保護永久關掉，且不留
+        痕跡。保護該有的失效方向是「寧可多擋」，不是「寧可放行」。
+        """
+        cw, ccw = saved
+        ax = NO_AXIS.get(axis_no, axis_no)
+        for cmd, val in (("CWSLE", cw), ("CCWSLE", ccw)):
+            v = (val or "").strip()
+            if v not in ("0", "1"):
+                self._log(
+                    "ERROR",
+                    f"軸 {ax} {cmd} 原始值讀不到（收到 {val!r}），"
+                    f"改以啟用(1)還原——請確認限位設定是否符合預期",
+                )
+                v = "1"
+            self._serial_write(f"AXI{axis_no}:{cmd} {v}")
 
     def _wait_origin_done_ex(
         self,
@@ -2070,7 +2114,7 @@ class DS102Controller:
         某一軸失敗不中止整批，繼續跑其餘各軸。
         回傳 (全部成功?, 摘要訊息)。
         """
-        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
+        if self._manual_ops_blocked():
             return False, "EMS 作用中／重播進行中／尋光進行中／量測進行中，已略過"
 
         done, skipped, failed = [], [], []
@@ -2170,23 +2214,10 @@ class DS102Controller:
                         else:
                             failed.append(f"{ax}(歸零失敗 POS={pos3})")
             finally:
-                # 無論成功與否都要把軟體限位還原回去，還原不到就一律開啟
-                # （"1"），絕不 fallback 到停用：`cw or '0'` 這種寫法在
-                # _serial_write_read 三次失敗回傳空字串時會變成停用，等於
-                # 序列埠壅塞一下就把韌體端唯一可靠的保護永久關掉，且不留
-                # 痕跡。保護該有的失效方向是「寧可多擋」，不是「寧可放行」。
-                for axis_no, (cw, ccw) in saved.items():
-                    ax = NO_AXIS.get(axis_no, axis_no)
-                    for cmd, val in (("CWSLE", cw), ("CCWSLE", ccw)):
-                        v = (val or "").strip()
-                        if v not in ("0", "1"):
-                            self._log(
-                                "ERROR",
-                                f"軸 {ax} {cmd} 原始值讀不到（收到 {val!r}），"
-                                f"改以啟用(1)還原——請確認限位設定是否符合預期",
-                            )
-                            v = "1"
-                        self._serial_write(f"AXI{axis_no}:{cmd} {v}")
+                # 無論成功與否都要把軟體限位還原回去，見 _restore_soft_limits
+                # docstring（保護該有的失效方向是「寧可多擋」，不是「寧可放行」）。
+                for axis_no, saved_limits in saved.items():
+                    self._restore_soft_limits(axis_no, saved_limits)
 
         parts = []
         if done:
@@ -2411,17 +2442,7 @@ class DS102Controller:
                         if self._homing_repeat_abort(stop_event):
                             break
                 finally:
-                    cw, ccw = saved_limits
-                    for cmd, val in (("CWSLE", cw), ("CCWSLE", ccw)):
-                        v = (val or "").strip()
-                        if v not in ("0", "1"):
-                            self._log(
-                                "ERROR",
-                                f"軸 {ax_name} {cmd} 原始值讀不到（收到 {val!r}），"
-                                f"改以啟用(1)還原——請確認限位設定是否符合預期",
-                            )
-                            v = "1"
-                        self._serial_write(f"AXI{axis_no}:{cmd} {v}")
+                    self._restore_soft_limits(axis_no, saved_limits)
 
                 if self._homing_repeat_abort(stop_event):
                     break
@@ -3308,24 +3329,49 @@ class DS102Controller:
         self._persist_profiles()
         self._log("INFO", f"速度 Profile [{name}] 已刪除")
 
-    def _persist_profiles(self) -> None:
-        p = RECORDING_DIR / "speed_profiles.json"
-        # 與 _persist_points() 同一套防護：沒 load 過就寫回，等於拿一份不完整的
-        # 記憶體狀態覆蓋磁碟。teaching points 早就有這層保護，profiles 一直沒有。
-        if not self._profiles_loaded and p.exists():
+    def _persist_guarded(
+        self,
+        filename: str,
+        data: dict,
+        loaded: bool,
+        loader_name: str,
+        item_label: str,
+    ) -> None:
+        """
+        持久化拒寫守護（_persist_profiles / _persist_points / _persist_axis_calib 共用）。
+
+        沒先 load 過就寫回，等於拿一份不完整的記憶體狀態覆蓋磁碟：比對磁碟既有
+        內容缺哪些 key，缺就拒寫並記 ERROR（只有 .bak 可救）。`filename` 只傳
+        檔名字串、不可傳 Path 或在別處先組好路徑——RECORDING_DIR 必須在這裡、
+        呼叫當下才組出來，否則 tests/conftest.py 對 ds102_ctrl.RECORDING_DIR 的
+        monkeypatch 會失效，測試會直接寫進真正的 recordings/。
+        """
+        p = RECORDING_DIR / filename
+        if not loaded and p.exists():
             try:
                 existing = json.loads(p.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 existing = {}
-            missing = set(existing) - set(self.speed_profiles)
+            missing = set(existing) - set(data)
             if missing:
                 self._log(
                     "ERROR",
-                    f"拒絕寫入 speed_profiles.json：未先 load_speed_profiles() 就儲存，"
-                    f"會遺失 {len(missing)} 個既有 Profile（{'、'.join(sorted(missing))}）",
+                    f"拒絕寫入 {filename}：未先 {loader_name}() 就儲存，"
+                    f"會遺失 {len(missing)} {item_label}（{'、'.join(sorted(missing))}）",
                 )
                 return
-        _write_json_with_backup(p, self.speed_profiles, self._log)
+        _write_json_with_backup(p, data, self._log)
+
+    def _persist_profiles(self) -> None:
+        # 與 _persist_points() 同一套防護：沒 load 過就寫回，等於拿一份不完整的
+        # 記憶體狀態覆蓋磁碟。teaching points 早就有這層保護，profiles 一直沒有。
+        self._persist_guarded(
+            "speed_profiles.json",
+            self.speed_profiles,
+            self._profiles_loaded,
+            "load_speed_profiles",
+            "個既有 Profile",
+        )
 
     def load_speed_profiles(self) -> None:
         p = RECORDING_DIR / "speed_profiles.json"
@@ -3389,7 +3435,7 @@ class DS102Controller:
         if name not in self.saved_points:
             self._log("ERROR", f"Teaching Point [{name}] 不存在")
             return False
-        if self.ems_active or self.playback_running or self.scanning_active or self.measuring_active:
+        if self._manual_ops_blocked():
             return False
 
         pt = self.saved_points[name]
@@ -3461,24 +3507,16 @@ class DS102Controller:
         return True
 
     def _persist_points(self) -> None:
-        p = RECORDING_DIR / "teaching_points.json"
         # 沒 load 過就寫回，等於拿一份不完整的記憶體狀態覆蓋磁碟。
         # 正常流程 GUI 啟動一定會 load_points()，會走到這裡的多半是
         # 直接 new 一個 controller 的測試腳本。
-        if not self._points_loaded and p.exists():
-            try:
-                existing = json.loads(p.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-            missing = set(existing) - set(self.saved_points)
-            if missing:
-                self._log(
-                    "ERROR",
-                    f"拒絕寫入 teaching_points.json：未先 load_points() 就儲存，"
-                    f"會遺失 {len(missing)} 個既有點位（{'、'.join(sorted(missing))}）",
-                )
-                return
-        _write_json_with_backup(p, self.saved_points, self._log)
+        self._persist_guarded(
+            "teaching_points.json",
+            self.saved_points,
+            self._points_loaded,
+            "load_points",
+            "個既有點位",
+        )
 
     def load_points(self) -> None:
         p = RECORDING_DIR / "teaching_points.json"
@@ -3512,21 +3550,13 @@ class DS102Controller:
         _persist_points 的既有防護：比對磁碟既有內容缺哪些軸，缺就拒寫並記
         ERROR，只有 .bak 可救。
         """
-        p = RECORDING_DIR / "axis_calibration.json"
-        if not self._axis_calib_loaded and p.exists():
-            try:
-                existing = json.loads(p.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-            missing = set(existing) - set(self.axis_calib)
-            if missing:
-                self._log(
-                    "ERROR",
-                    f"拒絕寫入 axis_calibration.json：未先 load_axis_calib() 就儲存，"
-                    f"會遺失 {len(missing)} 軸既有校正參數（{'、'.join(sorted(missing))}）",
-                )
-                return
-        _write_json_with_backup(p, self.axis_calib, self._log)
+        self._persist_guarded(
+            "axis_calibration.json",
+            self.axis_calib,
+            self._axis_calib_loaded,
+            "load_axis_calib",
+            "軸既有校正參數",
+        )
 
     def set_axis_calib(self, calib: Dict[str, dict]) -> List[str]:
         """

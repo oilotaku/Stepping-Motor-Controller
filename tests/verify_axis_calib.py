@@ -346,6 +346,52 @@ class TestSetAxisCalib:
             assert "Y" not in on_disk  # 真正的重點：磁碟沒有被 ctrl2 寫壞
 
 
+class TestPersistGuardedSharedHelper:
+    """
+    core/ds102_ctrl.py 的 _persist_profiles / _persist_points / _persist_axis_calib
+    2026-09 起共用同一個 _persist_guarded() helper（機械性去重，零行為變更）。
+    上面 TestSetAxisCalib.test_reject_write_without_load_when_disk_has_other_axes
+    只驗證了 axis_calib 這一份路徑；teaching points 與 speed profiles 兩份路徑
+    原本完全沒有專屬測試，去重後三者共用同一段守護邏輯，這裡補上另外兩份，
+    讓這支測試同時成為三條路徑的守門測試。寫法逐字比照上面那支既有測試。
+    """
+
+    def test_persist_points_reject_write_without_load(self, tmp_path):
+        with patch.object(ds102_ctrl, "RECORDING_DIR", new=tmp_path):
+            ctrl1 = ds102_ctrl.DS102Controller()
+            ctrl1.load_points()
+            ctrl1.save_point("A", {"X": 100.0})
+
+            ctrl2 = ds102_ctrl.DS102Controller()
+            assert ctrl2._points_loaded is False
+            ctrl2.save_point("B", {"Y": 200.0})
+            # 記憶體裡 ctrl2 已經寫入 B（拒寫發生在 _persist_points 內部）。
+            assert "B" in ctrl2.saved_points
+
+            on_disk = json.loads(
+                (tmp_path / "teaching_points.json").read_text(encoding="utf-8")
+            )
+            assert "A" in on_disk
+            assert "B" not in on_disk  # 真正的重點：磁碟沒有被 ctrl2 寫壞
+
+    def test_persist_profiles_reject_write_without_load(self, tmp_path):
+        with patch.object(ds102_ctrl, "RECORDING_DIR", new=tmp_path):
+            ctrl1 = ds102_ctrl.DS102Controller()
+            ctrl1.load_speed_profiles()
+            ctrl1.save_speed_profile("P1", "100", "5000", "500", "10")
+
+            ctrl2 = ds102_ctrl.DS102Controller()
+            assert ctrl2._profiles_loaded is False
+            ctrl2.save_speed_profile("P2", "200", "6000", "600", "20")
+            assert "P2" in ctrl2.speed_profiles
+
+            on_disk = json.loads(
+                (tmp_path / "speed_profiles.json").read_text(encoding="utf-8")
+            )
+            assert "P1" in on_disk
+            assert "P2" not in on_disk  # 真正的重點：磁碟沒有被 ctrl2 寫壞
+
+
 class TestClearAxisCalib:
     def test_clear_existing_axis_returns_true(self, tmp_path):
         with patch.object(ds102_ctrl, "RECORDING_DIR", new=tmp_path):

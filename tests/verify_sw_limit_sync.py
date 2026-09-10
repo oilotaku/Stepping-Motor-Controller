@@ -344,4 +344,35 @@ def test_stage_not_connected_axis_excluded_from_unprotected(ctrl):
     )
     ctrl.sync_sw_limits_from_controller()
     assert ctrl.sw_limits["X"] == (None, None)
+
+
+# ===========================================================================
+# 十一、_restore_soft_limits()：origin_all / measure_homing_repeatability
+# 的 finally 共用 helper（2026-09 機械性去重，零行為變更）。這裡直接測
+# helper 本體，鎖住「保護只能收緊、讀不到一律還原成啟用」這個安全不變量。
+# ===========================================================================
+def test_restore_soft_limits_missing_value_falls_back_to_enabled(ctrl):
+    """CW 讀不到原值（空字串）→ 還原成啟用(1)；CCW 有效值(0)→ 原值保留。"""
+    sent = []
+    ctrl._serial_write = lambda cmd: sent.append(cmd)
+    logs = collect_logs(ctrl)
+
+    ctrl._restore_soft_limits("1", ("", "0"))
+
+    assert "AXI1:CWSLE 1" in sent
+    assert "AXI1:CCWSLE 0" in sent
+    assert any(level == "ERROR" for level, _ in logs)
+
+
+def test_restore_soft_limits_valid_values_pass_through_unchanged(ctrl):
+    """兩側都是有效值時原樣送出，不觸發任何 ERROR log。"""
+    sent = []
+    ctrl._serial_write = lambda cmd: sent.append(cmd)
+    logs = collect_logs(ctrl)
+
+    ctrl._restore_soft_limits("1", ("1", "0"))
+
+    assert "AXI1:CWSLE 1" in sent
+    assert "AXI1:CCWSLE 0" in sent
+    assert not any(level == "ERROR" for level, _ in logs)
     assert "X" not in ctrl.sw_limits_unprotected, "未接滑台的軸不該觸發無保護警示"
