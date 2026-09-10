@@ -26,9 +26,25 @@
   // 用錯直譯器執行測試會在 import main_ai 階段就失敗。
   "python.testing.pytestPath": "${workspaceFolder}/venv/Scripts/pytest.exe",
   "python.testing.pytestArgs": [
-    "${workspaceFolder}"
+    "."
   ],
   "python.testing.cwd": "${workspaceFolder}",
+  // 2026-08-19 排查「Testing 面板只顯示 123 項，明明有 187 項」時發現：
+  // ms-python.python 2026.4.0 的 useEnvExtension() 判斷式是
+  // `!!getExtension("ms-python.vscode-python-envs") && config.get("python.useEnvironmentsExtension", false)`
+  // ——vscode.extensions.getExtension() 只要擴充套件「有安裝」就回傳
+  // truthy，跟它是否被停用（Disable）無關，所以直接停用
+  // ms-python.vscode-python-envs 這個擴充套件沒有用。真正的開關是這個
+  // setting，預設值是 false，但這台機器不知為何被開成 true（不在原本
+  // 這份檔案或使用者全域 settings.json 裡，懷疑是 Microsoft 的實驗
+  // (A/B) 機制注入的預設值）。開啟後會啟用新的「test-by-project」探索
+  // 路徑，這條路徑在磁碟機代號大小寫不一致時（`d:\...` vs 解析出來的
+  // `D:\...`，log 會看到 "Working directory resolves to different
+  // path" 警告）會把部分測試項目配對不到 project、從 Testing 面板的樹
+  // 狀畫面裡默默丟掉——背景探索子行程本身仍然正確收集到完整項目數
+  // （log 的 collected 數字是對的），只有面板顯示不完整。明確設為
+  // false 蓋掉任何實驗預設值，退回沒有這條配對邏輯的舊版探索路徑。
+  "python.useEnvironmentsExtension": false,
 
   // ===========================================================================
   // Pylance 分析：只分析自己的程式碼，避開 venv 與驅動程式資料夾

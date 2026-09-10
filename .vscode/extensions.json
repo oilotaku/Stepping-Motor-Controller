@@ -13,7 +13,8 @@
     // --- 建議：本專案情境 ---
     "ms-ceintl.vscode-language-pack-zh-hant", // 繁體中文介面
     "mechatroner.rainbow-csv",    // data/ 底下實驗數據 CSV 上色檢視
-    "emilast.logfilehighlighter"  // logs/ 的 DS102 log 依 INFO/ERROR 上色
+    "emilast.logfilehighlighter", // logs/ 的 DS102 log 依 INFO/ERROR 上色
+    "anthropic.claude-code"
   ],
   "unwantedRecommendations": [
     // 與 Pylance / Ruff 功能重疊，同時裝會有重複警告
