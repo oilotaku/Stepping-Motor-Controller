@@ -13,6 +13,8 @@
 
 **2026-08-17 已實際打包驗證過一次**（`venv/Scripts/pyinstaller.exe --onedir --windowed --name DS102 main_ai.py`）：build 乾淨完成（含 matplotlib TkAgg backend 自動偵測），產出約 152MB；雙擊產生的 `DS102.exe` 能正常啟動、存活、於自己目錄下建出 `logs/`/`recordings/`/`data/`（驗證了 `_app_dir()` 的 `sys.frozen` 分支），matplotlib 中文字型（Microsoft JhengHei）在打包環境下也能正確解析。**沒有實測連硬體**（GPIB／序列埠），那部分仍待驗證。
 
+**2026-09-10 分資料夾遷移後重新打包驗證**（同一組指令，`main_ai.py` 仍在根目錄、`DS102Controller` 等現役模組已搬進 `core/`）：build 乾淨完成，PyInstaller 靜態分析對 `core/` 底下的 sibling package import（`from core.ds102_ctrl import ...` 等）沒有額外 hidden-import 警告，`core/__init__.py` 讓它被辨識為正常套件、自動收進去，跟 CLAUDE.md 記載的預期一致。產出約 229MB（比 08-17 那次大，主要是 `fiber_scanner_advanced.py` 的 Powell 路徑帶進 `scipy` 依賴，08-17 那次還沒有這個模組）。啟動測試：執行後背景存活、PID 存在、於自己目錄下正確建出 `logs/ds102_*.log`／`recordings/`／`data/`，log 內容掃過一輪未見任何 `error`／`traceback`／`exception` 字樣。**同樣沒有實測連硬體**，且這次也沒有測試〈尋光〉分頁在打包環境下的實際操作流程（只確認程式能啟動、目錄建置正常），這兩項仍待之後補。
+
 打包時另外要注意：
 - 用 `--onedir` 而非 `--onefile`。這台機器的 SentinelOne 有前科（見 [DRIVER_ISSUE_REPORT.md](DRIVER_ISSUE_REPORT.md)），而未簽章的 onefile exe 自解壓縮到 temp 的行為特徵跟 packer 一樣，是典型的誤判目標；onedir 也省掉每次啟動的解壓時間。
 - 別把 `ds102 (2).pdf`（4.4MB）與兩個驅動資料夾（6MB）`--add-data` 進去，執行期完全用不到。
