@@ -99,9 +99,9 @@ body {
     background: var(--md-bg);
     color: var(--md-text);
     font-family: var(--md-font-body);
-    font-size: 16px;
+    font-size: 18px;
     line-height: 1.6;
-    max-width: 960px;
+    max-width: min(1200px, 92vw);
     margin-left: auto;
     margin-right: auto;
 }
@@ -161,6 +161,14 @@ th, td {
 th { background: var(--md-surface); font-weight: 600; }
 td.align-center, th.align-center { text-align: center; }
 td.align-right, th.align-right { text-align: right; }
+
+img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 1.5em auto;
+    border-radius: 8px;
+}
 
 blockquote {
     border-left: 3px solid var(--md-border);
@@ -235,7 +243,13 @@ nav.toc a[aria-current="location"] {
 }
 
 /* TOC variants */
-body.toc-sticky-sidebar { display: grid; grid-template-columns: 220px 1fr; gap: 2.5rem; max-width: 1200px; }
+/* !important：四種 design_style 各自設了 max-width（720/960/680/880px，見上方
+   style variants），跟這裡的 sidebar 版面寬度是同一權重的 class 選擇器，
+   兩者同時存在時後宣告的贏，順序一換就會被蓋掉——sidebar 版面需要的寬度
+   是結構性需求（要放得下側欄＋內容兩欄），優先權必須高於風格化的窄版面
+   偏好，用 !important 明確鎖住這個優先順序，不要只靠來源順序這種脆弱的
+   方式維持。 */
+body.toc-sticky-sidebar { display: grid; grid-template-columns: 240px 1fr; gap: 2.5rem; max-width: min(1680px, 95vw) !important; }
 body.toc-sticky-sidebar nav.toc {
     position: sticky;
     top: 1.5rem;
